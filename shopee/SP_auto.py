@@ -1,7 +1,7 @@
 """Shopee 店铺广告自动化和数据采集。
 
-本文件独立维护 Shopee 的 DrissionPage 连接、菜单操作、日期切换、指标读取、
-数值转换、日志和结果组装。程序只接管紫鸟已经打开的当前标签页，不会主动访问网址。
+本文件独立维护 Shopee 的 DrissionPage 连接、URL 登录判断、广告页跳转、URL周期切换、
+指标读取、数值转换、日志和结果组装。程序只接管紫鸟已经打开的当前标签页。
 
 尚未提供的 XPath 统一留在本文件顶部。XPath 为空、元素不存在或转换失败时，
 对应指标返回空值并记录日志，不会影响其他指标继续执行。
@@ -16,6 +16,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from DrissionPage import Chromium
 
@@ -24,25 +25,51 @@ LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 一、Shopee 广告页面按钮 XPath
+# 一、Shopee 广告页面 URL、等待参数和弹窗 XPath
 # ---------------------------------------------------------------------------
 
-# 同时包含密码输入框和账号输入框的 form 是 Shopee 未登录页面的明确标志。
-# 一旦检测到该表单，当前店铺不再执行登录、菜单点击或数据采集，而是抛出异常，
-# 由外层 ZiniaoStoreSession 使用紫鸟官方 stopBrowser 关闭店铺后继续下一店铺。
-LOGIN_FORM_XPATH = '//form[.//input[@name="password"] and .//input[@name="loginKey"]]'
+# Shopee 登录页和卖家中心域名。URL 查询参数不参与判断。
+# 当前 URL 为登录页时，本店铺立即停止采集，由外层紫鸟会话关闭后继续下一店铺。
+SHOPEE_LOGIN_PAGE_URL = "https://accounts.shopee.com.br/seller/login"
+SHOPEE_SELLER_HOST = "seller.shopee.com.br"
 
-# 刚接管紫鸟标签页时等待登录表单出现的最长时间，单位为秒。
-# 首次检查结束后，页面完成加载时还会再次检查，避免异步渲染较慢导致漏判。
-LOGIN_FORM_DETECTION_TIMEOUT_SECONDS = 5
+# 已确认登录后直接打开广告页，不再点击首页的营销中心或 Shopee 广告菜单。
+SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
 
-# Shopee 未登录页面可能因语言或版本不同而使用不同的登录按钮。
-# 程序严格按列表顺序检查：第一个 XPath 没找到可见元素时，才检查第二个 XPath。
-# 以后遇到新的登录页面，可以继续在列表末尾追加 XPath，不需要修改登录处理函数。
-LOGIN_BUTTON_XPATHS: list[str] = [
-    "//form//button[contains(@class,'ZzzLTG')]",
-    '//button[normalize-space()="Log In"]',
-]
+# 广告页单次等待 document.readyState=complete 的最长时间，单位为秒。
+# 超过 120 秒仍未完成时，本次加载判定失败，刷新当前广告页后重新尝试。
+AD_PAGE_LOAD_TIMEOUT_SECONDS = 120
+
+# 广告页加载失败后允许刷新的次数。值为 4 表示首次打开 1 次，失败后最多再刷新 4 次，
+# 因此广告入口最多执行 5 轮加载尝试。
+AD_PAGE_LOAD_RETRY_TIMES = 4
+
+# 昨日和最近7天页面的数据加载成功标志。document.readyState=complete 后还必须读取到
+# 该元素的非空文本，才能确认 Shopee 广告数据已经渲染。
+AD_PAGE_READY_METRIC_XPATH = '//div[@class="line-metrics"]/div[1]//div[@class="content"]//span'
+
+# 广告入口文档加载完成后，每隔2秒读取一次当前网址，最多读取40次。
+# 只有 URL 的 group 参数变成已知时间范围后，才使用该完整 URL 生成昨日和最近7天地址。
+AD_GROUP_URL_CHECK_TIMES = 40
+AD_GROUP_URL_CHECK_INTERVAL_SECONDS = 2
+AD_KNOWN_GROUP_VALUES: frozenset[str] = frozenset({"today", "yesterday", "last_week", "last_month"})
+
+# 昨日/最近7天页面首次加载失败后允许刷新的次数。值为5表示首次打开1次加刷新5次，
+# 每个时间范围最多进行6轮“文档完成 + 首个指标文本验证”。
+PERIOD_PAGE_REFRESH_RETRY_TIMES = 5
+
+# Shopee 流量验证错误页。只比较域名和路径，忽略 home_url、tracking_id 等动态参数。
+SHOPEE_TRAFFIC_ERROR_URL = "https://shopee.com.br/verify/traffic/error"
+
+# 内部周期名称与 Shopee URL group 参数的固定映射，不再点击页面日期按钮。
+PERIOD_GROUP_VALUES: dict[str, str] = {
+    "昨天": "yesterday",
+    "7天": "last_week",
+}
+
+# 紫鸟刚打开店铺时 URL 可能还在 chrome://newtab 或重定向中。
+# 最长观察 60 秒，期间一旦进入登录页或 seller.shopee.com.br 就立即作出判断。
+SHOPEE_URL_STATE_TIMEOUT_SECONDS = 60
 
 # Shopee 广告弹窗关闭按钮按顺序检查：先使用现有奖励弹窗定位，找不到时再检查广告升级通知弹窗。
 # 后续如果出现更多类型，只需在列表末尾追加 XPath，不需要修改关闭函数。
@@ -64,115 +91,20 @@ AD_POPUP_CLOSE_XPATHS: list[str] = [
 # 关闭一层广告弹窗后继续观察的时间，防止第二层弹窗稍晚渲染而被误判为全部关闭。
 AD_POPUP_CHAIN_WAIT_SECONDS = 2
 
-# 如果“Shopee广告”不可见，需要先点击“营销中心”展开菜单。
-MARKETING_CENTER_BUTTON_XPATH = '(//ul[@class="sidebar-menu"]/li)[3]//span[@class="sidebar-menu-item-text"]'
-
-# “Shopee广告”菜单按钮。
-SHOPEE_AD_BUTTON_XPATH = '//a[contains(@href,"/portal/marketing/pas/index")]'
-
-# 广告页面的时间切换按钮。
-TIME_SWITCH_BUTTON_XPATH = '//div[@class="eds-popover__ref"]//div[@class="eds-date-picker__input"]/div'
-
-# 时间面板中的“昨天”和“最近7天”选项。
-YESTERDAY_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[2]//span'
-LAST_7_DAYS_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[3]//span'
-
-
-# 页面主文档加载完成的最长等待时间，单位为秒。
-# 超过 60 秒仍未达到 document.readyState=complete 时会记录错误日志，然后继续执行。
-PAGE_READY_TIMEOUT_SECONDS = 60
-
 # 页面主文档加载完成后额外等待的时间，单位为秒。
-# 这 10 秒用于等待 Shopee 的菜单、弹窗和异步页面内容继续渲染。
+# 这 10 秒用于等待 Shopee 广告数据、弹窗和异步页面内容继续渲染。
 AFTER_PAGE_READY_WAIT_SECONDS = 10
 
 # 普通按钮首次点击失败后允许再次重试的次数。
-# 当前值为 3，表示“首次点击 1 次 + 失败后重试 3 次”；Shopee 广告入口和日期按钮
-# 使用下面各自独立的 8 次重试配置，不受这个通用值限制。
+# 当前值为 3，表示“首次点击 1 次 + 失败后重试 3 次”。这里只用于广告弹窗关闭。
 CLICK_RETRY_TIMES = 3
 
 # 同一个按钮前后两次点击尝试之间的最短间隔，单位为秒。
 # 实际重试时会在 2 秒基础上增加 0～1 秒随机等待，避免连续机械点击。
 CLICK_RETRY_INTERVAL_SECONDS = 2
 
-# 点击按钮后，等待下一个按钮、日期选项或页面数据出现的最长时间，单位为秒。
-# 如果没有可用于判断加载完成的 XPath，也会使用这个值固定等待 30 秒。
-NEXT_ELEMENT_TIMEOUT_SECONDS = 30
-
-# Shopee 广告入口和日期按钮的专项重试次数。
-# 数值 8 表示首次点击 1 次 + 失败后重试 8 次，一个按钮最多尝试 9 次。
-SHOPEE_AD_CLICK_RETRY_TIMES = 8
-PERIOD_CLICK_RETRY_TIMES = 8
-
-# Shopee 广告入口点击后页面跳转较慢：每次点击后最多等待约 3 秒检查时间按钮，
-# 未出现才进入下一次尝试。这个等待窗口只用于“广告入口 -> 时间按钮”的状态确认。
-SHOPEE_AD_NEXT_ELEMENT_WAIT_SECONDS = 3
-
-# 日期面板点击后等待“昨天/最近 7 天”选项出现的时间；选项消失的确认仍使用通用 30 秒。
-PERIOD_OPTION_WAIT_SECONDS = 3
-
 # ---------------------------------------------------------------------------
-# 二、昨天和最近 7 天的日期切换步骤
-# ---------------------------------------------------------------------------
-
-# 日期按钮只有在日期选项出现后才算点击成功；日期选项只有在点击后消失才算成功。
-# 用户补充上面的四个 XPath 后，本列表会自动使用相同的 XPath。
-PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
-    "昨天": [
-        {
-            "name": "广告-打开时间选择面板（昨天）",
-            "xpath": TIME_SWITCH_BUTTON_XPATH,
-            "wait_seconds": 1,
-            "retry_times": PERIOD_CLICK_RETRY_TIMES,
-            "retry_interval_seconds": 2,
-            "success_timeout_seconds": PERIOD_OPTION_WAIT_SECONDS,
-            "success_xpath": YESTERDAY_OPTION_XPATH,
-            "success_state": "visible",
-            "success_name": "昨天选项出现",
-            "scroll_after_success_xpath": TIME_SWITCH_BUTTON_XPATH,
-            "scroll_after_success_name": "昨天时间面板打开后重新定位时间按钮",
-        },
-        {
-            "name": "广告-选择昨天",
-            "xpath": YESTERDAY_OPTION_XPATH,
-            "wait_seconds": 2,
-            "retry_times": PERIOD_CLICK_RETRY_TIMES,
-            "retry_interval_seconds": 2,
-            "success_xpath": YESTERDAY_OPTION_XPATH,
-            "success_state": "hidden",
-            "success_name": "昨天选项消失",
-        },
-    ],
-    "7天": [
-        {
-            "name": "广告-打开时间选择面板（7天）",
-            "xpath": TIME_SWITCH_BUTTON_XPATH,
-            "wait_seconds": 1,
-            "retry_times": PERIOD_CLICK_RETRY_TIMES,
-            "retry_interval_seconds": 2,
-            "success_timeout_seconds": PERIOD_OPTION_WAIT_SECONDS,
-            "success_xpath": LAST_7_DAYS_OPTION_XPATH,
-            "success_state": "visible",
-            "success_name": "最近7天选项出现",
-            "scroll_after_success_xpath": TIME_SWITCH_BUTTON_XPATH,
-            "scroll_after_success_name": "7天时间面板打开后重新定位时间按钮",
-        },
-        {
-            "name": "广告-选择最近7天",
-            "xpath": LAST_7_DAYS_OPTION_XPATH,
-            "wait_seconds": 2,
-            "retry_times": PERIOD_CLICK_RETRY_TIMES,
-            "retry_interval_seconds": 2,
-            "success_xpath": LAST_7_DAYS_OPTION_XPATH,
-            "success_state": "hidden",
-            "success_name": "最近7天选项消失",
-        },
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
-# 三、Shopee 广告 ALL 行指标
+# 二、Shopee 广告 ALL 行指标
 # ---------------------------------------------------------------------------
 
 # kind 可选值：
@@ -227,59 +159,28 @@ class ShopeeAuto:
 
         LOGGER.info("[Shopee][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
-        # 只连接紫鸟已经打开的 Chromium，不创建浏览器，也不调用 tab.get()。
+        # 只连接紫鸟已经打开的 Chromium，不创建普通浏览器；确认登录后在当前标签页打开广告页。
         browser = Chromium(f"127.0.0.1:{debugging_port}")
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
 
-        # Shopee 首页接管后立即检查一次广告弹窗，避免弹窗遮挡登录表单或后续菜单。
-        # 此时弹窗尚未渲染也不影响，页面加载完成后还会再次检查。
-        self._close_ad_popup(tab, "刚进入Shopee首页")
-
-        # 登录表单的优先级最高。检测到后通过异常退出 collect，外层紫鸟会话负责关闭店铺。
-        self._raise_if_login_required(
-            tab,
-            store_name,
-            check_position="刚接管紫鸟标签页",
-            timeout_seconds=LOGIN_FORM_DETECTION_TIMEOUT_SECONDS,
-        )
-
-        self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
-        LOGGER.info("[Shopee][页面] 主文档等待结束，额外等待 %s 秒让菜单完成渲染", AFTER_PAGE_READY_WAIT_SECONDS)
-        time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
-
-        # 页面异步内容可能在首次检查之后才渲染，因此在任何弹窗或菜单操作前复查一次。
-        self._raise_if_login_required(
-            tab,
-            store_name,
-            check_position="页面加载完成后",
-            timeout_seconds=1,
-        )
-        self._close_ad_popup(tab, "页面加载完成后")
-
-        # 页面可能处于未登录状态；按配置顺序检查多个登录按钮 XPath。
-        self._login_if_needed(tab)
-        # 登录跳转完成后弹窗可能才开始渲染，因此再次检查一次。
-        self._close_ad_popup(tab, "登录检查完成后")
-
-        # 广告按钮可见时直接点击；不可见时先展开营销中心。
-        first_period_xpath = self._first_step_xpath(PERIOD_CLICK_STEPS.get("昨天", []))
-        if not self._enter_shopee_ads(tab, first_period_xpath):
-            raise RuntimeError("Shopee 广告按钮多次点击后仍未确认时间切换按钮出现，停止当前店铺采集")
-
-        # 时间按钮出现代表广告页已经完成关键区域加载。这里只滚动一次，失败也不重试滚动，
-        # 后续日期按钮点击仍会按自己的重试规则查找目标元素。
-        self._scroll_element_to_center(tab, TIME_SWITCH_BUTTON_XPATH, "广告页首次定位时间切换按钮")
+        # 首页只通过 URL 判断登录状态，不查找元素、不处理首页弹窗，也不点击任何首页菜单。
+        self._confirm_login_state_by_url(tab, store_name)
+        template_url = self._open_ad_page(tab, store_name)
 
         rows: list[dict[str, Any]] = []
         for period in ("昨天", "7天"):
-            LOGGER.info("[Shopee][广告] 开始切换并采集时间范围=%s", period)
-            # 选择日期后，时间选项消失才算点击成功；随后固定等待 30 秒让广告表刷新。
-            if not self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), final_next_xpath=""):
-                raise RuntimeError(f"Shopee {period} 日期切换多次重试后仍失败，停止当前店铺采集")
+            group_value = PERIOD_GROUP_VALUES[period]
+            period_url = self._replace_group_in_url(template_url, group_value)
+            LOGGER.info(
+                "[Shopee][周期URL] 时间范围=%s，group=%s，模板url=%s，目标url=%s",
+                period,
+                group_value,
+                template_url,
+                period_url,
+            )
+            self._open_period_page(tab, store_name, period, group_value, period_url)
 
-            # 日期切换成功后把时间按钮重新放回视口水平中心线，只执行一次且不因滚动失败重试。
-            self._scroll_element_to_center(tab, TIME_SWITCH_BUTTON_XPATH, f"{period}日期切换成功后定位时间按钮")
             for spec in METRIC_SPECS:
                 if spec["period"] != period:
                     continue
@@ -348,48 +249,455 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(rows))
         return rows
 
-    @staticmethod
-    def _raise_if_login_required(
+    def _confirm_login_state_by_url(self, tab: Any, store_name: str) -> None:
+        """仅根据当前 URL 判断登录状态；未登录或无法确认时终止当前店铺。"""
+        started_at = time.monotonic()
+        deadline = started_at + SHOPEE_URL_STATE_TIMEOUT_SECONDS
+        last_url = ""
+        LOGGER.info(
+            "[Shopee][URL登录判断] 店铺=%s，最长等待=%.1f秒，登录页=%s，已登录域名=%s",
+            store_name,
+            SHOPEE_URL_STATE_TIMEOUT_SECONDS,
+            SHOPEE_LOGIN_PAGE_URL,
+            SHOPEE_SELLER_HOST,
+        )
+        while time.monotonic() < deadline:
+            current_url = self._read_current_url(tab)
+            if current_url != last_url:
+                LOGGER.info("[Shopee][URL变化] 店铺=%s，当前url=%s", store_name, current_url or "<空>")
+                last_url = current_url
+
+            url_state = self._classify_login_url(current_url)
+            if url_state == "not_logged_in":
+                error_message = (
+                    f"Shopee 店铺 {store_name} 当前网址为登录页，确认账号未登录；"
+                    "登录流程尚未配置，已停止本店铺采集，关闭店铺后继续下一店铺。"
+                )
+                LOGGER.error("[Shopee][URL确认未登录] 店铺=%s，url=%s", store_name, current_url)
+                raise RuntimeError(error_message)
+            if url_state == "logged_in":
+                LOGGER.info(
+                    "[Shopee][URL确认已登录] 店铺=%s，url=%s，耗时=%.2f秒",
+                    store_name,
+                    current_url,
+                    time.monotonic() - started_at,
+                )
+                return
+            time.sleep(1)
+
+        raise RuntimeError(
+            f"Shopee 店铺 {store_name} 在 {SHOPEE_URL_STATE_TIMEOUT_SECONDS} 秒内未进入登录页或卖家中心，"
+            f"无法确认登录状态，最后网址={last_url or '<空>'}；已停止本店铺采集。"
+        )
+
+    def _open_ad_page(self, tab: Any, store_name: str) -> str:
+        """打开广告入口并取得包含 Shopee 动态参数和 group 的完整模板 URL。"""
+        max_attempts = AD_PAGE_LOAD_RETRY_TIMES + 1
+        last_failure_reason = ""
+
+        for attempt in range(max_attempts):
+            attempt_number = attempt + 1
+            try:
+                if attempt == 0:
+                    LOGGER.info(
+                        "[Shopee][广告入口跳转] 店铺=%s，第 %s/%s 轮，url=%s，单轮超时=%.1f秒",
+                        store_name,
+                        attempt_number,
+                        max_attempts,
+                        SHOPEE_AD_PAGE_URL,
+                        AD_PAGE_LOAD_TIMEOUT_SECONDS,
+                    )
+                    navigation_result = tab.get(SHOPEE_AD_PAGE_URL, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+                else:
+                    retry_current_url = self._read_current_url(tab)
+                    if self._is_traffic_error_url(retry_current_url):
+                        LOGGER.warning(
+                            "[Shopee][广告入口重新跳转重试] 店铺=%s，第 %s/%s 轮，"
+                            "当前仍是流量错误页，重新跳转广告入口，不执行刷新，url=%s",
+                            store_name,
+                            attempt_number,
+                            max_attempts,
+                            retry_current_url,
+                        )
+                        navigation_result = tab.get(SHOPEE_AD_PAGE_URL, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+                    else:
+                        LOGGER.warning(
+                            "[Shopee][广告入口刷新重试] 店铺=%s，第 %s/%s 轮，上轮失败原因=%s",
+                            store_name,
+                            attempt_number,
+                            max_attempts,
+                            last_failure_reason,
+                        )
+                        navigation_result = tab.refresh()
+                if navigation_result is False:
+                    current_url = self._read_current_url(tab)
+                    if self._is_traffic_error_url(current_url):
+                        LOGGER.warning(
+                            "[Shopee][广告入口导航超时后命中流量错误页] 店铺=%s，url=%s；"
+                            "重新跳转广告入口，不执行刷新",
+                            store_name,
+                            current_url,
+                        )
+                        self._reopen_ad_entry_after_traffic_error(tab, store_name)
+                    else:
+                        last_failure_reason = f"导航在 {AD_PAGE_LOAD_TIMEOUT_SECONDS} 秒内未完成"
+                        continue
+            except Exception as exc:
+                last_failure_reason = f"打开或刷新广告入口异常: {exc}"
+                LOGGER.warning(
+                    "[Shopee][广告入口导航异常] 店铺=%s，第 %s/%s 轮，异常=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    exc,
+                )
+                continue
+
+            current_url = self._read_current_url(tab)
+            if self._classify_login_url(current_url) == "not_logged_in":
+                raise RuntimeError(
+                    f"Shopee 店铺 {store_name} 跳转广告入口后被重定向到登录页；"
+                    "已停止本店铺采集，关闭店铺后继续下一店铺。"
+                )
+
+            if not self._wait_for_page_ready(tab, AD_PAGE_LOAD_TIMEOUT_SECONDS):
+                last_failure_reason = f"document.readyState 在 {AD_PAGE_LOAD_TIMEOUT_SECONDS} 秒内未达到 complete"
+                continue
+
+            template_url = self._wait_for_group_url(tab, store_name)
+            if template_url:
+                LOGGER.info(
+                    "[Shopee][广告入口URL确认] 店铺=%s，第 %s/%s 轮，完整模板url=%s，group=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    template_url,
+                    self._extract_group_from_url(template_url),
+                )
+                return template_url
+
+            last_failure_reason = (
+                f"每隔 {AD_GROUP_URL_CHECK_INTERVAL_SECONDS} 秒查询 {AD_GROUP_URL_CHECK_TIMES} 次后，"
+                "URL仍没有已知group参数"
+            )
+
+        raise TimeoutError(
+            f"Shopee 广告入口首次打开并刷新 {AD_PAGE_LOAD_RETRY_TIMES} 次后仍未取得完整group URL；"
+            f"最后原因={last_failure_reason or '未知'}"
+        )
+
+    def _wait_for_group_url(self, tab: Any, store_name: str) -> str:
+        """每隔2秒读取URL；流量错误页必须重新跳转广告入口，不能刷新错误页。"""
+        last_url = ""
+        for check_index in range(AD_GROUP_URL_CHECK_TIMES):
+            current_url = self._read_current_url(tab)
+            last_url = current_url or last_url
+
+            if self._classify_login_url(current_url) == "not_logged_in":
+                raise RuntimeError(
+                    f"Shopee 店铺 {store_name} 等待广告URL时进入登录页；"
+                    "已停止本店铺采集，关闭店铺后继续下一店铺。"
+                )
+
+            if self._is_traffic_error_url(current_url):
+                LOGGER.warning(
+                    "[Shopee][流量验证错误页] 店铺=%s，第 %s/%s 次查询命中url=%s；"
+                    "按要求重新跳转广告入口，不刷新当前错误页",
+                    store_name,
+                    check_index + 1,
+                    AD_GROUP_URL_CHECK_TIMES,
+                    current_url,
+                )
+                self._reopen_ad_entry_after_traffic_error(tab, store_name)
+            else:
+                group_value = self._extract_group_from_url(current_url)
+                LOGGER.info(
+                    "[Shopee][广告URL查询] 店铺=%s，第 %s/%s 次，group=%s，url=%s",
+                    store_name,
+                    check_index + 1,
+                    AD_GROUP_URL_CHECK_TIMES,
+                    group_value or "<未出现>",
+                    current_url or "<空>",
+                )
+                if group_value in AD_KNOWN_GROUP_VALUES:
+                    return current_url
+
+            if check_index < AD_GROUP_URL_CHECK_TIMES - 1:
+                time.sleep(AD_GROUP_URL_CHECK_INTERVAL_SECONDS)
+
+        LOGGER.error(
+            "[Shopee][广告URL查询超时] 店铺=%s，查询次数=%s，间隔=%.1f秒，最后url=%s",
+            store_name,
+            AD_GROUP_URL_CHECK_TIMES,
+            AD_GROUP_URL_CHECK_INTERVAL_SECONDS,
+            last_url or "<空>",
+        )
+        return ""
+
+    def _open_period_page(
+        self,
         tab: Any,
         store_name: str,
-        check_position: str,
-        timeout_seconds: float,
+        period: str,
+        expected_group: str,
+        period_url: str,
     ) -> None:
-        """检查未登录 form；存在时立即终止当前店铺，让外层紫鸟会话执行关闭。"""
-        LOGGER.info(
-            "[Shopee][登录表单检查] 店铺=%s，检查位置=%s，最长等待=%.1f秒，xpath=%s",
-            store_name,
-            check_position,
-            timeout_seconds,
-            LOGIN_FORM_XPATH,
-        )
-        try:
-            # 用户要求按元素是否存在判断，因此这里不额外要求元素可见或具备点击尺寸。
-            login_form = tab.ele(f"xpath:{LOGIN_FORM_XPATH}", timeout=timeout_seconds)
-        except Exception as exc:
-            LOGGER.warning(
-                "[Shopee][登录表单检查异常] 店铺=%s，检查位置=%s，异常=%s；继续按已登录流程处理",
+        """打开指定周期 URL；数据抓不到时刷新当前周期页，最多额外重试5次。"""
+        max_attempts = PERIOD_PAGE_REFRESH_RETRY_TIMES + 1
+        last_failure_reason = ""
+
+        for attempt in range(max_attempts):
+            attempt_number = attempt + 1
+            try:
+                if attempt == 0:
+                    LOGGER.info(
+                        "[Shopee][周期页跳转] 店铺=%s，时间范围=%s，第 %s/%s 轮，url=%s",
+                        store_name,
+                        period,
+                        attempt_number,
+                        max_attempts,
+                        period_url,
+                    )
+                    navigation_result = tab.get(period_url, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+                else:
+                    retry_current_url = self._read_current_url(tab)
+                    if self._is_traffic_error_url(retry_current_url):
+                        LOGGER.warning(
+                            "[Shopee][周期页重新跳转重试] 店铺=%s，时间范围=%s，第 %s/%s 轮，"
+                            "当前仍是流量错误页，先重新跳转广告入口，url=%s",
+                            store_name,
+                            period,
+                            attempt_number,
+                            max_attempts,
+                            retry_current_url,
+                        )
+                        navigation_result = self._reopen_period_after_traffic_error(
+                            tab,
+                            store_name,
+                            period,
+                            period_url,
+                        )
+                    else:
+                        LOGGER.warning(
+                            "[Shopee][周期页刷新重试] 店铺=%s，时间范围=%s，第 %s/%s 轮，上轮失败原因=%s",
+                            store_name,
+                            period,
+                            attempt_number,
+                            max_attempts,
+                            last_failure_reason,
+                        )
+                        navigation_result = tab.refresh()
+                if navigation_result is False:
+                    current_url = self._read_current_url(tab)
+                    if self._is_traffic_error_url(current_url):
+                        LOGGER.warning(
+                            "[Shopee][周期页导航超时后命中流量错误页] 店铺=%s，时间范围=%s，url=%s；"
+                            "先重新跳转广告入口",
+                            store_name,
+                            period,
+                            current_url,
+                        )
+                        navigation_result = self._reopen_period_after_traffic_error(
+                            tab,
+                            store_name,
+                            period,
+                            period_url,
+                        )
+                    else:
+                        last_failure_reason = f"导航在 {AD_PAGE_LOAD_TIMEOUT_SECONDS} 秒内未完成"
+                        continue
+            except Exception as exc:
+                last_failure_reason = f"打开或刷新{period}页面异常: {exc}"
+                LOGGER.warning(
+                    "[Shopee][周期页导航异常] 店铺=%s，时间范围=%s，第 %s/%s 轮，异常=%s",
+                    store_name,
+                    period,
+                    attempt_number,
+                    max_attempts,
+                    exc,
+                )
+                continue
+
+            current_url = self._read_current_url(tab)
+            if self._classify_login_url(current_url) == "not_logged_in":
+                raise RuntimeError(f"Shopee 店铺 {store_name} 打开{period}数据页后被重定向到登录页")
+            if self._is_traffic_error_url(current_url):
+                LOGGER.warning(
+                    "[Shopee][周期页流量验证] 店铺=%s，时间范围=%s，url=%s；先重新跳转广告入口",
+                    store_name,
+                    period,
+                    current_url,
+                )
+                navigation_result = self._reopen_period_after_traffic_error(
+                    tab,
+                    store_name,
+                    period,
+                    period_url,
+                )
+                if navigation_result is False:
+                    last_failure_reason = f"流量验证恢复后重新打开{period}页面超时"
+                    continue
+
+            if not self._wait_for_page_ready(tab, AD_PAGE_LOAD_TIMEOUT_SECONDS):
+                last_failure_reason = f"document.readyState 在 {AD_PAGE_LOAD_TIMEOUT_SECONDS} 秒内未达到 complete"
+                continue
+
+            current_url = self._read_current_url(tab)
+            current_group = self._extract_group_from_url(current_url)
+            if current_group != expected_group:
+                last_failure_reason = f"当前URL的group={current_group or '<空>'}，期望={expected_group}"
+                LOGGER.warning(
+                    "[Shopee][周期URL验证失败] 店铺=%s，时间范围=%s，第 %s/%s 轮，%s，url=%s",
+                    store_name,
+                    period,
+                    attempt_number,
+                    max_attempts,
+                    last_failure_reason,
+                    current_url,
+                )
+                continue
+
+            LOGGER.info(
+                "[Shopee][周期页文档完成] 店铺=%s，时间范围=%s，第 %s/%s 轮，额外等待 %.1f 秒",
                 store_name,
-                check_position,
-                exc,
+                period,
+                attempt_number,
+                max_attempts,
+                AFTER_PAGE_READY_WAIT_SECONDS,
+            )
+            time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+            self._close_ad_popup(tab, f"{period}周期页第{attempt_number}轮加载完成后")
+
+            ready_metric_text = self._read_xpath(tab, AD_PAGE_READY_METRIC_XPATH, f"{period}页面加载验证指标")
+            if not ready_metric_text:
+                last_failure_reason = f"首个指标未抓到非空文本，xpath={AD_PAGE_READY_METRIC_XPATH}"
+                LOGGER.warning(
+                    "[Shopee][周期数据验证失败] 店铺=%s，时间范围=%s，第 %s/%s 轮，原因=%s",
+                    store_name,
+                    period,
+                    attempt_number,
+                    max_attempts,
+                    last_failure_reason,
+                )
+                continue
+
+            LOGGER.info(
+                "[Shopee][周期数据验证成功] 店铺=%s，时间范围=%s，group=%s，xpath=%s，原始文本=%r",
+                store_name,
+                period,
+                current_group,
+                AD_PAGE_READY_METRIC_XPATH,
+                ready_metric_text,
             )
             return
 
-        if not login_form:
-            LOGGER.info("[Shopee][登录表单未发现] 店铺=%s，检查位置=%s，继续后续操作", store_name, check_position)
-            return
+        raise TimeoutError(
+            f"Shopee 店铺 {store_name} 的{period}页面首次打开并刷新 "
+            f"{PERIOD_PAGE_REFRESH_RETRY_TIMES} 次后仍无法抓取数据；最后原因={last_failure_reason or '未知'}"
+        )
 
-        error_message = (
-            f"Shopee 店铺 {store_name} 检测到登录表单，当前账号需要登录；"
-            "已停止本店铺采集，正在通过紫鸟关闭店铺，关闭成功后继续下一店铺。"
-        )
-        LOGGER.error(
-            "[Shopee][需要登录-停止当前店铺] 店铺=%s，检查位置=%s，xpath=%s",
+    def _reopen_ad_entry_after_traffic_error(self, tab: Any, store_name: str) -> None:
+        """流量错误页只能重新跳转广告入口，禁止在错误页上执行 refresh。"""
+        LOGGER.info("[Shopee][流量验证恢复] 店铺=%s，重新跳转url=%s", store_name, SHOPEE_AD_PAGE_URL)
+        try:
+            navigation_result = tab.get(SHOPEE_AD_PAGE_URL, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception as exc:
+            raise RuntimeError(f"Shopee 流量错误页重新跳转广告入口失败: {exc}") from exc
+        if navigation_result is False:
+            raise TimeoutError(f"Shopee 流量错误页重新跳转广告入口超过 {AD_PAGE_LOAD_TIMEOUT_SECONDS} 秒")
+        if not self._wait_for_page_ready(tab, AD_PAGE_LOAD_TIMEOUT_SECONDS):
+            raise TimeoutError("Shopee 流量错误页重新跳转广告入口后，页面未加载完成")
+
+    def _reopen_period_after_traffic_error(
+        self,
+        tab: Any,
+        store_name: str,
+        period: str,
+        period_url: str,
+    ) -> Any:
+        """从错误页先回广告入口，再重新跳指定周期；调用顺序不能改成刷新错误页。"""
+        self._reopen_ad_entry_after_traffic_error(tab, store_name)
+        LOGGER.info(
+            "[Shopee][流量验证恢复] 店铺=%s，重新跳转%s周期url=%s",
             store_name,
-            check_position,
-            LOGIN_FORM_XPATH,
+            period,
+            period_url,
         )
-        raise RuntimeError(error_message)
+        return tab.get(period_url, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+
+    @staticmethod
+    def _extract_group_from_url(current_url: str) -> str:
+        """使用查询参数解析器读取 group，避免用字符串切割误伤其他参数。"""
+        try:
+            query_pairs = parse_qsl(urlsplit(str(current_url or "").strip()).query, keep_blank_values=True)
+        except (TypeError, ValueError):
+            return ""
+        for key, value in query_pairs:
+            if key.casefold() == "group":
+                return value.strip().casefold()
+        return ""
+
+    @staticmethod
+    def _replace_group_in_url(source_url: str, group_value: str) -> str:
+        """只替换完整 URL 的 group 参数，保留 Shopee 生成的 from、to、type 等参数。"""
+        parsed = urlsplit(str(source_url or "").strip())
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        replaced = False
+        updated_pairs: list[tuple[str, str]] = []
+        for key, value in query_pairs:
+            if key.casefold() == "group":
+                if not replaced:
+                    updated_pairs.append((key, group_value))
+                    replaced = True
+                continue
+            updated_pairs.append((key, value))
+        if not replaced:
+            updated_pairs.append(("group", group_value))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(updated_pairs), parsed.fragment))
+
+    @staticmethod
+    def _is_traffic_error_url(current_url: str) -> bool:
+        """判断是否为 shopee.com.br/verify/traffic/error，忽略动态查询参数。"""
+        try:
+            current = urlsplit(str(current_url or "").strip())
+            target = urlsplit(SHOPEE_TRAFFIC_ERROR_URL)
+        except (TypeError, ValueError):
+            return False
+        return (
+            current.netloc.casefold().split(":", 1)[0] == target.netloc.casefold()
+            and current.path.rstrip("/").casefold() == target.path.rstrip("/").casefold()
+        )
+
+    @staticmethod
+    def _read_current_url(tab: Any) -> str:
+        """优先读取 DrissionPage 的 tab.url，失败时再读取 window.location.href。"""
+        try:
+            current_url = str(tab.url or "").strip()
+            if current_url:
+                return current_url
+        except Exception as exc:
+            LOGGER.warning("[Shopee][URL读取异常] tab.url 读取失败=%s，尝试读取 location.href", exc)
+        try:
+            return str(tab.run_js("return window.location.href;") or "").strip()
+        except Exception as exc:
+            LOGGER.warning("[Shopee][URL读取失败] location.href 读取失败=%s", exc)
+            return ""
+
+    @staticmethod
+    def _classify_login_url(current_url: str) -> str:
+        """返回 not_logged_in、logged_in 或 unknown，查询参数和末尾斜杠不影响判断。"""
+        try:
+            parsed = urlparse(str(current_url or "").strip())
+        except (TypeError, ValueError):
+            return "unknown"
+        host = parsed.netloc.casefold().split(":", 1)[0]
+        path = parsed.path.rstrip("/").casefold()
+        login_parsed = urlparse(SHOPEE_LOGIN_PAGE_URL)
+        if host == login_parsed.netloc.casefold() and path == login_parsed.path.rstrip("/").casefold():
+            return "not_logged_in"
+        if host == SHOPEE_SELLER_HOST:
+            return "logged_in"
+        return "unknown"
 
     def _close_ad_popup(self, tab: Any, check_position: str = "当前步骤") -> bool:
         """发现奖励广告弹窗时关闭；首次失败后最多重试 3 次，并验证关闭按钮已经消失。"""
@@ -539,311 +847,6 @@ class ShopeeAuto:
                 return xpath, element
         return "", None
 
-    def _login_if_needed(self, tab: Any) -> bool:
-        """依次检查多个登录按钮；发现后点击并等待登录后的菜单出现。"""
-        configured_xpaths = [str(xpath or "").strip() for xpath in LOGIN_BUTTON_XPATHS if str(xpath or "").strip()]
-        if not configured_xpaths:
-            LOGGER.warning("[Shopee][登录检查跳过] LOGIN_BUTTON_XPATHS 没有有效 XPath")
-            return False
-
-        for index, xpath in enumerate(configured_xpaths, start=1):
-            LOGGER.info(
-                "[Shopee][登录检查] 正在检查第 %s/%s 个登录按钮，xpath=%s",
-                index,
-                len(configured_xpaths),
-                xpath,
-            )
-            login_element = self._find_visible_element(tab, xpath, timeout=3)
-            if not login_element:
-                LOGGER.info("[Shopee][登录按钮未发现] 第 %s 个 XPath 没有可见按钮，继续检查下一个", index)
-                continue
-
-            LOGGER.warning("[Shopee][未登录] 发现第 %s 个登录按钮，准备点击，xpath=%s", index, xpath)
-            clicked = self._click_with_retry(
-                tab,
-                xpath,
-                f"点击第{index}个Shopee登录按钮",
-                success_xpath=xpath,
-                success_state="hidden",
-                success_name="登录按钮消失",
-            )
-            if not clicked:
-                LOGGER.error("[Shopee][登录失败] 第 %s 个登录按钮经过首次及 3 次重试仍未成功，继续检查其他 XPath", index)
-                continue
-
-            # 登录按钮消失后，等待登录页面跳转并出现左侧菜单中的任意一个已登录标志。
-            self._wait_for_any_xpath(
-                tab,
-                [SHOPEE_AD_BUTTON_XPATH, MARKETING_CENTER_BUTTON_XPATH],
-                NEXT_ELEMENT_TIMEOUT_SECONDS,
-                "登录后的Shopee广告或营销中心菜单",
-            )
-            LOGGER.info("[Shopee][登录处理完成] 已点击第 %s 个登录按钮，继续进入广告页面", index)
-            return True
-
-        LOGGER.info("[Shopee][登录检查完成] 所有登录按钮 XPath 均不可见，按当前已经登录继续")
-        return False
-
-    def _enter_shopee_ads(self, tab: Any, next_xpath: str = "") -> bool:
-        """判断 Shopee 广告按钮是否可见，必要时先展开营销中心。"""
-        if not SHOPEE_AD_BUTTON_XPATH:
-            LOGGER.error("[Shopee][配置缺失] SHOPEE_AD_BUTTON_XPATH 为空，无法进入 Shopee 广告页面")
-            return False
-
-        ad_element = self._find_visible_element(tab, SHOPEE_AD_BUTTON_XPATH, timeout=2)
-        if ad_element:
-            LOGGER.info("[Shopee][菜单判断] Shopee广告按钮当前可见，直接点击")
-        else:
-            LOGGER.info("[Shopee][菜单判断] Shopee广告按钮不可见，需要展开营销中心")
-            if not MARKETING_CENTER_BUTTON_XPATH:
-                LOGGER.error("[Shopee][配置缺失] MARKETING_CENTER_BUTTON_XPATH 为空，无法展开营销中心")
-                return False
-            expanded = self._click_with_retry(
-                tab,
-                MARKETING_CENTER_BUTTON_XPATH,
-                "点击营销中心展开按钮",
-                success_xpath=SHOPEE_AD_BUTTON_XPATH,
-                success_state="visible",
-                success_name="Shopee广告按钮出现",
-            )
-            if not expanded:
-                LOGGER.error("[Shopee][菜单失败] 营销中心展开后仍未看到 Shopee广告按钮")
-                return False
-
-        # 已配置时间按钮时，用它的出现确认确实进入了广告页面；否则只判断 click() 是否成功。
-        entered = self._click_with_retry(
-            tab,
-            SHOPEE_AD_BUTTON_XPATH,
-            "点击Shopee广告按钮",
-            success_xpath=next_xpath,
-            success_state="visible" if next_xpath else "",
-            success_name="Shopee广告页面的时间切换按钮出现",
-            retry_times=SHOPEE_AD_CLICK_RETRY_TIMES,
-            retry_interval_seconds=0,
-            success_timeout_seconds=SHOPEE_AD_NEXT_ELEMENT_WAIT_SECONDS,
-        )
-        if not entered:
-            LOGGER.error(
-                "[Shopee][菜单失败] Shopee广告按钮首次点击加 %s 次重试后，仍未确认时间切换按钮出现",
-                SHOPEE_AD_CLICK_RETRY_TIMES,
-            )
-            return False
-        # XPath 尚未填写时仍固定等待 30 秒，给广告页面留下完整加载时间。
-        if not next_xpath:
-            self._wait_for_xpath(tab, "", NEXT_ELEMENT_TIMEOUT_SECONDS, "Shopee广告页面的时间切换按钮")
-        return True
-
-    def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> bool:
-        """顺序执行日期按钮步骤；任一步最终失败都返回 False，禁止继续读取旧数据。"""
-        for index, step in enumerate(steps):
-            step_name = str(step.get("name") or f"第 {index + 1} 个未命名按钮")
-            xpath = str(step.get("xpath") or "").strip()
-            if not xpath:
-                LOGGER.error("[Shopee][按钮终止] 步骤=%s，原因=XPath 为空", step_name)
-                return False
-
-            clicked = self._click_with_retry(
-                tab,
-                xpath,
-                step_name,
-                success_xpath=str(step.get("success_xpath") or "").strip(),
-                success_state=str(step.get("success_state") or "").strip().lower(),
-                success_name=str(step.get("success_name") or "点击后的页面状态"),
-                scroll_to_center=bool(step.get("scroll_to_center", False)),
-                retry_times=int(step.get("retry_times", CLICK_RETRY_TIMES)),
-                retry_interval_seconds=float(step.get("retry_interval_seconds", CLICK_RETRY_INTERVAL_SECONDS)),
-                success_timeout_seconds=float(step.get("success_timeout_seconds", NEXT_ELEMENT_TIMEOUT_SECONDS)),
-            )
-            if not clicked:
-                retry_times = int(step.get("retry_times", CLICK_RETRY_TIMES))
-                LOGGER.error(
-                    "[Shopee][按钮失败] 步骤=%s，首次点击加 %s 次重试后仍未成功",
-                    step_name,
-                    retry_times,
-                )
-                return False
-
-            scroll_after_success_xpath = str(step.get("scroll_after_success_xpath") or "").strip()
-            if scroll_after_success_xpath:
-                self._scroll_element_to_center(
-                    tab,
-                    scroll_after_success_xpath,
-                    str(step.get("scroll_after_success_name") or f"{step_name}成功后的单次滚动"),
-                )
-
-            wait_seconds = float(step.get("wait_seconds", 1) or 0)
-            if wait_seconds > 0:
-                LOGGER.info("[Shopee][按钮] 步骤=%s 点击成功，先等待 %.1f 秒", step_name, wait_seconds)
-                time.sleep(wait_seconds)
-
-            next_xpath = self._next_step_xpath(steps, index + 1) or final_next_xpath
-            self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一按钮或数据")
-        return True
-
-    def _click_with_retry(
-        self,
-        tab: Any,
-        xpath: str,
-        step_name: str,
-        success_xpath: str = "",
-        success_state: str = "",
-        success_name: str = "点击后的页面状态",
-        scroll_to_center: bool = False,
-        retry_times: int = CLICK_RETRY_TIMES,
-        retry_interval_seconds: float = CLICK_RETRY_INTERVAL_SECONDS,
-        success_timeout_seconds: float = NEXT_ELEMENT_TIMEOUT_SECONDS,
-    ) -> bool:
-        """按按钮自己的次数重试；查找、点击或状态验证失败时都会检查广告弹窗。"""
-        safe_retry_times = max(0, int(retry_times))
-        safe_retry_interval = max(0.0, float(retry_interval_seconds))
-        safe_success_timeout = max(0.1, float(success_timeout_seconds))
-        max_attempts = safe_retry_times + 1
-        # 只有上一次确实向元素发出过点击，才允许把“目标已隐藏”解释为延迟生效。
-        # 否则日期选项从未出现时也属于 hidden，会被错误判定为日期选择成功。
-        previous_click_dispatched = False
-        for attempt in range(max_attempts):
-            # 弹窗可能在任意按钮操作前延迟出现，先关闭再查找目标按钮。
-            self._close_ad_popup(tab, f"{step_name}点击前")
-            if scroll_to_center:
-                self._scroll_element_to_center(tab, xpath, step_name)
-            if success_xpath and success_state == "visible" and self._element_state_matches(tab, success_xpath, "visible"):
-                LOGGER.info("[Shopee][按钮验证成功] 步骤=%s，%s，无需再次点击", step_name, success_name)
-                return True
-            if (
-                attempt > 0
-                and previous_click_dispatched
-                and success_xpath
-                and success_state == "hidden"
-                and self._element_state_matches(tab, success_xpath, "hidden")
-            ):
-                LOGGER.info("[Shopee][按钮验证成功] 步骤=%s，%s，上一次点击已延迟生效", step_name, success_name)
-                return True
-
-            if attempt > 0:
-                interval = safe_retry_interval
-                if interval > 0:
-                    interval += random.uniform(0, 1)
-                LOGGER.warning(
-                    "[Shopee][按钮重试] 步骤=%s，第 %s/%s 次尝试前等待 %.2f 秒，xpath=%s",
-                    step_name,
-                    attempt + 1,
-                    max_attempts,
-                    interval,
-                    xpath,
-                )
-                if interval > 0:
-                    time.sleep(interval)
-
-            try:
-                LOGGER.info(
-                    "[Shopee][按钮查找] 步骤=%s，第 %s/%s 次尝试，xpath=%s",
-                    step_name,
-                    attempt + 1,
-                    max_attempts,
-                    xpath,
-                )
-                element = self._find_action_element(tab, xpath, timeout=5, target_name=step_name)
-                if not element:
-                    LOGGER.warning("[Shopee][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
-                    self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次未找到按钮后")
-                    continue
-                self._click_element_with_fallback(tab, element, xpath, step_name)
-                previous_click_dispatched = True
-                if success_xpath and success_state:
-                    LOGGER.info("[Shopee][按钮已点击] 步骤=%s，开始验证=%s", step_name, success_name)
-                    if not self._wait_for_element_state(
-                        tab,
-                        success_xpath,
-                        success_state,
-                        safe_success_timeout,
-                        success_name,
-                    ):
-                        LOGGER.warning("[Shopee][按钮验证失败] 步骤=%s，第 %s/%s 次未满足=%s", step_name, attempt + 1, max_attempts, success_name)
-                        self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次状态验证失败后")
-                        continue
-                else:
-                    LOGGER.info("[Shopee][按钮已点击] 步骤=%s，无额外状态验证", step_name)
-                LOGGER.info("[Shopee][按钮成功] 步骤=%s，第 %s/%s 次点击并验证成功", step_name, attempt + 1, max_attempts)
-                return True
-            except Exception as exc:
-                LOGGER.warning(
-                    "[Shopee][按钮异常] 步骤=%s，第 %s/%s 次失败，异常=%s，xpath=%s",
-                    step_name,
-                    attempt + 1,
-                    max_attempts,
-                    exc,
-                    xpath,
-                )
-                self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次点击异常后")
-
-        LOGGER.error("[Shopee][按钮终止] 步骤=%s，全部 %s 次点击均失败，xpath=%s", step_name, max_attempts, xpath)
-        return False
-
-    def _scroll_element_to_center(self, tab: Any, xpath: str, target_name: str) -> bool:
-        """把时间切换按钮滚动到屏幕水平中心线；只执行一次，失败由调用方继续流程。"""
-        if not xpath:
-            LOGGER.warning("[Shopee][滚动跳过] 目标=%s，XPath 为空", target_name)
-            return False
-
-        # 滚动的目的就是处理视口外元素，因此不能使用要求“已经位于视口内”的
-        # _find_action_element()；只要 DOM 元素处于 displayed 状态就可以执行滚动。
-        element = self._find_visible_element(tab, xpath, timeout=3)
-        if not element:
-            LOGGER.warning("[Shopee][滚动失败且不重试] 目标=%s，未找到DOM可见元素，xpath=%s", target_name, xpath)
-            return False
-
-        # 优先使用 DrissionPage 自带滚动接口，真实驱动浏览器滚动到元素中心。
-        api_scrolled = False
-        try:
-            scroll_api = getattr(element, "scroll", None)
-            to_center = getattr(scroll_api, "to_center", None) if scroll_api is not None else None
-            if callable(to_center):
-                to_center()
-                api_scrolled = True
-                LOGGER.info("[Shopee][滚动API成功] 目标=%s，已通过 to_center() 定位，xpath=%s", target_name, xpath)
-            else:
-                to_see = getattr(scroll_api, "to_see", None) if scroll_api is not None else None
-                if callable(to_see):
-                    try:
-                        to_see(center=True)
-                    except TypeError:
-                        to_see()
-                    api_scrolled = True
-                    LOGGER.info("[Shopee][滚动API成功] 目标=%s，已通过 to_see() 定位，xpath=%s", target_name, xpath)
-        except Exception as exc:
-            LOGGER.warning("[Shopee][滚动API异常] 目标=%s，准备使用 JavaScript 滚动，异常=%s", target_name, exc)
-
-        # 再使用 JavaScript 的 block:center，兼容没有 DrissionPage 滚动接口的版本。
-        try:
-            xpath_literal = json.dumps(xpath, ensure_ascii=False)
-            result = tab.run_js(
-                f"""
-                const targetXPath = {xpath_literal};
-                let target = document.evaluate(
-                    targetXPath,
-                    document,
-                    null,
-                    XPathResult.FIRST_ORDERED_NODE_TYPE,
-                    null
-                ).singleNodeValue;
-                if (!target) return false;
-                const originalRect = target.getBoundingClientRect();
-                // XPath 可能命中没有尺寸的内部 div/span，改用最近的父节点完成滚动。
-                if (originalRect.width <= 0 || originalRect.height <= 0) {{
-                    target = target.parentElement || target;
-                }}
-                target.scrollIntoView({{behavior: 'instant', block: 'center', inline: 'center'}});
-                return true;
-                """
-            )
-            if result is not False:
-                LOGGER.info("[Shopee][滚动成功] 目标=%s，已滚动到屏幕中心，xpath=%s", target_name, xpath)
-                return True
-        except Exception as exc:
-            LOGGER.warning("[Shopee][滚动JS异常] 目标=%s，JavaScript 滚动失败，异常=%s", target_name, exc)
-
-        return api_scrolled
-
     def _click_element_with_fallback(self, tab: Any, element: Any, xpath: str, step_name: str) -> None:
         """点击元素；无尺寸时依次尝试可点击父节点和 JavaScript click。"""
         try:
@@ -900,42 +903,6 @@ class ShopeeAuto:
 
         raise RuntimeError(f"原始点击和父节点/JS回退均失败：{first_error}")
 
-    def _wait_for_element_state(
-        self,
-        tab: Any,
-        xpath: str,
-        expected_state: str,
-        timeout_seconds: float,
-        target_name: str,
-    ) -> bool:
-        """等待日期选项出现或消失；消失需要连续确认两次。"""
-        if expected_state not in {"visible", "hidden"}:
-            LOGGER.error("[Shopee][状态配置错误] 目标=%s，不支持状态=%s", target_name, expected_state)
-            return False
-        started_at = time.monotonic()
-        deadline = started_at + timeout_seconds
-        hidden_checks = 0
-        LOGGER.info("[Shopee][状态等待] 目标=%s，期望=%s，最长 %.1f 秒，xpath=%s", target_name, expected_state, timeout_seconds, xpath)
-        while time.monotonic() < deadline:
-            self._close_ad_popup(tab, f"等待{target_name}状态时")
-            # 状态验证只判断元素是否存在且 displayed，不要求它已经在视口内。
-            # 这样广告页时间按钮可以先被确认出现，再由滚动函数移到屏幕中心。
-            visible = bool(self._find_visible_element(tab, xpath, timeout=1))
-            if expected_state == "visible" and visible:
-                LOGGER.info("[Shopee][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
-                return True
-            if expected_state == "hidden":
-                if visible:
-                    hidden_checks = 0
-                else:
-                    hidden_checks += 1
-                    if hidden_checks >= 2:
-                        LOGGER.info("[Shopee][状态满足] 目标=%s 连续两次不可见，确认消失", target_name)
-                        return True
-            time.sleep(0.5)
-        LOGGER.error("[Shopee][状态超时] 目标=%s，等待 %.1f 秒未达到=%s，xpath=%s", target_name, timeout_seconds, expected_state, xpath)
-        return False
-
     def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
         """等待 Shopee 主文档加载完成。"""
         started_at = time.monotonic()
@@ -954,55 +921,7 @@ class ShopeeAuto:
             except Exception as exc:
                 LOGGER.warning("[Shopee][页面异常] 读取 document.readyState 失败：%s", exc)
             time.sleep(1)
-        LOGGER.error("[Shopee][页面超时] 等待 %.1f 秒仍未加载完成，继续执行", timeout_seconds)
-        return False
-
-    def _wait_for_xpath(self, tab: Any, xpath: str, timeout_seconds: float, target_name: str) -> bool:
-        """等待下一按钮或数据；没有目标 XPath 时固定等待 30 秒。"""
-        if not xpath:
-            LOGGER.warning("[Shopee][元素等待] 目标=%s 未配置 XPath，固定等待 %.1f 秒", target_name, timeout_seconds)
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                self._close_ad_popup(tab, f"固定等待{target_name}时")
-                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-            return True
-        started_at = time.monotonic()
-        deadline = started_at + timeout_seconds
-        LOGGER.info("[Shopee][元素等待] 目标=%s，最长 %.1f 秒，xpath=%s", target_name, timeout_seconds, xpath)
-        while time.monotonic() < deadline:
-            self._close_ad_popup(tab, f"等待{target_name}出现时")
-            if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
-                LOGGER.info("[Shopee][元素出现] 目标=%s，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
-                return True
-            time.sleep(1)
-        LOGGER.error("[Shopee][元素超时] 目标=%s，等待 %.1f 秒仍未出现，xpath=%s", target_name, timeout_seconds, xpath)
-        return False
-
-    def _wait_for_any_xpath(self, tab: Any, xpaths: list[str], timeout_seconds: float, target_name: str) -> bool:
-        """等待多个 XPath 中任意一个出现，适用于登录后菜单可能有不同展开状态的页面。"""
-        candidates = [str(xpath or "").strip() for xpath in xpaths if str(xpath or "").strip()]
-        if not candidates:
-            LOGGER.warning("[Shopee][多元素等待] 目标=%s 没有有效 XPath，固定等待 %.1f 秒", target_name, timeout_seconds)
-            time.sleep(timeout_seconds)
-            return True
-
-        started_at = time.monotonic()
-        deadline = started_at + timeout_seconds
-        LOGGER.info("[Shopee][多元素等待] 目标=%s，候选数=%s，最长 %.1f 秒", target_name, len(candidates), timeout_seconds)
-        while time.monotonic() < deadline:
-            self._close_ad_popup(tab, f"等待{target_name}出现时")
-            for index, xpath in enumerate(candidates, start=1):
-                if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
-                    LOGGER.info(
-                        "[Shopee][多元素出现] 目标=%s，第 %s 个候选已出现，耗时 %.2f 秒，xpath=%s",
-                        target_name,
-                        index,
-                        time.monotonic() - started_at,
-                        xpath,
-                    )
-                    return True
-            time.sleep(1)
-        LOGGER.error("[Shopee][多元素超时] 目标=%s，等待 %.1f 秒仍没有候选元素出现", target_name, timeout_seconds)
+        LOGGER.error("[Shopee][页面超时] 等待 %.1f 秒仍未加载完成，本轮页面加载判定失败", timeout_seconds)
         return False
 
     def _read_xpath(self, tab: Any, xpath: str, field_name: str) -> str:
@@ -1127,30 +1046,6 @@ class ShopeeAuto:
             # run_js 不同版本返回值不同，回退到 DrissionPage 的尺寸判断。
             pass
         return ShopeeAuto._element_has_geometry(element)
-
-    def _element_state_matches(self, tab: Any, xpath: str, expected_state: str) -> bool:
-        """立即判断元素状态，用于重试前确认上次点击是否延迟生效。"""
-        # 状态匹配使用 DOM displayed 状态，不把“位于视口之外”误判成“已经消失”。
-        visible = bool(self._find_visible_element(tab, xpath, timeout=0.5))
-        if expected_state == "visible":
-            return visible
-        if expected_state == "hidden":
-            return not visible
-        return False
-
-    @staticmethod
-    def _next_step_xpath(steps: list[dict[str, Any]], start_index: int) -> str:
-        """从后续步骤中返回第一个非空 XPath。"""
-        for step in steps[start_index:]:
-            xpath = str(step.get("xpath") or "").strip()
-            if xpath:
-                return xpath
-        return ""
-
-    @staticmethod
-    def _first_step_xpath(steps: list[dict[str, Any]]) -> str:
-        """返回按钮步骤中的第一个非空 XPath。"""
-        return ShopeeAuto._next_step_xpath(steps, 0)
 
     @staticmethod
     def _format_value(raw_text: str, kind: str) -> Any:

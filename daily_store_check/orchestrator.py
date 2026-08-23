@@ -132,6 +132,87 @@ SHOPEE_PERCENT_TEXT_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# Shopee 历史电子表使用便于人工阅读的业务顺序：店铺名、昨日12项、最近7天12项、采集时间。
+# 多维表仍使用 SHOPEE_TABLE_FIELD_ORDER 中的真实字段名，不受电子表列顺序调整影响。
+SHOPEE_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
+    "店铺名",
+    "昨天ALL展示次数",
+    "昨天ALL点击数",
+    "昨天ALL点击率",
+    "昨天ALL订单量",
+    "昨天ALL商品已出售",
+    "昨天ALL销售额",
+    "昨天ALL花费",
+    "昨天ALL广告支出回报率",
+    "昨天ALL优惠价金额",
+    "昨天ALL优惠劵带来销售额",
+    "昨天ALL加购次数",
+    "昨天ALL加购率",
+    "7天ALL展示次数",
+    "7天ALL点击数",
+    "7天ALL点击率",
+    "7天ALL订单量",
+    "7天ALL商品已出售",
+    "7天ALL销售额",
+    "7天ALL花费",
+    "7天ALL广告支出回报率",
+    "7天ALL优惠价金额",
+    "7天ALL优惠劵带来销售额",
+    "7天ALL加购次数",
+    "7天ALL加购率",
+    "采集时间",
+)
+
+# 机器人 Markdown 与电子表使用相同的指标先后顺序；展示标签去掉“昨天/7天/ALL”前缀。
+SHOPEE_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "昨日广告数据",
+        (
+            ("展示次数", "昨天ALL展示次数"),
+            ("点击数", "昨天ALL点击数"),
+            ("点击率", "昨天ALL点击率"),
+            ("订单量", "昨天ALL订单量"),
+            ("商品已出售", "昨天ALL商品已出售"),
+            ("销售额", "昨天ALL销售额"),
+            ("花费", "昨天ALL花费"),
+            ("广告支出回报率", "昨天ALL广告支出回报率"),
+            ("优惠价金额", "昨天ALL优惠价金额"),
+            ("优惠劵带来销售额", "昨天ALL优惠劵带来销售额"),
+            ("加购次数", "昨天ALL加购次数"),
+            ("加购率", "昨天ALL加购率"),
+        ),
+    ),
+    (
+        "最近7天广告数据",
+        (
+            ("展示次数", "7天ALL展示次数"),
+            ("点击数", "7天ALL点击数"),
+            ("点击率", "7天ALL点击率"),
+            ("订单量", "7天ALL订单量"),
+            ("商品已出售", "7天ALL商品已出售"),
+            ("销售额", "7天ALL销售额"),
+            ("花费", "7天ALL花费"),
+            ("广告支出回报率", "7天ALL广告支出回报率"),
+            ("优惠价金额", "7天ALL优惠价金额"),
+            ("优惠劵带来销售额", "7天ALL优惠劵带来销售额"),
+            ("加购次数", "7天ALL加购次数"),
+            ("加购率", "7天ALL加购率"),
+        ),
+    ),
+)
+
+# 当爬虫没有提供“显示值”时，机器人根据字段类别补充货币符号或合适的小数位。
+SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
+    field_name
+    for field_name in SHOPEE_TABLE_FIELD_ORDER
+    if any(keyword in field_name for keyword in ("销售额", "花费", "优惠价金额"))
+)
+SHOPEE_INTEGER_FIELDS: frozenset[str] = frozenset(
+    field_name
+    for field_name in SHOPEE_TABLE_FIELD_ORDER
+    if any(keyword in field_name for keyword in ("展示次数", "点击数", "订单量", "商品已出售", "加购次数"))
+)
+
 
 # 美客多多维表和历史电子表的固定 32 字段顺序。
 # 多维表只接收这些已建立字段，避免通用“指标/数值/原始数据”导致 WrongRequestBody。
@@ -349,6 +430,9 @@ class DailyStoreCheck:
                 self._write_feishu(task, rows)
                 if task.platform == "tiktok":
                     message_title, message_body = self._format_tiktok_notification(task.store_name, rows)
+                    self._safe_notify_markdown(task.recipient, message_title, message_body)
+                elif task.platform == "shopee":
+                    message_title, message_body = self._format_shopee_notification(task.store_name, rows)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
                 else:
                     self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
@@ -843,7 +927,7 @@ class DailyStoreCheck:
         if missing_fields:
             LOGGER.warning("[飞书][SP空字段] 以下字段本次无数据，不放入多维表请求体：%s", missing_fields)
 
-        # 历史电子表固定保留 26 列，空指标写空单元格，采集时间使用便于阅读的 ISO 文本。
+        # 历史电子表固定保留 26 列，按“昨日数据 -> 7天数据”排列；空指标写空单元格。
         spreadsheet_values = dict(merged_fields)
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
@@ -851,7 +935,8 @@ class DailyStoreCheck:
             value = spreadsheet_values.get(field_name, "")
             if value not in ("", None):
                 spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="SP")
-        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in SHOPEE_TABLE_FIELD_ORDER]
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in SHOPEE_SPREADSHEET_FIELD_ORDER]
+        LOGGER.info("[飞书][SP电子表顺序] 字段顺序=%s，行数据=%s", SHOPEE_SPREADSHEET_FIELD_ORDER, spreadsheet_row)
         return [bitable_record], [spreadsheet_row]
 
     def _build_mercado_feishu_rows(
@@ -1001,6 +1086,73 @@ class DailyStoreCheck:
         return title, "\n".join(lines).strip()
 
     @staticmethod
+    def _format_shopee_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
+        """整理 Shopee 机器人 Markdown，固定按昨日和最近7天两组输出。"""
+        collected_at = ""
+        display_values: dict[str, Any] = {}
+        for row in rows:
+            collected_at = collected_at or str(row.get("采集时间") or "")
+            metric_name = str(row.get("指标") or "").strip()
+            if metric_name:
+                # SP_auto.py 的显示值已经包含 R$ 或 %；没有显示值时再使用内部数值补充格式。
+                value = row.get("显示值", "")
+                if value in ("", None):
+                    value = row.get("数值", "")
+                if value not in ("", None):
+                    display_values[metric_name] = value
+
+            # 兼容以后 SP_auto.py 改成一次返回“飞书字段”字典的结果结构。
+            platform_fields = row.get("飞书字段", {})
+            if isinstance(platform_fields, dict):
+                for field_name, field_value in platform_fields.items():
+                    if field_name not in display_values and field_value not in ("", None):
+                        display_values[field_name] = field_value
+
+        try:
+            timestamp = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+            date_text = f"{timestamp.month}月{timestamp.day}日"
+        except (TypeError, ValueError):
+            date_text = collected_at[:10] if collected_at else "未知日期"
+
+        title = f"{store_name} shopee 推送数据 - {date_text}"
+        lines: list[str] = []
+        for group_name, metric_specs in SHOPEE_MESSAGE_GROUPS:
+            lines.append(f"### {group_name}")
+            for label, field_name in metric_specs:
+                value = display_values.get(field_name, "")
+                lines.append(f"- **{label}**：{DailyStoreCheck._format_shopee_display_value(field_name, value)}")
+            # 组间保留一个空行，防止两段数据在飞书卡片中连成一块。
+            lines.append("")
+        return title, "\n".join(lines).strip()
+
+    @staticmethod
+    def _format_shopee_display_value(field_name: str, value: Any) -> str:
+        """补充 Shopee 机器人字段的货币、百分比和小数格式。"""
+        if value in (None, ""):
+            return "-"
+        text = str(value).strip()
+        if field_name in SHOPEE_PERCENT_TEXT_FIELDS:
+            return DailyStoreCheck._format_percent_text(value, platform_log_name="SP")
+        if field_name in SHOPEE_CURRENCY_FIELDS:
+            if text.upper().startswith("R$"):
+                return text
+            try:
+                return f"R${float(value):.2f}"
+            except (TypeError, ValueError):
+                return text
+        if field_name in SHOPEE_INTEGER_FIELDS:
+            try:
+                return str(int(float(value)))
+            except (TypeError, ValueError):
+                return text
+        if "广告支出回报率" in field_name:
+            try:
+                return f"{float(value):.2f}"
+            except (TypeError, ValueError):
+                return text
+        return text
+
+    @staticmethod
     def _format_tiktok_display_value(field_name: str, value: Any, raw_text: str = "") -> str:
         """把 TK 数值格式化为机器人和人工可读文本，并根据原始值保留 R$/USD 符号。"""
         if value in (None, ""):
@@ -1059,23 +1211,11 @@ class DailyStoreCheck:
                     lines.append(f"{field_name}: {value}")
             return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
         if any(row.get("平台") == "shopee" for row in rows):
-            merged_fields: dict[str, Any] = {}
-            for row in rows:
-                metric_name = str(row.get("指标") or "").strip()
-                value = row.get("显示值", row.get("数值", ""))
-                if metric_name and value not in ("", None):
-                    merged_fields[metric_name] = value
-                platform_fields = row.get("飞书字段", {})
-                if isinstance(platform_fields, dict):
-                    for field_name, field_value in platform_fields.items():
-                        if field_value not in ("", None):
-                            merged_fields[field_name] = field_value
-            lines = [
-                f"{field_name}: {merged_fields[field_name]}"
-                for field_name in SHOPEE_TABLE_FIELD_ORDER
-                if field_name not in {"店铺名", "采集时间"} and field_name in merged_fields
-            ]
-            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
+            _, message_body = DailyStoreCheck._format_shopee_notification(
+                str(rows[0].get("店铺名") or "Shopee"),
+                rows,
+            )
+            return message_body
         lines = []
         for row in rows[:20]:
             platform_fields = row.get("飞书字段", {})
