@@ -29,9 +29,13 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Shopee 登录页和卖家中心域名。URL 查询参数不参与判断。
-# 当前 URL 为登录页时，本店铺立即停止采集，由外层紫鸟会话关闭后继续下一店铺。
+# 如果当前 URL 中包含 login，视为需要执行登录按钮点击流程。
 SHOPEE_LOGIN_PAGE_URL = "https://accounts.shopee.com.br/seller/login"
 SHOPEE_SELLER_HOST = "seller.shopee.com.br"
+
+# Shopee 登录页的“Entrar”按钮。按钮点击后等待 URL 回到 seller.shopee.com.br，
+# 再等待首页 document.readyState=complete，才继续进入广告页。
+SHOPEE_LOGIN_BUTTON_XPATH = "//button[contains(normalize-space(),'Entrar')]"
 
 # 已确认登录后直接打开广告页，不再点击首页的营销中心或 Shopee 广告菜单。
 SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
@@ -70,6 +74,13 @@ PERIOD_GROUP_VALUES: dict[str, str] = {
 # 紫鸟刚打开店铺时 URL 可能还在 chrome://newtab 或重定向中。
 # 最长观察 60 秒，期间一旦进入登录页或 seller.shopee.com.br 就立即作出判断。
 SHOPEE_URL_STATE_TIMEOUT_SECONDS = 60
+
+# 登录按钮点击后等待回到卖家中心首页的最长时间，单位为秒。
+# 页面可能先提交表单、再经过多次重定向，因此这里单独保留一个可调整参数。
+SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS = 60
+
+# 登录按钮首次点击失败后允许再次尝试的次数。总尝试次数为 1 + 此值。
+SHOPEE_LOGIN_CLICK_RETRY_TIMES = 3
 
 # Shopee 广告弹窗关闭按钮按顺序检查：先使用现有奖励弹窗定位，找不到时再检查广告升级通知弹窗。
 # 后续如果出现更多类型，只需在列表末尾追加 XPath，不需要修改关闭函数。
@@ -164,7 +175,8 @@ class ShopeeAuto:
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
 
-        # 首页只通过 URL 判断登录状态，不查找元素、不处理首页弹窗，也不点击任何首页菜单。
+        # 首页先通过 URL 判断登录状态。若 URL 中含 login，点击登录页的 Entrar 按钮，
+        # 等待回到卖家中心首页后再进入广告页；已登录状态则直接继续。
         self._confirm_login_state_by_url(tab, store_name)
         template_url = self._open_ad_page(tab, store_name)
 
@@ -250,7 +262,7 @@ class ShopeeAuto:
         return rows
 
     def _confirm_login_state_by_url(self, tab: Any, store_name: str) -> None:
-        """仅根据当前 URL 判断登录状态；未登录或无法确认时终止当前店铺。"""
+        """根据当前 URL 判断登录状态；登录页点击 Entrar 后等待卖家中心首页。"""
         started_at = time.monotonic()
         deadline = started_at + SHOPEE_URL_STATE_TIMEOUT_SECONDS
         last_url = ""
@@ -269,12 +281,14 @@ class ShopeeAuto:
 
             url_state = self._classify_login_url(current_url)
             if url_state == "not_logged_in":
-                error_message = (
-                    f"Shopee 店铺 {store_name} 当前网址为登录页，确认账号未登录；"
-                    "登录流程尚未配置，已停止本店铺采集，关闭店铺后继续下一店铺。"
+                LOGGER.warning(
+                    "[Shopee][URL确认未登录] 店铺=%s，url=%s；准备点击登录按钮 xpath=%s",
+                    store_name,
+                    current_url,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
                 )
-                LOGGER.error("[Shopee][URL确认未登录] 店铺=%s，url=%s", store_name, current_url)
-                raise RuntimeError(error_message)
+                self._login_from_login_page(tab, store_name)
+                return
             if url_state == "logged_in":
                 LOGGER.info(
                     "[Shopee][URL确认已登录] 店铺=%s，url=%s，耗时=%.2f秒",
@@ -288,6 +302,112 @@ class ShopeeAuto:
         raise RuntimeError(
             f"Shopee 店铺 {store_name} 在 {SHOPEE_URL_STATE_TIMEOUT_SECONDS} 秒内未进入登录页或卖家中心，"
             f"无法确认登录状态，最后网址={last_url or '<空>'}；已停止本店铺采集。"
+        )
+
+    def _login_from_login_page(self, tab: Any, store_name: str) -> None:
+        """点击 Shopee 登录页的 Entrar 按钮，并等待页面回到卖家中心首页。"""
+        max_attempts = SHOPEE_LOGIN_CLICK_RETRY_TIMES + 1
+        last_error = ""
+
+        for attempt in range(max_attempts):
+            attempt_number = attempt + 1
+            if attempt > 0:
+                interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
+                LOGGER.warning(
+                    "[Shopee][登录按钮重试] 店铺=%s，第 %s/%s 次点击前等待 %.2f 秒，xpath=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    interval,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
+                )
+                time.sleep(interval)
+
+            try:
+                LOGGER.info(
+                    "[Shopee][登录按钮查找] 店铺=%s，第 %s/%s 次尝试，xpath=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
+                )
+                login_button = self._find_action_element(
+                    tab,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
+                    timeout=3,
+                    target_name="Shopee登录Entrar按钮",
+                )
+                if not login_button:
+                    raise RuntimeError("未找到可点击的 Entrar 登录按钮")
+
+                self._click_element_with_fallback(
+                    tab,
+                    login_button,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
+                    "Shopee登录Entrar",
+                )
+                LOGGER.info(
+                    "[Shopee][登录按钮点击成功] 店铺=%s，第 %s/%s 次点击已提交，等待首页",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                )
+                self._wait_for_login_home(tab, store_name)
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                LOGGER.warning(
+                    "[Shopee][登录按钮失败] 店铺=%s，第 %s/%s 次失败，异常=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    exc,
+                )
+
+        raise RuntimeError(
+            f"Shopee 店铺 {store_name} 登录按钮连续 {max_attempts} 次未能完成，最后错误={last_error}；"
+            "已停止本店铺采集。"
+        )
+
+    def _wait_for_login_home(self, tab: Any, store_name: str) -> None:
+        """等待登录后 URL 回到卖家中心，并确认首页主文档加载完成。"""
+        started_at = time.monotonic()
+        deadline = started_at + SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS
+        last_url = ""
+        LOGGER.info(
+            "[Shopee][登录后首页等待] 店铺=%s，最长等待=%.1f秒，目标域名=%s",
+            store_name,
+            SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS,
+            SHOPEE_SELLER_HOST,
+        )
+
+        while time.monotonic() < deadline:
+            current_url = self._read_current_url(tab)
+            if current_url != last_url:
+                LOGGER.info("[Shopee][登录后URL变化] 店铺=%s，当前url=%s", store_name, current_url or "<空>")
+                last_url = current_url
+
+            if self._classify_login_url(current_url) == "logged_in":
+                remaining = max(1.0, deadline - time.monotonic())
+                page_ready = self._wait_for_page_ready(tab, min(remaining, AD_PAGE_LOAD_TIMEOUT_SECONDS))
+                if page_ready:
+                    LOGGER.info(
+                        "[Shopee][登录成功] 店铺=%s，已回到卖家中心首页，耗时=%.2f秒，url=%s",
+                        store_name,
+                        time.monotonic() - started_at,
+                        current_url,
+                    )
+                    return
+                LOGGER.warning(
+                    "[Shopee][登录后首页未就绪] 店铺=%s，当前url=%s，继续等待重定向/页面加载",
+                    store_name,
+                    current_url,
+                )
+            time.sleep(1)
+
+        raise TimeoutError(
+            f"Shopee 店铺 {store_name} 点击 Entrar 后在 {SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS} 秒内未确认首页加载完成，"
+            f"最后网址={last_url or '<空>'}"
         )
 
     def _open_ad_page(self, tab: Any, store_name: str) -> str:
@@ -685,9 +805,12 @@ class ShopeeAuto:
 
     @staticmethod
     def _classify_login_url(current_url: str) -> str:
-        """返回 not_logged_in、logged_in 或 unknown，查询参数和末尾斜杠不影响判断。"""
+        """返回 not_logged_in、logged_in 或 unknown；URL 中出现 login 即视为登录页。"""
+        url_text = str(current_url or "").strip()
+        if "login" in url_text.casefold():
+            return "not_logged_in"
         try:
-            parsed = urlparse(str(current_url or "").strip())
+            parsed = urlparse(url_text)
         except (TypeError, ValueError):
             return "unknown"
         host = parsed.netloc.casefold().split(":", 1)[0]
