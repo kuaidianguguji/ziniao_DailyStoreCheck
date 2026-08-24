@@ -121,8 +121,8 @@ SHOPEE_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "昨天ALL点击率",
 )
 
-# Shopee 只有点击率和加购率属于百分比；广告支出回报率是普通倍数，不能追加百分号。
-# SP_auto.py 内部用 0.033 表示 3.3%，写入飞书多维表和电子表时再转换成 "3.3%" 文本。
+# Shopee 只有点击率和加购率属于百分比；SP_auto.py 内部用 0.033 表示 3.3%，
+# 写入飞书多维表和电子表时再转换成 "3.3%" 文本。
 SHOPEE_PERCENT_TEXT_FIELDS: frozenset[str] = frozenset(
     {
         "昨天ALL点击率",
@@ -130,6 +130,25 @@ SHOPEE_PERCENT_TEXT_FIELDS: frozenset[str] = frozenset(
         "昨天ALL加购率",
         "7天ALL加购率",
     }
+)
+
+# 飞书端把广告支出回报率配置成 STRING（多行文本），而不是数字字段。
+# 该指标是 ROAS 普通倍数，只转换成例如 "2.61" 的字符串，不能追加百分号。
+SHOPEE_ROAS_TEXT_FIELDS: frozenset[str] = frozenset(
+    {
+        "昨天ALL广告支出回报率",
+        "7天ALL广告支出回报率",
+    }
+)
+
+# SP 多维表中除店铺名、采集时间和六个文本指标之外，其他业务字段均为 DOUBLE。
+# 写入前根据这个集合执行类型校验，避免把带 R$ 的展示文本误传给数字/货币字段。
+SHOPEE_DOUBLE_FIELDS: frozenset[str] = frozenset(
+    field_name
+    for field_name in SHOPEE_TABLE_FIELD_ORDER
+    if field_name not in {"店铺名", "采集时间"}
+    and field_name not in SHOPEE_PERCENT_TEXT_FIELDS
+    and field_name not in SHOPEE_ROAS_TEXT_FIELDS
 )
 
 # Shopee 历史电子表使用便于人工阅读的业务顺序：店铺名、昨日12项、最近7天12项、采集时间。
@@ -904,7 +923,8 @@ class DailyStoreCheck:
             collected_at = datetime.now(timezone.utc).isoformat()
 
         # 飞书金额和数字字段不能接收空字符串，因此只把非空业务指标加入请求 JSON。
-        # 点击率和加购率在飞书端是文本字段，发送前统一转换成 "3.3%" 字符串。
+        # 点击率和加购率是文本字段，发送前统一转换成 "3.3%" 字符串；
+        # 广告支出回报率也是文本字段，但它是普通倍数，发送 "2.61"，不追加百分号。
         bitable_record: dict[str, Any] = {
             "店铺名": task.store_name,
             "采集时间": self._to_feishu_timestamp_ms(collected_at),
@@ -916,7 +936,13 @@ class DailyStoreCheck:
             if value not in ("", None):
                 if field_name in SHOPEE_PERCENT_TEXT_FIELDS:
                     value = self._format_percent_text(value, platform_log_name="SP")
+                elif field_name in SHOPEE_ROAS_TEXT_FIELDS:
+                    value = self._format_roas_text(value, platform_log_name="SP")
+                elif field_name in SHOPEE_DOUBLE_FIELDS:
+                    value = self._format_double_value(value, field_name, platform_log_name="SP")
                 bitable_record[field_name] = value
+
+        self._log_and_validate_shopee_bitable_record(bitable_record)
 
         missing_fields = [
             field_name
@@ -935,6 +961,10 @@ class DailyStoreCheck:
             value = spreadsheet_values.get(field_name, "")
             if value not in ("", None):
                 spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="SP")
+        for field_name in SHOPEE_ROAS_TEXT_FIELDS:
+            value = spreadsheet_values.get(field_name, "")
+            if value not in ("", None):
+                spreadsheet_values[field_name] = self._format_roas_text(value, platform_log_name="SP")
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in SHOPEE_SPREADSHEET_FIELD_ORDER]
         LOGGER.info("[飞书][SP电子表顺序] 字段顺序=%s，行数据=%s", SHOPEE_SPREADSHEET_FIELD_ORDER, spreadsheet_row)
         return [bitable_record], [spreadsheet_row]
@@ -1000,6 +1030,60 @@ class DailyStoreCheck:
                 spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="MKD")
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in MERCADO_TABLE_FIELD_ORDER]
         return [bitable_record], [spreadsheet_row]
+
+    @staticmethod
+    def _format_roas_text(value: Any, platform_log_name: str = "") -> str:
+        """把广告支出回报率转换为飞书 STRING 字段需要的普通小数字符串。"""
+        text = str(value).strip()
+        if not text:
+            return ""
+        try:
+            number = float(text.replace(",", ".").replace("%", "").strip())
+        except (TypeError, ValueError):
+            LOGGER.warning("[飞书][%s广告支出回报率转换失败] 原始值=%r，保留原文本", platform_log_name or "平台", value)
+            return text
+        return f"{number:.2f}"
+
+    @staticmethod
+    def _format_double_value(value: Any, field_name: str, platform_log_name: str = "") -> int | float | str:
+        """把 SP DOUBLE 字段规范成数字；误传带 R$ 的展示文本时先解析再写入。"""
+        if isinstance(value, bool):
+            LOGGER.error("[飞书][%s DOUBLE类型错误] 字段=%s，禁止写入布尔值=%r", platform_log_name or "平台", field_name, value)
+            return ""
+        if isinstance(value, (int, float)):
+            return value
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        cleaned = text.replace("R$", "").replace("BRL", "").replace(" ", "")
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", ".")
+        try:
+            number = float(cleaned)
+        except ValueError:
+            LOGGER.error("[飞书][%s DOUBLE转换失败] 字段=%s，值=%r", platform_log_name or "平台", field_name, value)
+            return ""
+        return int(number) if number.is_integer() else round(number, 2)
+
+    @staticmethod
+    def _log_and_validate_shopee_bitable_record(record: dict[str, Any]) -> None:
+        """打印 SP 最终请求字段并在本地拦截 STRING/DOUBLE 类型错误。"""
+        for field_name, value in record.items():
+            LOGGER.info(
+                "[飞书][SP最终字段] 字段=%s，值=%r，Python类型=%s",
+                field_name,
+                value,
+                type(value).__name__,
+            )
+            if field_name in SHOPEE_PERCENT_TEXT_FIELDS or field_name in SHOPEE_ROAS_TEXT_FIELDS:
+                if not isinstance(value, str):
+                    raise TypeError(f"SP 字段 {field_name} 必须是 STRING，实际类型={type(value).__name__}")
+            elif field_name in SHOPEE_DOUBLE_FIELDS:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise TypeError(f"SP 字段 {field_name} 必须是 DOUBLE，实际值={value!r}")
 
     @staticmethod
     def _format_percent_text(value: Any, platform_log_name: str = "") -> str:

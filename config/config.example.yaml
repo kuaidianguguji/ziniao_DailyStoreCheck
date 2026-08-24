@@ -101,13 +101,16 @@ platforms:
   tiktok:
     crawler: "tiktok.TK_auto:TiktokAuto"
     captcha:
-      # 登录后出现物体匹配验证码时，是否启用通义千问视觉识别。
+      # 登录后出现物体匹配验证码时，是否启用验证码识别接口。
       enabled: true
-      # 程序会对同一张验证码图片固定识别 5 次，各坐标取四舍五入后的平均值再点击。
-      # 可在这里填写，也可以通过环境变量 DASHSCOPE_API_KEY 注入。
-      qwen_api_key: ""
-      model: "qwen-vl-plus"
-      endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+      # 每张验证码图片请求一次；接口 data.res_str 返回两个图片像素坐标，直接点击，不平均、不四舍五入。
+      # 可在这里填写，也可以通过环境变量 TIKTOK_CAPTCHA_API_KEY 注入。
+      api_key: ""
+      # 验证码识别类型，当前相同形状物体验证码使用 38。
+      verify_idf_id: "38"
+      # 验证码接口的识别说明参数，按 captcha_tiktok.py 发送；不是旧视觉模型提示词。
+      words: "Select 2 objects that are the same shape"
+      endpoint: "http://220.167.181.200:9009/openapi/verify_code_identify/"
       request_timeout_seconds: 60
   shopee:
     crawler: "shopee.SP_auto:ShopeeAuto"

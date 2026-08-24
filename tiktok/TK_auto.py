@@ -9,16 +9,17 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -49,23 +50,14 @@ CAPTCHA_IMAGE_XPATH = '//img[@alt="captchaOpti_hCaptchaModal1_header"]'
 CAPTCHA_CONFIRM_BUTTON_XPATH = '//button[normalize-space(.)="确认"]'
 # 单次识别或提交失败后的额外重试次数；值为 2 表示最多处理 3 张验证码图片。
 CAPTCHA_SOLVE_RETRY_TIMES = 3
-# 同一张验证码图片连续请求视觉模型的次数。五次坐标分别求平均后再点击，降低单次识别的位置误差。
-CAPTCHA_RECOGNITION_SAMPLE_COUNT = 5
+# 验证码识别接口返回 data.res_str 字符串，例如 "[(135, 87), (287, 179)]"。
+# 两个元组就是图片上的两个点击坐标，图片左上角为原点；坐标直接使用，不做平均或四舍五入。
+# 这是识别接口的 words 参数，不是旧的视觉模型提示词；参考接口脚本要求随请求发送。
+CAPTCHA_WORDS = "Select 2 objects that are the same shape"
 # 点击验证码确认按钮后，等待业务菜单、验证码消失或验证码图片更新的最长秒数。
 CAPTCHA_SUBMIT_RESULT_TIMEOUT_SECONDS = 15
 # 登录按钮提交后，等待业务菜单、手机号错误或验证码出现的最长秒数。
 LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS = 30
-
-# 发送给通义千问视觉模型的固定提示词。模型只能返回两个原图像素坐标。
-CAPTCHA_QWEN_PROMPT = """
-这是相似物体匹配验证码，图中有多个3D物体，请找出两个形状相似的物体。务必记住下面4条规则注意：1.一定要忽略物体大小和物体颜色；
-2.一定只考虑物体是阿拉伯数字、26个英语字母和规则的几何形状（具体只考虑这几种几何形状：圆柱体、球体、长方体、正方体、多面体）；
-3.两相形状似物体经常存在视角不一样（比如一个是正面，一个是斜侧等等）；
-4.千万别被阴影干扰，阴影的方向不统一，阴影的颜色深浅不一样（唯一相同点是阴影颜色都属于灰色系，只是颜色深浅不一样）。
-严格只返回JSON，不要任何解释、不要markdown标记。
-输出格式：{"p1":[x1,y1],"p2":[x2,y2]}
-坐标为图片像素坐标，左上角是原点(0,0)。
-""".strip()
 
 # 页面和按钮操作参数。
 # 当当前路由是登录页时，连续检查多少次 URL；4 次、每次间隔 5 秒，总观察窗口约 20 秒。
@@ -932,27 +924,28 @@ class TiktokAuto:
         return "pending"
 
     def _solve_login_captcha(self, tab: Any) -> None:
-        """调用通义千问识别两个相同物体，并在当前紫鸟标签页完成坐标点击和提交。"""
+        """调用验证码识别接口，并在当前紫鸟标签页完成坐标点击和提交。"""
         captcha_config = self.config.get("captcha", {})
         if not isinstance(captcha_config, dict):
             raise RuntimeError("TikTok captcha 配置必须是字典")
         if not bool(captcha_config.get("enabled", True)):
             raise RuntimeError("TikTok 已出现验证码，但 platforms.tiktok.captcha.enabled 为 false")
 
-        api_key = str(captcha_config.get("qwen_api_key") or os.getenv("DASHSCOPE_API_KEY", "")).strip()
+        api_key = str(captcha_config.get("api_key") or os.getenv("TIKTOK_CAPTCHA_API_KEY", "")).strip()
         if not api_key:
-            raise RuntimeError("TikTok 已出现验证码，但未配置 captcha.qwen_api_key 或 DASHSCOPE_API_KEY")
+            raise RuntimeError("TikTok 已出现验证码，但未配置 captcha.api_key 或 TIKTOK_CAPTCHA_API_KEY")
 
         endpoint = str(
             captcha_config.get("endpoint")
-            or "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+            or "http://220.167.181.200:9009/openapi/verify_code_identify/"
         ).strip()
-        model = str(captcha_config.get("model") or "qwen-vl-max").strip()
+        verify_idf_id = str(captcha_config.get("verify_idf_id") or "38").strip()
+        words = str(captcha_config.get("words") or CAPTCHA_WORDS).strip()
         request_timeout = float(captcha_config.get("request_timeout_seconds", 60) or 60)
         max_attempts = CAPTCHA_SOLVE_RETRY_TIMES + 1
         LOGGER.warning(
-            "[TikTok][验证码处理] 开始识别物体匹配验证码，模型=%s，最多尝试=%s次",
-            model,
+            "[TikTok][验证码处理] 开始识别物体匹配验证码，识别类型=%s，最多尝试=%s次",
+            verify_idf_id,
             max_attempts,
         )
 
@@ -968,7 +961,7 @@ class TiktokAuto:
             try:
                 image_bytes = self._read_captcha_image_bytes(captcha_img, image_src, request_timeout)
                 try:
-                    image_base64, image_width, image_height = self._image_bytes_to_jpeg_base64(image_bytes)
+                    image_base64, image_width, image_height = self._image_bytes_to_data_uri(image_bytes, image_src)
                 except RuntimeError:
                     raise
                 except Exception as image_exc:
@@ -977,24 +970,25 @@ class TiktokAuto:
                     screenshot = captcha_img.get_screenshot(as_bytes="png", scroll_to_center=True)
                     if not screenshot:
                         raise RuntimeError("TikTok 验证码元素截图失败") from image_exc
-                    image_base64, image_width, image_height = self._image_bytes_to_jpeg_base64(bytes(screenshot))
-                point1, point2, recognition_results = self._recognise_captcha_average(
+                    image_base64, image_width, image_height = self._image_bytes_to_data_uri(bytes(screenshot), "")
+                point1, point2, raw_reply = self._recognise_captcha_coordinates(
                     api_key,
                     endpoint,
-                    model,
+                    verify_idf_id,
+                    words,
                     request_timeout,
                     image_base64,
                     image_width,
                     image_height,
                 )
                 LOGGER.info(
-                    "[TikTok][验证码识别成功] 第 %s/%s 次，原图尺寸=%sx%s，五次识别结果=%s，"
-                    "四舍五入后的平均坐标 p1=%s，p2=%s",
+                    "[TikTok][验证码识别成功] 第 %s/%s 次，原图尺寸=%sx%s，"
+                    "接口原始 res_str=%r，直接使用坐标 p1=%s，p2=%s",
                     attempt + 1,
                     max_attempts,
                     image_width,
                     image_height,
-                    json.dumps(recognition_results, ensure_ascii=False),
+                    raw_reply,
                     point1,
                     point2,
                 )
@@ -1036,66 +1030,35 @@ class TiktokAuto:
         raise RuntimeError(f"TikTok 物体匹配验证码连续 {max_attempts} 次处理失败")
 
     @classmethod
-    def _recognise_captcha_average(
+    def _recognise_captcha_coordinates(
         cls,
         api_key: str,
         endpoint: str,
-        model: str,
+        verify_idf_id: str,
+        words: str,
         timeout_seconds: float,
         image_base64: str,
         image_width: int,
         image_height: int,
-    ) -> tuple[tuple[int, int], tuple[int, int], list[dict[str, Any]]]:
-        """对同一张图片识别五次，分别计算 p1/p2 横纵坐标的四舍五入平均值。"""
-        recognition_results: list[dict[str, Any]] = []
-        for sample_index in range(CAPTCHA_RECOGNITION_SAMPLE_COUNT):
-            point1, point2, raw_reply = cls._call_qwen_captcha(
-                api_key,
-                endpoint,
-                model,
-                timeout_seconds,
-                image_base64,
-                image_width,
-                image_height,
-            )
-            current_result = {
-                "p1": [point1[0], point1[1]],
-                "p2": [point2[0], point2[1]],
-            }
-            recognition_results.append(current_result)
-            LOGGER.info(
-                "[TikTok][验证码模型采样] 第 %s/%s 次识别成功，坐标=%s，模型原始返回=%r",
-                sample_index + 1,
-                CAPTCHA_RECOGNITION_SAMPLE_COUNT,
-                json.dumps(current_result, ensure_ascii=False),
-                raw_reply,
-            )
-
-        point1_average = (
-            cls._round_coordinate_average(result["p1"][0] for result in recognition_results),
-            cls._round_coordinate_average(result["p1"][1] for result in recognition_results),
-        )
-        point2_average = (
-            cls._round_coordinate_average(result["p2"][0] for result in recognition_results),
-            cls._round_coordinate_average(result["p2"][1] for result in recognition_results),
+    ) -> tuple[tuple[float, float], tuple[float, float], str]:
+        """请求一次并直接返回接口给出的两个坐标，不做重复采样、平均或四舍五入。"""
+        point1, point2, raw_reply = cls._call_captcha_identify_api(
+            api_key,
+            endpoint,
+            verify_idf_id,
+            words,
+            timeout_seconds,
+            image_base64,
+            image_width,
+            image_height,
         )
         LOGGER.info(
-            "[TikTok][验证码坐标平均] 样本数=%s，全部坐标=%s，最终 p1=%s，最终 p2=%s",
-            len(recognition_results),
-            json.dumps(recognition_results, ensure_ascii=False),
-            point1_average,
-            point2_average,
+            "[TikTok][验证码坐标读取] res_str=%r，坐标1=%s，坐标2=%s，坐标未做平均或四舍五入",
+            raw_reply,
+            point1,
+            point2,
         )
-        return point1_average, point2_average, recognition_results
-
-    @staticmethod
-    def _round_coordinate_average(values: Any) -> int:
-        """使用十进制 ROUND_HALF_UP 求坐标平均值，确保小数部分为 .5 时向上取整。"""
-        decimal_values = [Decimal(str(value)) for value in values]
-        if not decimal_values:
-            raise ValueError("验证码坐标平均值缺少样本")
-        average = sum(decimal_values, Decimal("0")) / Decimal(len(decimal_values))
-        return int(average.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        return point1, point2, raw_reply
 
     @staticmethod
     def _read_captcha_image_bytes(captcha_img: Any, image_src: str, timeout_seconds: float) -> bytes:
@@ -1122,8 +1085,8 @@ class TiktokAuto:
         return bytes(screenshot)
 
     @staticmethod
-    def _image_bytes_to_jpeg_base64(image_bytes: bytes) -> tuple[str, int, int]:
-        """用 Pillow 把内存图片转为 JPEG Base64，并返回模型坐标所对应的原图尺寸。"""
+    def _image_bytes_to_data_uri(image_bytes: bytes, image_src: str = "") -> tuple[str, int, int]:
+        """保留原始图片格式生成 Data URI，并返回接口坐标对应的原图尺寸。"""
         try:
             from PIL import Image
         except ImportError as exc:
@@ -1132,61 +1095,92 @@ class TiktokAuto:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image.load()
             width, height = image.size
-            rgb_image = image.convert("RGB")
-            output = io.BytesIO()
-            rgb_image.save(output, format="JPEG", quality=85)
-        encoded = base64.b64encode(output.getvalue()).decode("ascii")
-        return f"data:image/jpeg;base64,{encoded}", int(width), int(height)
+            image_format = str(image.format or "PNG").lower()
+
+        # 优先使用图片实际格式；如果 Pillow 没有识别，再尝试从 src 后缀读取。
+        format_to_mime = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "gif": "image/gif",
+            "bmp": "image/bmp",
+        }
+        mime_type = format_to_mime.get(image_format)
+        if not mime_type and image_src:
+            mime_type = mimetypes.guess_type(urlsplit(image_src).path)[0]
+        if not mime_type or not mime_type.startswith("image/"):
+            mime_type = "image/png"
+
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}", int(width), int(height)
 
     @staticmethod
-    def _call_qwen_captcha(
+    def _call_captcha_identify_api(
         api_key: str,
         endpoint: str,
-        model: str,
+        verify_idf_id: str,
+        words: str,
         timeout_seconds: float,
         image_base64: str,
         image_width: int,
         image_height: int,
     ) -> tuple[tuple[float, float], tuple[float, float], str]:
-        """调用千问视觉模型，并严格解析、校验 p1/p2 两个图片像素坐标。"""
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        """调用验证码识别接口，并从 res_str 严格解析、校验两个图片像素坐标。"""
+        headers = {"Content-Type": "application/json"}
         payload = {
-            "model": model,
-            "input": {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"text": CAPTCHA_QWEN_PROMPT},
-                            {"image": image_base64},
-                        ],
-                    }
-                ]
-            },
-            "parameters": {"temperature": 0.0, "max_tokens": 1200},
+            "key": api_key,
+            "verify_idf_id": verify_idf_id,
+            "img_base64": image_base64,
+            "words": words,
         }
+        LOGGER.info(
+            "[TikTok][验证码接口请求] endpoint=%s，verify_idf_id=%s，words=%r，图片格式=%s，图片尺寸=%sx%s",
+            endpoint,
+            verify_idf_id,
+            words,
+            image_base64.split(";", 1)[0].replace("data:", "") if image_base64.startswith("data:") else "unknown",
+            image_width,
+            image_height,
+        )
         response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
         response.raise_for_status()
-        response_json = response.json()
         try:
-            raw_reply = response_json["output"]["choices"][0]["message"]["content"][0]["text"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ValueError(f"千问验证码响应结构异常: {response_json}") from exc
+            response_json = response.json()
+        except ValueError as exc:
+            raise ValueError(f"验证码接口返回的不是 JSON: {response.text!r}") from exc
+        if not isinstance(response_json, dict):
+            raise ValueError(f"验证码接口响应结构异常: {response_json!r}")
+        if response_json.get("code") != 200:
+            raise ValueError(
+                f"验证码接口识别失败 code={response_json.get('code')!r} "
+                f"msg={response_json.get('msg')!r}"
+            )
 
-        json_match = re.search(r"\{.*\}", str(raw_reply), re.S)
-        if not json_match:
-            raise ValueError(f"千问返回内容中没有 JSON 坐标: {raw_reply!r}")
-        coordinate_data = json.loads(json_match.group(0))
+        response_data = response_json.get("data")
+        if not isinstance(response_data, dict):
+            raise ValueError(f"验证码接口响应缺少 data 字典: {response_json!r}")
+        raw_reply = str(response_data.get("res_str") or "").strip()
+        if not raw_reply:
+            raise ValueError(f"验证码接口响应缺少 data.res_str: {response_json!r}")
+        try:
+            coordinate_data = ast.literal_eval(raw_reply)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"验证码接口 res_str 坐标格式错误: {raw_reply!r}") from exc
+        if not isinstance(coordinate_data, (list, tuple)) or len(coordinate_data) != 2:
+            raise ValueError(f"验证码接口必须返回两个坐标: {raw_reply!r}")
 
         points: list[tuple[float, float]] = []
-        for point_name in ("p1", "p2"):
-            point = coordinate_data.get(point_name)
+        for point_index, point in enumerate(coordinate_data, start=1):
             if not isinstance(point, (list, tuple)) or len(point) != 2:
-                raise ValueError(f"验证码坐标 {point_name} 格式错误: {point!r}")
-            x, y = float(point[0]), float(point[1])
+                raise ValueError(f"验证码第 {point_index} 个坐标格式错误: {point!r}")
+            try:
+                x, y = float(point[0]), float(point[1])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"验证码第 {point_index} 个坐标不是数字: {point!r}") from exc
             if not (0 <= x <= image_width and 0 <= y <= image_height):
                 raise ValueError(
-                    f"验证码坐标 {point_name}=({x}, {y}) 超出图片范围 {image_width}x{image_height}"
+                    f"验证码第 {point_index} 个坐标=({x}, {y}) 超出图片范围 {image_width}x{image_height}"
                 )
             points.append((x, y))
         return points[0], points[1], str(raw_reply)

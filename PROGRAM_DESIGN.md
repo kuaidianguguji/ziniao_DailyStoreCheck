@@ -106,7 +106,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `TK_auto.py` 确认登录后直接进入 TikTok 固定广告页和数据概览页，各自集中维护 URL、时间面板/日期切换步骤和指标 XPath；未填写或暂时失效的 XPath 按空值处理。
 - TikTok 广告金额字段使用 `currency_code=USD`，概览 GMV 使用 `currency_code=BRL`；两个模块分别返回一条记录，避免同名 SKU 订单数字段相互覆盖。
 - TikTok 接管后立即同时检查登录入口、营销按钮、店铺广告按钮、首页广告弹窗关闭按钮和 `verify-bar-close` 验证码弹窗关闭按钮，不等待 `document.readyState`。首次只看到登录入口时固定等待 `LOGIN_RECHECK_WAIT_SECONDS` 后复查，复查仍只有登录入口才执行登录；登录流程每一步前后都会检查四类已登录标志，发现任一标志便立即结束登录流程。确认登录后直接打开广告页和数据概览页，时间按钮及日期选项的出现/消失统一在 `TK_STEP_WAIT_SECONDS` 内确认，随后等待页面完成和数据标志再批量抓取。
-- TikTok 登录默认直接提交；仅在出现“请检查输入的手机号格式”时切换邮箱并重新登录。登录提交后如果出现物体匹配验证码，程序从内存读取图片，调用通义千问视觉模型识别两个相同物体，通过当前紫鸟标签页的 CDP 鼠标事件点击坐标并提交；API Key 配置在 `platforms.tiktok.captcha.qwen_api_key`，也可使用环境变量 `DASHSCOPE_API_KEY`。
+- TikTok 登录默认直接提交；仅在出现“请检查输入的手机号格式”时切换邮箱并重新登录。登录提交后如果出现物体匹配验证码，程序从内存读取图片，调用验证码识别接口识别两个相同物体。接口返回 `data.res_str` 字符串，例如 `"[(135, 87), (287, 179)]"`，表示图片上的两个点击坐标，图片左上角为原点；程序直接使用坐标，不做五次采样、平均或四舍五入，再通过当前紫鸟标签页的 CDP 鼠标事件点击并提交。API Key 配置在 `platforms.tiktok.captcha.api_key`，也可使用环境变量 `TIKTOK_CAPTCHA_API_KEY`。
 - TikTok 同一日期周期的全部指标通过一次页面 JavaScript 批量 XPath 读取；批量脚本异常时才回退为逐项读取。日志会逐项打印字段名、完整 XPath、该 XPath 抓到的原始文本和类型，再打印转换结果。
 - TikTok 日期按钮采用“首次 + 3 次重试”，相邻尝试至少间隔 2 秒；时间面板出现和日期选项消失都以统一的 `TK_STEP_WAIT_SECONDS`（默认5秒）作为单次状态确认超时。
 - TikTok 会详细记录页面状态、按钮 XPath、每次点击和重试结果、下一元素等待、弹窗处理，以及每个指标的原始值、转换值和 Python 类型；日志同时显示在控制台并写入 `data/daily_store_check.log`。
