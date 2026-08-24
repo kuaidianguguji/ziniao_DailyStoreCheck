@@ -25,7 +25,7 @@ from DrissionPage import Chromium
 LOGGER = logging.getLogger(__name__)
 
 
-# 美客多首页广告弹窗的关闭按钮。
+# 美客多首页广告弹窗的关闭按钮
 HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
 
 # 紫鸟当前网址包含 vendedores 时，使用卖家后台专用的经营指标页面。
