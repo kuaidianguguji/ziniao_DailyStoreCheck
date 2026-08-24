@@ -79,18 +79,41 @@ deepseek:
   enabled: true
   # 可直接填写，也可通过环境变量 DEEPSEEK_API_KEY 注入。
   api_key: ""
-  model_name: "deepseek-v4-flash"
-  base_url: "https://api.deepseek.com/v1"
-  temperature: 0.7
-  max_tokens: 2000
-  timeout_seconds: 120
+  model_name: "deepseek-v4-pro"
+  base_url: "https://api.deepseek.com"
+  timeout_seconds: 300
   # 首次分析失败后最多重试 5 次，即最多请求 6 次；HTTP、响应解析和空内容都会触发重试。
   retry_times: 5
   # 相邻两次 DeepSeek 请求之间的等待秒数。
   retry_interval_seconds: 3
+  # 提示词固定照搬 test/DS_an2.py；客户端会使用同样的原文。
   system_prompt: |
-    你是中国一个专业南美跨境电商公司总经理，擅长店铺的数据分析。严格按照用户要求处理输入文本。
-    输出尽量简洁，不要多余废话。这分别是 TikTok、Shopee、美客多巴西跨境电商后台的广告数据和店铺概览数据，帮我总结分析这些店铺。
+    在这里粘贴你的完整提示词。
+
+    例如：
+
+    你是一名资深巴西电商运营经理和数据分析师，
+    长期负责：
+
+    Shopee Brazil
+    TikTok Shop Brazil
+    Mercado Livre Brazil
+
+    我每天会提供多个平台、多个店铺的经营数据。
+
+    你的任务是：
+
+    数据清洗
+    → 指标计算
+    → 单店诊断
+    → 同平台横向比较
+    → 异常识别
+    → 机会识别
+    → 给出运营优先级
+
+    所有结论必须严格基于我提供的数据。
+
+    禁止虚构数据。
 
 data:
   retention_days: 90
