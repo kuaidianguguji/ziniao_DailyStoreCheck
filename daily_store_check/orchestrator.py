@@ -285,6 +285,82 @@ MERCADO_PROGRESS_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+# 美客多机器人消息与历史电子表使用相同的业务顺序：先输出最近 7 天，再输出最近 30 天。
+# 每组按销售额、销量、流量、转化、取消和退货指标排列，便于每天横向比较。
+MERCADO_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "最近7天经营数据",
+        (
+            ("总销售额", "7天总销售额"),
+            ("已售件数", "7天已售件数"),
+            ("平均单价", "7天平均单价"),
+            ("访问", "7天访问"),
+            ("销售量", "7天销售量"),
+            ("转换率", "7天转换率"),
+            ("取消的销售数量", "7天取消的销售数量"),
+            ("取消的销售价值", "7天取消的销售价值"),
+            ("退货数量", "7天退货数量"),
+            ("退货价值", "7天退货价值"),
+            ("独特的参观", "7天独特的参观"),
+            ("购买意向", "7天购买意向"),
+            ("独立意向转换率", "7天独立意向转换率"),
+            ("意向购买转换率", "7天意向购买转换率"),
+            ("总转换率", "7天总转换率"),
+        ),
+    ),
+    (
+        "最近30天经营数据",
+        (
+            ("总销售额", "30天总销售额"),
+            ("已售件数", "30天已售件数"),
+            ("平均单价", "30天平均单价"),
+            ("访问", "30天访问"),
+            ("销售量", "30天销售量"),
+            ("转换率", "30天转换率"),
+            ("取消的销售数量", "30天取消的销售数量"),
+            ("取消的销售价值", "30天取消的销售价值"),
+            ("退货数量", "30天退货数量"),
+            ("退货价值", "30天退货价值"),
+            ("独特的参观", "30天独特的参观"),
+            ("购买意向", "30天购买意向"),
+            ("独立意向转换率", "30天独立意向转换率"),
+            ("意向购买转换率", "30天意向购买转换率"),
+            ("总转换率", "30天总转换率"),
+        ),
+    ),
+)
+
+# 美客多历史电子表的列顺序与上面的机器人消息完全一致；店铺名放在首列，采集时间放在末列。
+# 电子表字段必须与飞书表头逐列对应，后续调整顺序时请同步修改 MERCADO_MESSAGE_GROUPS。
+MERCADO_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
+    "店铺名",
+    *(field_name for _, metric_specs in MERCADO_MESSAGE_GROUPS for _, field_name in metric_specs),
+    "采集时间",
+)
+
+# 美客多货币字段均为巴西雷亚尔；计数字段在消息中按整数显示。
+MERCADO_CURRENCY_FIELDS: frozenset[str] = frozenset(
+    {
+        "7天总销售额",
+        "7天平均单价",
+        "7天取消的销售价值",
+        "7天退货价值",
+        "30天总销售额",
+        "30天平均单价",
+        "30天取消的销售价值",
+        "30天退货价值",
+    }
+)
+MERCADO_INTEGER_FIELDS: frozenset[str] = frozenset(
+    {
+        field_name
+        for _, metric_specs in MERCADO_MESSAGE_GROUPS
+        for label, field_name in metric_specs
+        if field_name not in MERCADO_PROGRESS_FIELDS
+        and any(keyword in label for keyword in ("件数", "访问", "销售量", "数量", "参观", "意向"))
+    }
+)
+
 
 class DailyStoreCheck:
     """控制表 -> 紫鸟单店铺 -> 平台爬虫 -> 飞书写入/推送的主流程。"""
@@ -452,6 +528,9 @@ class DailyStoreCheck:
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
                 elif task.platform == "shopee":
                     message_title, message_body = self._format_shopee_notification(task.store_name, rows)
+                    self._safe_notify_markdown(task.recipient, message_title, message_body)
+                elif task.platform == "mercado":
+                    message_title, message_body = self._format_mercado_notification(task.store_name, rows)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
                 else:
                     self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
@@ -1021,6 +1100,7 @@ class DailyStoreCheck:
             LOGGER.warning("[飞书][MKD空字段] 以下字段本次无数据，不放入多维表请求体：%s", missing_fields)
 
         # 电子表固定追加 32 列，并保留 ISO 采集时间方便人工查看。
+        # 这里使用业务阅读顺序，不使用多维表的建表顺序；多维表记录仍按其真实字段名写入。
         spreadsheet_values = dict(merged_fields)
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
@@ -1028,7 +1108,8 @@ class DailyStoreCheck:
             value = spreadsheet_values.get(field_name, "")
             if value not in ("", None):
                 spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="MKD")
-        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in MERCADO_TABLE_FIELD_ORDER]
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in MERCADO_SPREADSHEET_FIELD_ORDER]
+        LOGGER.info("[飞书][MKD电子表顺序] 字段顺序=%s，行数据=%s", MERCADO_SPREADSHEET_FIELD_ORDER, spreadsheet_row)
         return [bitable_record], [spreadsheet_row]
 
     @staticmethod
@@ -1210,6 +1291,78 @@ class DailyStoreCheck:
         return title, "\n".join(lines).strip()
 
     @staticmethod
+    def _format_mercado_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
+        """整理美客多机器人 Markdown，固定按最近 7 天和最近 30 天输出。"""
+        collected_at = ""
+        display_values: dict[str, Any] = {}
+        for row in rows:
+            collected_at = collected_at or str(row.get("采集时间") or "")
+
+            # MKD_auto.py 当前返回一行“飞书字段”字典；同时兼容旧版一项指标一行的结果。
+            platform_fields = row.get("飞书字段", {})
+            if isinstance(platform_fields, dict):
+                for field_name, field_value in platform_fields.items():
+                    if field_value not in ("", None) or field_name not in display_values:
+                        display_values[field_name] = field_value
+            metric_name = str(row.get("指标") or "").strip()
+            if metric_name and metric_name not in display_values:
+                value = row.get("显示值", row.get("数值", ""))
+                if value not in ("", None):
+                    display_values[metric_name] = value
+
+        try:
+            timestamp = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+            date_text = f"{timestamp.month}月{timestamp.day}日"
+        except (TypeError, ValueError):
+            date_text = collected_at[:10] if collected_at else "未知日期"
+
+        title = f"{store_name} mercado 推送数据 - {date_text}"
+        lines: list[str] = []
+        for group_name, metric_specs in MERCADO_MESSAGE_GROUPS:
+            lines.append(f"### {group_name}")
+            for label, field_name in metric_specs:
+                value = display_values.get(field_name, "")
+                lines.append(f"- **{label}**：{DailyStoreCheck._format_mercado_display_value(field_name, value)}")
+            lines.append("")
+        return title, "\n".join(lines).strip()
+
+    @staticmethod
+    def _format_mercado_display_value(field_name: str, value: Any) -> str:
+        """把美客多字段转换成机器人可读文本：金额为 BRL，比例为百分比，计数为整数。"""
+        if value in (None, ""):
+            return "-"
+
+        text = str(value).strip()
+        if field_name in MERCADO_PROGRESS_FIELDS:
+            return DailyStoreCheck._format_percent_text(value, platform_log_name="MKD")
+
+        if field_name in MERCADO_CURRENCY_FIELDS:
+            cleaned = text.upper().replace("BRL", "").replace("R$", "").replace(" ", "")
+            try:
+                # 巴西格式如 18.558,26；同时兼容爬虫内部的 18558.26。
+                if "," in cleaned and "." in cleaned:
+                    cleaned = cleaned.replace(".", "").replace(",", ".")
+                else:
+                    cleaned = cleaned.replace(",", ".")
+                return f"R${float(cleaned):.2f}"
+            except (TypeError, ValueError):
+                return text
+
+        if field_name in MERCADO_INTEGER_FIELDS:
+            cleaned = text.replace(" ", "")
+            try:
+                # 1,400 是计数字段的千位分隔，不能按小数 1.4 处理。
+                if "," in cleaned and "." not in cleaned and len(cleaned.rsplit(",", 1)[-1]) == 3:
+                    cleaned = cleaned.replace(",", "")
+                else:
+                    cleaned = cleaned.replace(",", ".")
+                return str(int(float(cleaned)))
+            except (TypeError, ValueError):
+                return text
+
+        return text
+
+    @staticmethod
     def _format_shopee_display_value(field_name: str, value: Any) -> str:
         """补充 Shopee 机器人字段的货币、百分比和小数格式。"""
         if value in (None, ""):
@@ -1277,23 +1430,11 @@ class DailyStoreCheck:
             )
             return message_body
         if any(row.get("平台") == "mercado" for row in rows):
-            merged_fields: dict[str, Any] = {}
-            for row in rows:
-                platform_fields = row.get("飞书字段", {})
-                if isinstance(platform_fields, dict):
-                    for field_name, value in platform_fields.items():
-                        if value not in ("", None):
-                            merged_fields[field_name] = value
-            lines: list[str] = []
-            for field_name in MERCADO_TABLE_FIELD_ORDER:
-                if field_name not in merged_fields:
-                    continue
-                value = merged_fields[field_name]
-                if field_name in MERCADO_PROGRESS_FIELDS and isinstance(value, (int, float)):
-                    lines.append(f"{field_name}: {value * 100:.1f}%")
-                else:
-                    lines.append(f"{field_name}: {value}")
-            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
+            _, message_body = DailyStoreCheck._format_mercado_notification(
+                str(rows[0].get("店铺名") or "Mercado"),
+                rows,
+            )
+            return message_body
         if any(row.get("平台") == "shopee" for row in rows):
             _, message_body = DailyStoreCheck._format_shopee_notification(
                 str(rows[0].get("店铺名") or "Shopee"),
