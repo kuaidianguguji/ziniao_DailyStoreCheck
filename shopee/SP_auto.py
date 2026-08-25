@@ -69,6 +69,7 @@ SHOPEE_TRAFFIC_ERROR_URL = "https://shopee.com.br/verify/traffic/error"
 PERIOD_GROUP_VALUES: dict[str, str] = {
     "昨天": "yesterday",
     "7天": "last_week",
+    "今天": "today",
 }
 
 # 紫鸟刚打开店铺时 URL 可能还在 chrome://newtab 或重定向中。
@@ -149,10 +150,15 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "7天", "field": "7天ALL花费", "xpath": '//div[@class="line-metrics"]/div[7]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天ALL广告支出回报率", "xpath": '//div[@class="line-metrics"]/div[8]//div[@class="content"]//span', "kind": "decimal"}
 ]
+METRIC_SPECS.extend(
+    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    for spec in tuple(METRIC_SPECS)
+    if spec["period"] == "7天"
+)
 
 
 class ShopeeAuto:
-    """Shopee 广告后台昨天和最近 7 天数据自动化。"""
+    """Shopee 广告后台昨天、最近 7 天和今天数据自动化。"""
 
     def __init__(self, config: dict[str, Any] | None = None):
         """保存 Shopee 独立配置；所有 XPath 集中维护在本文件顶部。"""
@@ -164,7 +170,7 @@ class ShopeeAuto:
         download_path: str = "",
         debugging_port: int | str | None = None,
     ) -> list[dict[str, Any]]:
-        """接管紫鸟当前标签页，采集昨天和最近 7 天共 24 个广告指标。"""
+        """接管紫鸟当前标签页，采集昨天、最近 7 天和今天广告指标。"""
         if not debugging_port:
             raise RuntimeError("紫鸟没有返回 debuggingPort，无法接管 Shopee 店铺")
 
@@ -181,7 +187,7 @@ class ShopeeAuto:
         template_url = self._open_ad_page(tab, store_name)
 
         rows: list[dict[str, Any]] = []
-        for period in ("昨天", "7天"):
+        for period in ("昨天", "7天", "今天"):
             group_value = PERIOD_GROUP_VALUES[period]
             period_url = self._replace_group_in_url(template_url, group_value)
             LOGGER.info(

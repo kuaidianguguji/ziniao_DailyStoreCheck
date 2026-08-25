@@ -69,6 +69,9 @@ TIKTOK_FORMULA_FIELDS: frozenset[str] = frozenset(
         "7天ROI",
     }
 )
+TIKTOK_FORMULA_FIELDS = TIKTOK_FORMULA_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in TIKTOK_FORMULA_FIELDS
+)
 
 # TikTok 历史电子表专用顺序：昨天广告、7天广告、昨天概览、7天概览。
 # 与多维表原有顺序分开维护，避免机器人和电子表受字段插入顺序影响。
@@ -81,12 +84,16 @@ TIKTOK_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
     "采集时间",
 )
 
-# 机器人消息固定使用四个分组；同名 SKU 订单数字段在不同分组中分别读取，不互相覆盖。
+# 机器人消息包含原有四个分组，并追加今天广告和今天概览两个分组；同名 SKU 订单数字段在不同分组中分别读取。
 TIKTOK_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("昨日广告数据", (("成本", "昨天成本"), ("SKU订单数", "昨天SKU订单数"), ("均单价", "昨天均单价"), ("总收入", "昨天总收入"), ("ROI", "昨天ROI"))),
     ("最近7天广告数据", (("成本", "7天成本"), ("SKU订单数", "7天SKU订单数"), ("均单价", "7天均单价"), ("总收入", "7天总收入"), ("ROI", "7天ROI"))),
     ("昨日概览数据", (("GMV", "昨天GMV"), ("成交件数", "昨天成交件数"), ("SKU订单数", "昨天SKU订单数"), ("订单数", "昨天订单数"), ("客户数", "昨天客户数"), ("商品访客数", "昨天商品访客数"), ("曝光数", "昨天曝光数"), ("去重曝光数", "昨天去重曝光数"), ("直播GMV", "直播GMV"), ("短视频GMV", "短视频GMV"), ("商品卡GMV", "商品卡GMV"))),
     ("最近7天概览数据", (("GMV", "7天GMV"), ("成交件数", "7天成交件数"), ("SKU订单数", "7天SKU订单数"), ("订单数", "7天订单数"), ("客户数", "7天客户数"), ("商品访客数", "7天商品访客数"), ("曝光数", "7天曝光数"), ("去重曝光数", "7天去重曝光数"), ("直播GMV", "_7天直播GMV"), ("短视频GMV", "_7天短视频GMV"), ("商品卡GMV", "_7天商品卡GMV"))),
+)
+TIKTOK_MESSAGE_GROUPS += (
+    ("今天广告数据", tuple((label, field.replace("7天", "今天")) for label, field in TIKTOK_MESSAGE_GROUPS[1][1])),
+    ("今天概览数据", tuple((label, field.replace("7天", "今天")) for label, field in TIKTOK_MESSAGE_GROUPS[3][1])),
 )
 
 
@@ -131,6 +138,9 @@ SHOPEE_PERCENT_TEXT_FIELDS: frozenset[str] = frozenset(
         "7天ALL加购率",
     }
 )
+SHOPEE_PERCENT_TEXT_FIELDS = SHOPEE_PERCENT_TEXT_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in SHOPEE_PERCENT_TEXT_FIELDS
+)
 
 # 飞书端把广告支出回报率配置成 STRING（多行文本），而不是数字字段。
 # 该指标是 ROAS 普通倍数，只转换成例如 "2.61" 的字符串，不能追加百分号。
@@ -139,6 +149,9 @@ SHOPEE_ROAS_TEXT_FIELDS: frozenset[str] = frozenset(
         "昨天ALL广告支出回报率",
         "7天ALL广告支出回报率",
     }
+)
+SHOPEE_ROAS_TEXT_FIELDS = SHOPEE_ROAS_TEXT_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in SHOPEE_ROAS_TEXT_FIELDS
 )
 
 # SP 多维表中除店铺名、采集时间和六个文本指标之外，其他业务字段均为 DOUBLE。
@@ -182,7 +195,7 @@ SHOPEE_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
     "采集时间",
 )
 
-# 机器人 Markdown 与电子表使用相同的指标先后顺序；展示标签去掉“昨天/7天/ALL”前缀。
+# 机器人 Markdown 按昨日、最近7天、今天依次输出；展示标签去掉周期和 ALL 前缀。
 SHOPEE_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "昨日广告数据",
@@ -219,6 +232,9 @@ SHOPEE_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
 )
+SHOPEE_MESSAGE_GROUPS += (
+    ("今天广告数据", tuple((label, field.replace("7天", "今天")) for label, field in SHOPEE_MESSAGE_GROUPS[1][1])),
+)
 
 # 当爬虫没有提供“显示值”时，机器人根据字段类别补充货币符号或合适的小数位。
 SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
@@ -226,10 +242,16 @@ SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
     for field_name in SHOPEE_TABLE_FIELD_ORDER
     if any(keyword in field_name for keyword in ("销售额", "花费", "优惠价金额"))
 )
+SHOPEE_CURRENCY_FIELDS = SHOPEE_CURRENCY_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in SHOPEE_CURRENCY_FIELDS
+)
 SHOPEE_INTEGER_FIELDS: frozenset[str] = frozenset(
     field_name
     for field_name in SHOPEE_TABLE_FIELD_ORDER
     if any(keyword in field_name for keyword in ("展示次数", "点击数", "订单量", "商品已出售", "加购次数"))
+)
+SHOPEE_INTEGER_FIELDS = SHOPEE_INTEGER_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in SHOPEE_INTEGER_FIELDS
 )
 
 
@@ -284,6 +306,9 @@ MERCADO_PROGRESS_FIELDS: frozenset[str] = frozenset(
         "30天总转换率",
     }
 )
+MERCADO_PROGRESS_FIELDS = MERCADO_PROGRESS_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in MERCADO_PROGRESS_FIELDS
+)
 
 # 美客多机器人消息与历史电子表使用相同的业务顺序：先输出最近 7 天，再输出最近 30 天。
 # 每组按销售额、销量、流量、转化、取消和退货指标排列，便于每天横向比较。
@@ -329,12 +354,20 @@ MERCADO_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
 )
+MERCADO_MESSAGE_GROUPS += (
+    ("今天经营数据", tuple((label, field.replace("7天", "今天")) for label, field in MERCADO_MESSAGE_GROUPS[0][1])),
+)
 
-# 美客多历史电子表的列顺序与上面的机器人消息完全一致；店铺名放在首列，采集时间放在末列。
-# 电子表字段必须与飞书表头逐列对应，后续调整顺序时请同步修改 MERCADO_MESSAGE_GROUPS。
+# 美客多历史电子表暂时只保留原有 7 天和 30 天字段；“今天”只用于消息发送，
+# 不能追加到既有电子表或多维表，避免表头未建立导致写入失败。
 MERCADO_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
     "店铺名",
-    *(field_name for _, metric_specs in MERCADO_MESSAGE_GROUPS for _, field_name in metric_specs),
+    *(
+        field_name
+        for group_name, metric_specs in MERCADO_MESSAGE_GROUPS
+        if group_name != "今天经营数据"
+        for _, field_name in metric_specs
+    ),
     "采集时间",
 )
 
@@ -351,6 +384,9 @@ MERCADO_CURRENCY_FIELDS: frozenset[str] = frozenset(
         "30天退货价值",
     }
 )
+MERCADO_CURRENCY_FIELDS = MERCADO_CURRENCY_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in MERCADO_CURRENCY_FIELDS
+)
 MERCADO_INTEGER_FIELDS: frozenset[str] = frozenset(
     {
         field_name
@@ -359,6 +395,9 @@ MERCADO_INTEGER_FIELDS: frozenset[str] = frozenset(
         if field_name not in MERCADO_PROGRESS_FIELDS
         and any(keyword in label for keyword in ("件数", "访问", "销售量", "数量", "参观", "意向"))
     }
+)
+MERCADO_INTEGER_FIELDS = MERCADO_INTEGER_FIELDS | frozenset(
+    field.replace("7天", "今天") for field in MERCADO_INTEGER_FIELDS
 )
 
 

@@ -83,6 +83,11 @@ CLICK_RETRY_INTERVAL_SECONDS = 2
 DATA_READY_RETRY_TIMES = 20
 # 数据加载完成标志相邻两次检查的等待秒数；5 次重查最长等待约 10 秒。
 DATA_READY_RETRY_INTERVAL_SECONDS = 2
+# 日期切换后按指标数量等待数据，不满足数量时每秒检查一次，最多检查 60 次。
+METRIC_COUNT_READY_CHECK_TIMES = 60
+METRIC_COUNT_READY_INTERVAL_SECONDS = 1
+# 指标数量满足后再给前端渲染和数值稳定留出的缓冲时间。
+METRIC_COUNT_READY_EXTRA_WAIT_SECONDS = 3
 
 # 任意两个真实按钮点击之间保持随机间隔，避免登录、菜单和日期按钮连续点击过快。
 # 点击前还会把元素滚动到视口中间、移动鼠标到目标并短暂停留，尽量模拟人工操作。
@@ -108,6 +113,7 @@ OVERVIEW_PAGE_URL = "https://seller-br.tiktok.com/compass/data-overview"
 AD_TIME_BUTTON_XPATH = '//span[@class="theme-arco-picker-suffix-icon"]'
 AD_YESTERDAY_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")])[2]'
 AD_7_DAYS_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")])[3]'
+AD_TODAY_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")])[1]'
 # 广告页面数据加载完成标志。该指标可见才表示广告页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的广告指标 XPath。
 AD_DATA_READY_XPATH = '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]'
@@ -147,22 +153,43 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
             "success_name": "最近7天按钮已经消失",
         },
     ],
+    "今天": [
+        {
+            "name": "广告-点击时间按钮（今天）",
+            "xpath": AD_TIME_BUTTON_XPATH,
+            "success_xpath": AD_TODAY_BUTTON_XPATH,
+            "success_state": "visible",
+            "success_name": "今天按钮已经出现",
+        },
+        {
+            "name": "广告-点击今天按钮",
+            "xpath": AD_TODAY_BUTTON_XPATH,
+            "success_xpath": AD_TODAY_BUTTON_XPATH,
+            "success_state": "hidden",
+            "success_name": "今天按钮已经消失",
+        },
+    ],
 }
 
 
 # 广告金额使用美元 USD，不转换为巴西雷亚尔。
 AD_METRIC_SPECS: list[dict[str, str]] = [
-    {"period": "昨天", "field": "昨天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "decimal"},
-    {"period": "7天", "field": "7天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "integer"},
-    {"period": "7天", "field": "7天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "decimal"},
+    {"period": "昨天", "field": "昨天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
+    {"period": "7天", "field": "7天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
+    {"period": "7天", "field": "7天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
 ]
+AD_METRIC_SPECS.extend(
+    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    for spec in tuple(AD_METRIC_SPECS)
+    if spec["period"] == "7天"
+)
 # AD_METRIC_SPECS: list[dict[str, str]] = [
 #     {"period": "昨天", "field": "昨天成本", "xpath": '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
 #     {"period": "昨天", "field": "昨天SKU订单数", "xpath": '//div[normalize-space(.)="SKU 订单数"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
@@ -185,9 +212,10 @@ AD_METRIC_SPECS: list[dict[str, str]] = [
 OVERVIEW_TIME_BUTTON_XPATH = '//div[@class="arco-picker-input"]/input'
 OVERVIEW_YESTERDAY_BUTTON_XPATH = '//button[@data-testid="time-selector-yesterday"]//div'
 OVERVIEW_7_DAYS_BUTTON_XPATH = '//button[@data-testid="time-selector-last-7-days"]//div'
+OVERVIEW_TODAY_BUTTON_XPATH = '//button[@data-testid="time-selector-today"]//div'
 # 概览页面数据加载完成标志。该指标可见才表示概览页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的概览指标 XPath。
-OVERVIEW_DATA_READY_XPATH = '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]'
+OVERVIEW_DATA_READY_XPATH = '(//label[contains(@class,"pcm-smc-card-group-item")])[1]//div[@class="pcm-smc-content"]'
 
 
 # 数据概览时间范围切换步骤。
@@ -224,6 +252,22 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
             "success_name": "概览最近7天按钮已经消失",
         },
     ],
+    "今天": [
+        {
+            "name": "概览-点击时间按钮（今天）",
+            "xpath": OVERVIEW_TIME_BUTTON_XPATH,
+            "success_xpath": OVERVIEW_TODAY_BUTTON_XPATH,
+            "success_state": "visible",
+            "success_name": "概览今天按钮已经出现",
+        },
+        {
+            "name": "概览-点击今天按钮",
+            "xpath": OVERVIEW_TODAY_BUTTON_XPATH,
+            "success_xpath": OVERVIEW_TODAY_BUTTON_XPATH,
+            "success_state": "hidden",
+            "success_name": "概览今天按钮已经消失",
+        },
+    ],
 }
 
 
@@ -231,29 +275,39 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 # “直播/视频/商品卡”三个 XPath 实际抓到的是渠道 GMV 金额，不是页面占比。
 # 昨天的渠道金额直接使用飞书已有字段名；7 天金额仅作为计算占比的临时值，计算后会从飞书字段中移除。
 OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
-    {"period": "昨天", "field": "昨天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "昨天成交件数", "xpath": '(//label[contains(@class,"core-checkbox")])[2]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[3]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[4]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天客户数", "xpath": '(//label[contains(@class,"core-checkbox")])[5]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天商品访客数", "xpath": '(//label[contains(@class,"core-checkbox")])[6]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[7]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天去重曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[8]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天GMV", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[1]//div[@class="pcm-smc-value-content"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "昨天成交件数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[2]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[3]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天订单数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[4]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天客户数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[5]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天商品访客数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[6]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天曝光数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[7]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天去重曝光数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[8]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+
     {"period": "昨天", "field": "直播GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "短视频GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[2]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "商品卡GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[3]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天成交件数", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[2]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[3]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天客户数", "xpath": '(//label[contains(@class,"core-checkbox")])[4]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天商品访客数", "xpath": '(//label[contains(@class,"core-checkbox")])[5]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[6]//div[@class="pcm-smc-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天去重曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[7]//div[@class="pcm-smc-content"]', "kind": "integer"},
+
+    {"period": "7天", "field": "7天GMV", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[1]//div[@class="pcm-smc-value-content"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天成交件数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[2]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[3]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天订单数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[4]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天客户数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[5]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天商品访客数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[6]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天曝光数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[7]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天去重曝光数", "xpath": '(//label[contains(@class,"pcm-smc-card-group-item")])[8]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+
     {"period": "7天", "field": "_7天直播GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "_7天短视频GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[2]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "_7天商品卡GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[3]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
 ]
+
+# 今天沿用与最近 7 天相同的指标 XPath，只更换字段前缀，便于消息中单独展示。
+OVERVIEW_METRIC_SPECS.extend(
+    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    for spec in tuple(OVERVIEW_METRIC_SPECS)
+    if spec["period"] == "7天"
+)
 # OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
 #     {"period": "昨天", "field": "昨天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
 #     {"period": "昨天", "field": "昨天成交件数", "xpath": '//div[@class="pcm-smc"][contains(.,"商品成交件数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
@@ -291,6 +345,11 @@ OVERVIEW_GMV_RATIO_SPECS: dict[str, list[dict[str, Any]]] = {
         {"amount_field": "_7天直播GMV", "ratio_field": "7天GMV直播比"},
         {"amount_field": "_7天短视频GMV", "ratio_field": "7天GMV视频比"},
         {"amount_field": "_7天商品卡GMV", "ratio_field": "7天GMV商品卡比"},
+    ],
+    "今天": [
+        {"amount_field": "_今天直播GMV", "ratio_field": "今天GMV直播比"},
+        {"amount_field": "_今天短视频GMV", "ratio_field": "今天GMV视频比"},
+        {"amount_field": "_今天商品卡GMV", "ratio_field": "今天GMV商品卡比"},
     ],
 }
 
@@ -342,7 +401,7 @@ class TiktokAuto:
         else:
             LOGGER.info("[TikTok][广告页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
-        for period in ("昨天", "7天"):
+        for period in ("昨天", "7天", "今天"):
             LOGGER.info("[TikTok][广告] 开始切换并采集时间范围=%s", period)
             if not ad_page_ready:
                 self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "未进入店铺广告页面")
@@ -355,10 +414,12 @@ class TiktokAuto:
                 continue
 
             self._wait_for_document_complete_after_period(tab, f"广告-{period}")
-            data_loaded = self._wait_for_data_ready_marker(
+            period_specs = [spec for spec in AD_METRIC_SPECS if spec["period"] == period]
+            data_loaded = self._wait_for_required_metric_count(
                 tab,
-                AD_DATA_READY_XPATH,
-                f"广告-{period}成本指标",
+                period,
+                period_specs,
+                f"广告-{period}",
             )
             if not data_loaded:
                 self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "广告数据未确认加载完成")
@@ -390,7 +451,7 @@ class TiktokAuto:
         else:
             LOGGER.info("[TikTok][概览页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
-        for period in ("昨天", "7天"):
+        for period in ("昨天", "7天", "今天"):
             LOGGER.info("[TikTok][概览] 开始切换并采集时间范围=%s", period)
             if not overview_page_ready:
                 self._record_empty_period_metrics(
@@ -415,10 +476,12 @@ class TiktokAuto:
                 continue
 
             self._wait_for_document_complete_after_period(tab, f"概览-{period}")
-            data_loaded = self._wait_for_data_ready_marker(
+            period_specs = [spec for spec in OVERVIEW_METRIC_SPECS if spec["period"] == period]
+            data_loaded = self._wait_for_required_metric_count(
                 tab,
-                OVERVIEW_DATA_READY_XPATH,
-                f"概览-{period}GMV指标",
+                period,
+                period_specs,
+                f"概览-{period}",
             )
             if not data_loaded:
                 self._record_empty_period_metrics(
@@ -1829,6 +1892,101 @@ class TiktokAuto:
             xpath,
         )
         return False
+
+    def _wait_for_required_metric_count(
+        self,
+        tab: Any,
+        period: str,
+        specs: list[dict[str, str]],
+        page_name: str,
+    ) -> bool:
+        """等待当前周期所有已配置指标出现非空文本，再额外缓冲三秒。"""
+        configured_specs = [
+            spec for spec in specs if str(spec.get("xpath") or "").strip()
+        ]
+        required_count = len(configured_specs)
+        if required_count == 0:
+            LOGGER.warning("[TikTok][指标数量等待跳过] 页面=%s，时间范围=%s，没有有效 XPath", page_name, period)
+            return True
+
+        LOGGER.info(
+            "[TikTok][指标数量等待] 页面=%s，时间范围=%s，要求=%s个非空指标，间隔=%.1f秒，最多检查=%s次",
+            page_name,
+            period,
+            required_count,
+            METRIC_COUNT_READY_INTERVAL_SECONDS,
+            METRIC_COUNT_READY_CHECK_TIMES,
+        )
+        started_at = time.monotonic()
+        for check_index in range(1, METRIC_COUNT_READY_CHECK_TIMES + 1):
+            loaded_count = self._count_non_empty_metrics(tab, configured_specs)
+            LOGGER.info(
+                "[TikTok][指标数量检查] 页面=%s，时间范围=%s，第%s/%s次，已加载=%s/%s",
+                page_name,
+                period,
+                check_index,
+                METRIC_COUNT_READY_CHECK_TIMES,
+                loaded_count,
+                required_count,
+            )
+            if loaded_count >= required_count:
+                LOGGER.info(
+                    "[TikTok][指标数量满足] 页面=%s，时间范围=%s，已加载=%s/%s，额外等待%.1f秒",
+                    page_name,
+                    period,
+                    loaded_count,
+                    required_count,
+                    METRIC_COUNT_READY_EXTRA_WAIT_SECONDS,
+                )
+                time.sleep(METRIC_COUNT_READY_EXTRA_WAIT_SECONDS)
+                return True
+            if check_index < METRIC_COUNT_READY_CHECK_TIMES:
+                time.sleep(METRIC_COUNT_READY_INTERVAL_SECONDS)
+
+        LOGGER.error(
+            "[TikTok][指标数量等待超时] 页面=%s，时间范围=%s，60次检查后仍只有%s/%s，耗时%.1f秒",
+            page_name,
+            period,
+            self._count_non_empty_metrics(tab, configured_specs),
+            required_count,
+            time.monotonic() - started_at,
+        )
+        return False
+
+    @staticmethod
+    def _count_non_empty_metrics(tab: Any, specs: list[dict[str, str]]) -> int:
+        """在页面内按每个配置 XPath 统计非空指标数量，不输出具体数据。"""
+        specs_json = json.dumps(
+            [{"xpath": str(spec.get("xpath") or "")} for spec in specs],
+            ensure_ascii=False,
+        )
+        script = f"""
+            const metricSpecs = {specs_json};
+            let loadedCount = 0;
+            for (const metric of metricSpecs) {{
+                try {{
+                    const node = document.evaluate(
+                        metric.xpath,
+                        document,
+                        null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE,
+                        null
+                    ).singleNodeValue;
+                    if (!node) continue;
+                    const isInput = node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement;
+                    const text = String(isInput ? node.value : (node.innerText ?? node.textContent ?? '')).trim();
+                    if (text) loadedCount += 1;
+                }} catch (error) {{}}
+            }}
+            return loadedCount;
+        """
+        try:
+            result = tab.run_js(script)
+            return max(0, int(result or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        except Exception:
+            return 0
 
     def _human_wait(self, tab: Any, seconds: float) -> None:
         """分段等待并穿插鼠标移动，避免长时间完全静止。"""

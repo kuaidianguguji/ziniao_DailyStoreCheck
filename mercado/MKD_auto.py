@@ -45,6 +45,7 @@ NEXT_ELEMENT_TIMEOUT_SECONDS = 30
 DATE_SWITCH_BUTTON_XPATH = '(//button[@class="andes-dropdown__trigger"])[1]'
 LAST_7_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastSevenDays")]'
 LAST_30_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastMonth")]'
+TODAY_OPTION_XPATH = '//li[contains(@id, "option-today")]'
 
 
 # 统计页面中的时间范围切换步骤。
@@ -52,6 +53,24 @@ LAST_30_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastMonth")]'
 # success_state="hidden"：目标元素可以继续保留在 HTML 中，只要连续两次处于不可见状态，
 # 就判定当前按钮点击成功；最长等待时间使用 NEXT_ELEMENT_TIMEOUT_SECONDS（当前 30 秒）。
 PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
+    "今天": [
+        {
+            "name": "打开日期切换按钮（今天）",
+            "xpath": DATE_SWITCH_BUTTON_XPATH,
+            "wait_seconds": 1,
+            "success_xpath": TODAY_OPTION_XPATH,
+            "success_state": "visible",
+            "success_name": "今天选项出现",
+        },
+        {
+            "name": "选择今天",
+            "xpath": TODAY_OPTION_XPATH,
+            "wait_seconds": 2,
+            "success_xpath": TODAY_OPTION_XPATH,
+            "success_state": "hidden",
+            "success_name": "今天选项已经不可见",
+        },
+    ],
     "7天": [
         {
             "name": "打开日期切换按钮（7天）",
@@ -126,17 +145,22 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "30天", "field": "30天独立意向转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[2]', "kind": "percent"},
     {"period": "30天", "field": "30天意向购买转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[3]', "kind": "percent"}
 ]
+METRIC_SPECS.extend(
+    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    for spec in tuple(METRIC_SPECS)
+    if spec["period"] == "7天"
+)
 
 
 class MercadoAuto:
-    """美客多 7 天/30 天经营指标自动化。"""
+    """美客多今天、7 天和 30 天经营指标自动化。"""
 
     def __init__(self, config: dict[str, Any] | None = None):
         """保存美客多独立配置；指标 XPath 直接维护在本文件的 METRIC_SPECS。"""
         self.config = config or {}
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
-        """接管紫鸟当前标签页，读取 7 天和 30 天共 30 个指标。"""
+        """接管紫鸟当前标签页，读取今天、7 天和 30 天经营指标。"""
         if not debugging_port:
             raise RuntimeError("紫鸟没有返回 debuggingPort，无法接管美客多店铺")
 
@@ -157,7 +181,7 @@ class MercadoAuto:
         self._open_metrics_page(tab)
 
         # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
-        for period in ("7天", "30天"):
+        for period in ("7天", "30天", "今天"):
             LOGGER.info("[美客多][指标] 开始切换并采集时间范围=%s", period)
             # 日期选项点击后，以对应选项“最长 30 秒内变为不可见”作为点击成功标志。
             # 元素不需要从 HTML 中移除；只要 DrissionPage 判断它不再显示即可。
