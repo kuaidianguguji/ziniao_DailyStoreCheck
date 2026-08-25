@@ -35,7 +35,7 @@ SHOPEE_SELLER_HOST = "seller.shopee.com.br"
 
 # Shopee 登录页的“Entrar”按钮。按钮点击后等待 URL 回到 seller.shopee.com.br，
 # 再等待首页 document.readyState=complete，才继续进入广告页。
-SHOPEE_LOGIN_BUTTON_XPATH = "//button[contains(normalize-space(),'Entrar')]"
+SHOPEE_LOGIN_BUTTON_XPATH = "//form/button"
 
 # 已确认登录后直接打开广告页，不再点击首页的营销中心或 Shopee 广告菜单。
 SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
@@ -362,6 +362,28 @@ class ShopeeAuto:
                     attempt_number,
                     max_attempts,
                     exc,
+                )
+
+                # 登录按钮点击、页面跳转或首页等待出现异常后，先复核一次 URL。
+                # 有些 Shopee 登录请求实际已经成功，但按钮点击返回异常或首页加载等待超时；
+                # 只要地址已经离开登录页，就直接确认登录，避免再次点击 Entrar 造成重复提交。
+                current_url = self._read_current_url(tab)
+                if current_url and self._classify_login_url(current_url) != "not_logged_in":
+                    LOGGER.warning(
+                        "[Shopee][登录失败后URL确认已登录] 店铺=%s，第 %s/%s 次失败后，"
+                        "当前url已不是未登录地址，直接确认已登录，url=%s",
+                        store_name,
+                        attempt_number,
+                        max_attempts,
+                        current_url,
+                    )
+                    return
+                LOGGER.info(
+                    "[Shopee][登录失败后URL复核仍未登录] 店铺=%s，第 %s/%s 次失败后，继续重试，url=%s",
+                    store_name,
+                    attempt_number,
+                    max_attempts,
+                    current_url or "<空>",
                 )
 
         raise RuntimeError(

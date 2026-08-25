@@ -21,6 +21,13 @@ from .config import StoreTask, is_enabled_switch, normalise_platform
 
 LOGGER = logging.getLogger(__name__)
 
+# 单张飞书 Markdown 卡片使用保守的字符上限。DeepSeek 的全店铺分析可能超过一万字，
+# 拆分后按顺序发送，避免整个 interactive 请求因内容过长返回 HTTP 400。
+MARKDOWN_CARD_MAX_CHARS = 4000
+
+# 连续发送多张分片卡片时保留短暂间隔，降低触发飞书消息频率限制的概率。
+MARKDOWN_CARD_SEND_INTERVAL_SECONDS = 0.5
+
 
 class FeishuClient:
     """飞书接口的薄封装，业务层不直接拼接 URL 或处理 token。"""
@@ -132,10 +139,37 @@ class FeishuClient:
         )
         try:
             response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
-            response.raise_for_status()
         except requests.RequestException:
             LOGGER.exception("[飞书][HTTP异常] method=%s，path=%s", method.upper(), safe_path)
             raise
+        if not response.ok:
+            # 飞书在 HTTP 400 响应中仍会返回可定位问题的 code/msg。旧逻辑先调用
+            # raise_for_status()，导致这些信息没有写入日志，只能看到笼统的 Bad Request。
+            response_text = response.text[:4000]
+            response_code: Any = ""
+            response_message = ""
+            try:
+                error_payload = response.json()
+                if isinstance(error_payload, dict):
+                    response_code = error_payload.get("code", "")
+                    response_message = str(error_payload.get("msg") or "")
+                    response_text = self._json_for_log(error_payload)
+            except ValueError:
+                pass
+            LOGGER.error(
+                "[飞书][HTTP失败] method=%s，path=%s，status=%s，code=%s，msg=%s，response=%s，请求JSON=%s",
+                method.upper(),
+                safe_path,
+                response.status_code,
+                response_code or "<无>",
+                response_message or "<无>",
+                response_text,
+                self._json_for_log(kwargs.get("json", {})),
+            )
+            raise RuntimeError(
+                f"飞书HTTP失败 status={response.status_code} "
+                f"code={response_code or '<无>'} msg={response_message or response_text[:500]}"
+            )
         try:
             payload = response.json()
         except ValueError:
@@ -425,41 +459,48 @@ class FeishuClient:
             LOGGER.warning("[飞书][Markdown机器人跳过] Markdown 内容为空，recipient=%s", recipient)
             return
 
-        # 标题放进 markdown 元素，保持应用机器人和 webhook 的卡片结构完全一致。
-        # 使用二级标题避免覆盖 DeepSeek 自己返回的一级标题。
-        card: dict[str, Any] = {
-            "schema": "2.0",
-            "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"## {str(title or '消息').strip()}\n\n{markdown_text}",
-                    }
-                ]
-            },
-        }
+        title_text = str(title or "消息").strip()
+        markdown_parts = self._split_markdown_text(markdown_text, MARKDOWN_CARD_MAX_CHARS)
+        total_parts = len(markdown_parts)
+        LOGGER.info(
+            "[飞书][Markdown分片] recipient=%s，原文字符数=%s，单片上限=%s，分片数=%s",
+            recipient or "<空接收人>",
+            len(markdown_text),
+            MARKDOWN_CARD_MAX_CHARS,
+            total_parts,
+        )
 
         if recipients and self.config.get("app_id") and self.config.get("app_secret"):
             receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
             for receive_id in recipients:
-                request_body = {
-                    "receive_id": receive_id,
-                    "msg_type": "interactive",
-                    # /im/v1/messages 的 interactive content 必须是 JSON 字符串。
-                    "content": json.dumps(card, ensure_ascii=False),
-                }
-                LOGGER.info(
-                    "[飞书][应用机器人Markdown JSON] receive_id_type=%s，body=%s",
-                    receive_id_type,
-                    self._json_for_log(request_body),
-                )
-                self._request(
-                    "POST",
-                    "/open-apis/im/v1/messages",
-                    headers=self._headers(),
-                    params={"receive_id_type": receive_id_type},
-                    json=request_body,
-                )
+                for part_index, markdown_part in enumerate(markdown_parts, start=1):
+                    part_title = title_text if total_parts == 1 else f"{title_text}（{part_index}/{total_parts}）"
+                    card = self._build_markdown_card(part_title, markdown_part)
+                    request_body = {
+                        "receive_id": receive_id,
+                        "msg_type": "interactive",
+                        # /im/v1/messages 的 interactive content 必须是 JSON 字符串。
+                        "content": json.dumps(card, ensure_ascii=False),
+                    }
+                    LOGGER.info(
+                        "[飞书][应用机器人Markdown JSON] receive_id_type=%s，接收人=%s，分片=%s/%s，"
+                        "分片字符数=%s，body=%s",
+                        receive_id_type,
+                        receive_id,
+                        part_index,
+                        total_parts,
+                        len(markdown_part),
+                        self._json_for_log(request_body),
+                    )
+                    self._request(
+                        "POST",
+                        "/open-apis/im/v1/messages",
+                        headers=self._headers(),
+                        params={"receive_id_type": receive_id_type},
+                        json=request_body,
+                    )
+                    if part_index < total_parts:
+                        time.sleep(MARKDOWN_CARD_SEND_INTERVAL_SECONDS)
             return
 
         webhook = self.config.get("robot", {}).get("webhook_url", "")
@@ -467,20 +508,177 @@ class FeishuClient:
             LOGGER.warning("飞书机器人 webhook 未配置，跳过 Markdown 推送 recipient=%s", recipient)
             return
 
-        body: dict[str, Any] = {"msg_type": "interactive", "card": card}
         secret = self.config.get("robot", {}).get("sign_secret", "")
-        if secret:
-            timestamp = str(int(time.time()))
-            body["timestamp"] = timestamp
-            body["sign"] = self._sign(timestamp, secret)
-        LOGGER.info("[飞书][Webhook机器人Markdown JSON] body=%s", self._json_for_log(body))
-        response = requests.post(webhook, json=body, timeout=self.timeout)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("code", 0) != 0:
-            LOGGER.error("[飞书][Webhook机器人Markdown失败] response=%s", self._json_for_log(result))
-            raise RuntimeError(f"飞书 Markdown 机器人推送失败: {result}")
-        LOGGER.info("[飞书][Webhook机器人Markdown成功] response=%s", self._json_for_log(result))
+        for part_index, markdown_part in enumerate(markdown_parts, start=1):
+            part_title = title_text if total_parts == 1 else f"{title_text}（{part_index}/{total_parts}）"
+            body: dict[str, Any] = {
+                "msg_type": "interactive",
+                "card": self._build_markdown_card(part_title, markdown_part),
+            }
+            if secret:
+                timestamp = str(int(time.time()))
+                body["timestamp"] = timestamp
+                body["sign"] = self._sign(timestamp, secret)
+            LOGGER.info(
+                "[飞书][Webhook机器人Markdown JSON] 分片=%s/%s，分片字符数=%s，body=%s",
+                part_index,
+                total_parts,
+                len(markdown_part),
+                self._json_for_log(body),
+            )
+            response = requests.post(webhook, json=body, timeout=self.timeout)
+            if not response.ok:
+                LOGGER.error(
+                    "[飞书][Webhook机器人Markdown HTTP失败] status=%s，response=%r",
+                    response.status_code,
+                    response.text[:4000],
+                )
+                response.raise_for_status()
+            result = response.json()
+            if result.get("code", 0) != 0:
+                LOGGER.error("[飞书][Webhook机器人Markdown失败] response=%s", self._json_for_log(result))
+                raise RuntimeError(f"飞书 Markdown 机器人推送失败: {result}")
+            LOGGER.info(
+                "[飞书][Webhook机器人Markdown成功] 分片=%s/%s，response=%s",
+                part_index,
+                total_parts,
+                self._json_for_log(result),
+            )
+            if part_index < total_parts:
+                time.sleep(MARKDOWN_CARD_SEND_INTERVAL_SECONDS)
+
+    @staticmethod
+    def _build_markdown_card(title: str, markdown_text: str) -> dict[str, Any]:
+        """构造一张飞书 Card 2.0 Markdown 卡片。"""
+        return {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": f"## {title}\n\n{markdown_text}",
+                    }
+                ]
+            },
+        }
+
+    @staticmethod
+    def _split_markdown_text(markdown_text: str, max_chars: int) -> list[str]:
+        """按 Markdown 结构拆分长文本，避免截断列表，并保证每张卡片最多一张表格。"""
+        text = str(markdown_text or "").strip()
+        if not text:
+            return []
+        table_count = FeishuClient._count_markdown_tables(text)
+        if max_chars <= 0 or (len(text) <= max_chars and table_count <= 1):
+            return [text]
+
+        lines = text.splitlines()
+        blocks: list[tuple[str, list[str]]] = []
+        index = 0
+        while index < len(lines):
+            # 飞书 Card 2.0 对单张卡片中的 table 数量有限制。识别标准 Markdown
+            # 表格（表头 + 分隔线），把整张表作为独立块，后续不会和其他表格合并。
+            if (
+                index + 1 < len(lines)
+                and lines[index].lstrip().startswith("|")
+                and FeishuClient._is_markdown_table_separator(lines[index + 1])
+            ):
+                table_lines = [lines[index], lines[index + 1]]
+                index += 2
+                while index < len(lines) and lines[index].lstrip().startswith("|"):
+                    table_lines.append(lines[index])
+                    index += 1
+                blocks.append(("table", table_lines))
+                continue
+
+            text_lines = [lines[index]]
+            index += 1
+            while index < len(lines):
+                if (
+                    index + 1 < len(lines)
+                    and lines[index].lstrip().startswith("|")
+                    and FeishuClient._is_markdown_table_separator(lines[index + 1])
+                ):
+                    break
+                text_lines.append(lines[index])
+                index += 1
+            blocks.append(("text", text_lines))
+
+        parts: list[str] = []
+        current_text_lines: list[str] = []
+        current_length = 0
+
+        def flush_text() -> None:
+            nonlocal current_text_lines, current_length
+            if current_text_lines:
+                parts.append("\n".join(current_text_lines).strip())
+                current_text_lines = []
+                current_length = 0
+
+        for block_kind, block_lines in blocks:
+            block_text = "\n".join(block_lines).strip()
+            if not block_text:
+                continue
+            if block_kind == "table":
+                flush_text()
+                parts.extend(FeishuClient._split_markdown_table(block_lines, max_chars))
+                continue
+
+            # 普通文本块按行聚合；单行极端超长时再按字符切开。
+            for source_line in block_lines:
+                line_chunks = [
+                    source_line[index:index + max_chars]
+                    for index in range(0, len(source_line), max_chars)
+                ] or [""]
+                for line_chunk in line_chunks:
+                    added_length = len(line_chunk) + (1 if current_text_lines else 0)
+                    if current_text_lines and current_length + added_length > max_chars:
+                        flush_text()
+                    current_text_lines.append(line_chunk)
+                    current_length += len(line_chunk) + (1 if len(current_text_lines) > 1 else 0)
+        flush_text()
+        return [part for part in parts if part]
+
+    @staticmethod
+    def _is_markdown_table_separator(line: str) -> bool:
+        """判断 Markdown 表格分隔线，例如 ``|---|---:|``。"""
+        cells = [cell.strip() for cell in str(line or "").strip().strip("|").split("|")]
+        return bool(cells) and all(bool(re.fullmatch(r":?-{3,}:?", cell)) for cell in cells)
+
+    @staticmethod
+    def _count_markdown_tables(markdown_text: str) -> int:
+        """统计普通 Markdown 表格数量，供卡片分片前判断是否触发飞书表格上限。"""
+        lines = str(markdown_text or "").splitlines()
+        return sum(
+            1
+            for index in range(len(lines) - 1)
+            if lines[index].lstrip().startswith("|")
+            and FeishuClient._is_markdown_table_separator(lines[index + 1])
+        )
+
+    @staticmethod
+    def _split_markdown_table(table_lines: list[str], max_chars: int) -> list[str]:
+        """保证每个表格分片保留表头和分隔线，并限制单片字符数。"""
+        table_text = "\n".join(table_lines).strip()
+        if len(table_text) <= max_chars:
+            return [table_text]
+
+        header = table_lines[:2]
+        header_length = len("\n".join(header))
+        chunks: list[str] = []
+        current = list(header)
+        current_length = header_length
+        for row in table_lines[2:]:
+            added_length = len(row) + 1
+            if len(current) > 2 and current_length + added_length > max_chars:
+                chunks.append("\n".join(current).strip())
+                current = list(header)
+                current_length = header_length
+            current.append(row)
+            current_length += added_length
+        if len(current) > 2:
+            chunks.append("\n".join(current).strip())
+        return chunks or [table_text[:max_chars]]
 
     @staticmethod
     def _sign(timestamp: str, secret: str) -> str:

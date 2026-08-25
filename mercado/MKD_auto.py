@@ -49,7 +49,8 @@ LAST_30_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastMonth")]'
 
 # 统计页面中的时间范围切换步骤。
 # success_state="visible"：目标出现后才算当前按钮点击成功。
-# success_state="hidden"：目标连续两次不可见后才算当前按钮点击成功。
+# success_state="hidden"：目标元素可以继续保留在 HTML 中，只要连续两次处于不可见状态，
+# 就判定当前按钮点击成功；最长等待时间使用 NEXT_ELEMENT_TIMEOUT_SECONDS（当前 30 秒）。
 PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
     "7天": [
         {
@@ -66,7 +67,7 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
             "wait_seconds": 2,
             "success_xpath": LAST_7_DAYS_OPTION_XPATH,
             "success_state": "hidden",
-            "success_name": "最近7天选项消失",
+            "success_name": "最近7天选项已经不可见",
         },
     ],
     "30天": [
@@ -84,7 +85,7 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
             "wait_seconds": 2,
             "success_xpath": LAST_30_DAYS_OPTION_XPATH,
             "success_state": "hidden",
-            "success_name": "最近30天选项消失",
+            "success_name": "最近30天选项已经不可见",
         },
     ],
 }
@@ -158,8 +159,8 @@ class MercadoAuto:
         # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
         for period in ("7天", "30天"):
             LOGGER.info("[美客多][指标] 开始切换并采集时间范围=%s", period)
-            # 最后一个日期选项点击后不使用仍存在的旧指标元素判断刷新状态，
-            # final_next_xpath 留空会触发固定等待 30 秒，确保该时间范围的数据加载完成。
+            # 日期选项点击后，以对应选项“最长 30 秒内变为不可见”作为点击成功标志。
+            # 元素不需要从 HTML 中移除；只要 DrissionPage 判断它不再显示即可。
             self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), final_next_xpath="")
             for spec in METRIC_SPECS:
                 if spec["period"] != period:
@@ -314,7 +315,18 @@ class MercadoAuto:
                 time.sleep(wait_seconds)
 
             next_xpath = self._next_step_xpath(steps, index + 1) or final_next_xpath
-            self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一步骤或数据")
+            if next_xpath:
+                self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一步骤或数据")
+            elif success_xpath and success_state:
+                # 最后一个日期选项已经在 _click_with_retry() 中完成最长 30 秒的状态验证。
+                # 不再对空 XPath 固定睡眠 30 秒，否则会在成功后产生一次没有意义的重复等待。
+                LOGGER.info(
+                    "[美客多][后续等待跳过] 步骤=%s 已通过状态验证=%s，不再执行无 XPath 的固定等待",
+                    step_name,
+                    success_name,
+                )
+            else:
+                self._wait_for_xpath(tab, "", NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一步骤或数据")
 
     def _click_with_retry(
         self,
@@ -403,7 +415,7 @@ class MercadoAuto:
         timeout_seconds: float,
         target_name: str,
     ) -> bool:
-        """等待元素出现或消失；消失需连续确认两次，避免瞬时查找异常造成误判。"""
+        """等待元素出现或变为不可见；不可见不要求节点从 HTML 中移除。"""
         if expected_state not in {"visible", "hidden"}:
             LOGGER.error("[美客多][状态配置错误] 目标=%s，不支持的 expected_state=%s", target_name, expected_state)
             return False
@@ -429,7 +441,12 @@ class MercadoAuto:
                 else:
                     hidden_checks += 1
                     if hidden_checks >= 2:
-                        LOGGER.info("[美客多][状态满足] 目标=%s 已连续两次不可见，确认消失，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
+                        LOGGER.info(
+                            "[美客多][状态满足] 目标=%s 已连续两次不可见（HTML节点可以保留），"
+                            "确认按钮点击成功，耗时 %.2f 秒",
+                            target_name,
+                            time.monotonic() - started_at,
+                        )
                         return True
             time.sleep(0.5)
 

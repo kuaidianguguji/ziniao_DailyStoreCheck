@@ -106,11 +106,11 @@ OVERVIEW_PAGE_URL = "https://seller-br.tiktok.com/compass/data-overview"
 
 # 广告页日期按钮 XPath。已登录后直接跳转广告页，不再查找或点击“营销/店铺广告”。
 AD_TIME_BUTTON_XPATH = '//span[@class="theme-arco-picker-suffix-icon"]'
-AD_YESTERDAY_BUTTON_XPATH = '//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")][contains(.,"昨") and contains(.,"天")]'
-AD_7_DAYS_BUTTON_XPATH = '//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")][contains(.,"近") and contains(.,"7") and contains(.,"天")]'
+AD_YESTERDAY_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")])[2]'
+AD_7_DAYS_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contains(@class,"theme-arco-btn-secondary") and contains(@class,"theme-arco-btn-size-mini") and contains(@class,"theme-arco-btn-shape-square")])[3]'
 # 广告页面数据加载完成标志。该指标可见才表示广告页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的广告指标 XPath。
-AD_DATA_READY_XPATH = '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]'
+AD_DATA_READY_XPATH = '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]'
 
 
 # 店铺广告时间范围切换步骤。每个时间范围都预留“打开时间”和“选择范围”两次点击。
@@ -152,17 +152,29 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 
 # 广告金额使用美元 USD，不转换为巴西雷亚尔。
 AD_METRIC_SPECS: list[dict[str, str]] = [
-    {"period": "昨天", "field": "昨天成本", "xpath": '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '//div[normalize-space(.)="SKU 订单数"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天均单价", "xpath": '//div[normalize-space(.)="平均下单成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天总收入", "xpath": '//div[normalize-space(.)="总收入"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "昨天", "field": "昨天ROI", "xpath": '//div[normalize-space(.)="ROI"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
-    {"period": "7天", "field": "7天成本", "xpath": '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天SKU订单数", "xpath": '//div[normalize-space(.)="SKU 订单数"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
-    {"period": "7天", "field": "7天均单价", "xpath": '//div[normalize-space(.)="平均下单成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天总收入", "xpath": '//div[normalize-space(.)="总收入"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
-    {"period": "7天", "field": "7天ROI", "xpath": '//div[normalize-space(.)="ROI"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
+    {"period": "昨天", "field": "昨天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "昨天", "field": "昨天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "decimal"},
+    {"period": "7天", "field": "7天成本", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[2]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "integer"},
+    {"period": "7天", "field": "7天均单价", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[3]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天总收入", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[4]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+    {"period": "7天", "field": "7天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "decimal"},
 ]
+# AD_METRIC_SPECS: list[dict[str, str]] = [
+#     {"period": "昨天", "field": "昨天成本", "xpath": '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "昨天", "field": "昨天SKU订单数", "xpath": '//div[normalize-space(.)="SKU 订单数"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天均单价", "xpath": '//div[normalize-space(.)="平均下单成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "昨天", "field": "昨天总收入", "xpath": '//div[normalize-space(.)="总收入"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "昨天", "field": "昨天ROI", "xpath": '//div[normalize-space(.)="ROI"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
+#     {"period": "7天", "field": "7天成本", "xpath": '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "7天", "field": "7天SKU订单数", "xpath": '//div[normalize-space(.)="SKU 订单数"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "integer"},
+#     {"period": "7天", "field": "7天均单价", "xpath": '//div[normalize-space(.)="平均下单成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "7天", "field": "7天总收入", "xpath": '//div[normalize-space(.)="总收入"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]', "kind": "currency", "currency_code": "USD"},
+#     {"period": "7天", "field": "7天ROI", "xpath": '//div[normalize-space(.)="ROI"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
+# ]
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +182,12 @@ AD_METRIC_SPECS: list[dict[str, str]] = [
 # ---------------------------------------------------------------------------
 
 # 概览流程按钮 XPath。日期选项不可见时，会重新点击时间按钮并等待相应选项出现。
-OVERVIEW_TIME_BUTTON_XPATH = '//div[contains(@class,"arco-picker-input")]//input[@placeholder="结束日期"]'
-OVERVIEW_YESTERDAY_BUTTON_XPATH = '//div[contains(@class,"arco-typography")][normalize-space(.)="昨天"]'
-OVERVIEW_7_DAYS_BUTTON_XPATH = '//div[contains(@class,"arco-typography")][normalize-space(.)="最近 7 天"]'
+OVERVIEW_TIME_BUTTON_XPATH = '//div[@class="arco-picker-input"]/input'
+OVERVIEW_YESTERDAY_BUTTON_XPATH = '//button[@data-testid="time-selector-yesterday"]//div'
+OVERVIEW_7_DAYS_BUTTON_XPATH = '//button[@data-testid="time-selector-last-7-days"]//div'
 # 概览页面数据加载完成标志。该指标可见才表示概览页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的概览指标 XPath。
-OVERVIEW_DATA_READY_XPATH = '//div[@class="pcm-smc"][contains(.,"GMV")]//div[@class="pcm-smc-content"]'
+OVERVIEW_DATA_READY_XPATH = '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]'
 
 
 # 数据概览时间范围切换步骤。
@@ -219,30 +231,53 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 # “直播/视频/商品卡”三个 XPath 实际抓到的是渠道 GMV 金额，不是页面占比。
 # 昨天的渠道金额直接使用飞书已有字段名；7 天金额仅作为计算占比的临时值，计算后会从飞书字段中移除。
 OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
-    {"period": "昨天", "field": "昨天GMV", "xpath": '//div[@class="pcm-smc"][contains(.,"GMV")]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "昨天成交件数", "xpath": '//div[@class="pcm-smc"][contains(.,"商品成交件数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '//div[@class="pcm-smc"][contains(.,"SKU 订单数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天订单数", "xpath": '//*[normalize-space(.)="订单数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天客户数", "xpath": '//*[normalize-space(.)="客户数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天商品访客数", "xpath": '//*[normalize-space(.)="商品访客数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天曝光数", "xpath": '//*[normalize-space(.)="商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "昨天", "field": "昨天去重曝光数", "xpath": '//*[normalize-space(.)="去重商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "昨天", "field": "直播GMV", "xpath": '//*[normalize-space(.)="直播"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "短视频GMV", "xpath": '//*[normalize-space(.)="视频"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "商品卡GMV", "xpath": '//*[normalize-space(.)="商品卡"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天GMV", "xpath": '//div[@class="pcm-smc"][contains(.,"GMV")]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天成交件数", "xpath": '//div[@class="pcm-smc"][contains(.,"商品成交件数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天SKU订单数", "xpath": '//div[@class="pcm-smc"][contains(.,"SKU 订单数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
-    {"period": "7天", "field": "7天订单数", "xpath": '//*[normalize-space(.)="订单数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "7天", "field": "7天客户数", "xpath": '//*[normalize-space(.)="客户数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "7天", "field": "7天商品访客数", "xpath": '//*[normalize-space(.)="商品访客数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "7天", "field": "7天曝光数", "xpath": '//*[normalize-space(.)="商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "7天", "field": "7天去重曝光数", "xpath": '//*[normalize-space(.)="去重商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
-    {"period": "7天", "field": "_7天直播GMV", "xpath": '//*[normalize-space(.)="直播"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "_7天短视频GMV", "xpath": '//*[normalize-space(.)="视频"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "_7天商品卡GMV", "xpath": '//*[normalize-space(.)="商品卡"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "昨天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "昨天成交件数", "xpath": '(//label[contains(@class,"core-checkbox")])[2]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天SKU订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[3]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[4]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天客户数", "xpath": '(//label[contains(@class,"core-checkbox")])[5]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天商品访客数", "xpath": '(//label[contains(@class,"core-checkbox")])[6]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[7]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "昨天去重曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[8]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "昨天", "field": "直播GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "短视频GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[2]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "商品卡GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[3]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天成交件数", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天SKU订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[2]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天订单数", "xpath": '(//label[contains(@class,"core-checkbox")])[3]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天客户数", "xpath": '(//label[contains(@class,"core-checkbox")])[4]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天商品访客数", "xpath": '(//label[contains(@class,"core-checkbox")])[5]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[6]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "7天去重曝光数", "xpath": '(//label[contains(@class,"core-checkbox")])[7]//div[@class="pcm-smc-content"]', "kind": "integer"},
+    {"period": "7天", "field": "_7天直播GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "_7天短视频GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[2]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "_7天商品卡GMV", "xpath": '(//tr[contains(@class,"core-table-tr")])[3]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
 ]
-
+# OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
+#     {"period": "昨天", "field": "昨天GMV", "xpath": '(//label[contains(@class,"core-checkbox")])[1]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "昨天", "field": "昨天成交件数", "xpath": '//div[@class="pcm-smc"][contains(.,"商品成交件数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天SKU订单数", "xpath": '//div[@class="pcm-smc"][contains(.,"SKU 订单数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天订单数", "xpath": '//*[normalize-space(.)="订单数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天客户数", "xpath": '//*[normalize-space(.)="客户数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天商品访客数", "xpath": '//*[normalize-space(.)="商品访客数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天曝光数", "xpath": '//*[normalize-space(.)="商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "昨天", "field": "昨天去重曝光数", "xpath": '//*[normalize-space(.)="去重商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "昨天", "field": "直播GMV", "xpath": '//*[normalize-space(.)="直播"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "昨天", "field": "短视频GMV", "xpath": '//*[normalize-space(.)="视频"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "昨天", "field": "商品卡GMV", "xpath": '//*[normalize-space(.)="商品卡"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "7天", "field": "7天GMV", "xpath": '//div[@class="pcm-smc"][contains(.,"GMV")]//div[@class="pcm-smc-content"]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "7天", "field": "7天成交件数", "xpath": '//div[@class="pcm-smc"][contains(.,"商品成交件数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+#     {"period": "7天", "field": "7天SKU订单数", "xpath": '//div[@class="pcm-smc"][contains(.,"SKU 订单数")]//div[@class="pcm-smc-value-content"]', "kind": "integer"},
+#     {"period": "7天", "field": "7天订单数", "xpath": '//*[normalize-space(.)="订单数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "7天", "field": "7天客户数", "xpath": '//*[normalize-space(.)="客户数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "7天", "field": "7天商品访客数", "xpath": '//*[normalize-space(.)="商品访客数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "7天", "field": "7天曝光数", "xpath": '//*[normalize-space(.)="商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "7天", "field": "7天去重曝光数", "xpath": '//*[normalize-space(.)="去重商品曝光次数"]/ancestor::div[contains(@class,"pcm-smc")][1]//div[contains(@class,"pcm-smc-value-content")]', "kind": "integer"},
+#     {"period": "7天", "field": "_7天直播GMV", "xpath": '//*[normalize-space(.)="直播"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "7天", "field": "_7天短视频GMV", "xpath": '//*[normalize-space(.)="视频"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+#     {"period": "7天", "field": "_7天商品卡GMV", "xpath": '//*[normalize-space(.)="商品卡"]/ancestor::td[contains(@class,"core-table-td")][1]//div[contains(@class,"text-body-m-medium")]', "kind": "currency", "currency_code": "BRL"},
+# ]
 
 # 每个占比都由“同周期渠道 GMV / 同周期总 GMV * 100”计算，结果保留两位小数。
 # 7天渠道金额会保留给机器人消息使用，多维表打包时自动忽略这些内部字段。

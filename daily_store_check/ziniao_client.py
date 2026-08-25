@@ -20,11 +20,25 @@ from typing import Any
 
 import requests
 from selenium import webdriver
-from selenium.common import NoSuchElementException
+from selenium.common import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 
 LOGGER = logging.getLogger(__name__)
+
+
+# 紫鸟启动后的 IP 检测页、launcherPage 使用单独的页面导航超时，避免 Selenium 默认的
+# 120 秒读取超时直接终止店铺。TikTok/Shopee/Mercado 后续页面由各自 DrissionPage 等待。
+ZINIAO_NAVIGATION_TIMEOUT_SECONDS = 60
+
+# launcherPage 导航超时后的有限重试次数。首次打开失败后最多再打开两次，避免无限卡住本轮任务。
+LAUNCHER_PAGE_RETRY_TIMES = 2
+
+# launcherPage 导航返回后，等待当前文档至少进入 interactive/complete 的最长时间。
+LAUNCHER_PAGE_READY_TIMEOUT_SECONDS = 30
+
+# launcherPage 成功后给紫鸟页面和插件留出的稳定时间。
+LAUNCHER_PAGE_SETTLE_SECONDS = 6
 
 
 class ZiniaoStoreCloseError(RuntimeError):
@@ -336,15 +350,29 @@ class ZiniaoClient:
             raise FileNotFoundError(f"找不到紫鸟 webdriver: {candidate}")
         options = webdriver.ChromeOptions()
         options.add_argument("--log-level=3")
+        # 紫鸟启动页常包含长期运行的第三方脚本。使用 eager 让 driver.get() 在 DOM
+        # 基本可用时返回，避免等待所有广告/统计资源导致整个导航卡满 120 秒。
+        options.page_load_strategy = "eager"
         options.add_experimental_option("debuggerAddress", f"127.0.0.1:{opened.get('debuggingPort')}")
-        return webdriver.Chrome(service=Service(str(candidate)), options=options)
+        driver = webdriver.Chrome(service=Service(str(candidate)), options=options)
+        driver.set_page_load_timeout(ZINIAO_NAVIGATION_TIMEOUT_SECONDS)
+        LOGGER.info(
+            "[紫鸟][WebDriver连接] debuggingPort=%s，webdriver=%s，page_load_strategy=eager，"
+            "page_load_timeout=%s秒",
+            opened.get("debuggingPort"),
+            candidate,
+            ZINIAO_NAVIGATION_TIMEOUT_SECONDS,
+        )
+        return driver
 
     @staticmethod
     def open_ip_check(driver: webdriver.Chrome, ip_check_url: str) -> bool:
         """按官方示例打开紫鸟 IP 检测页并检查成功按钮。"""
         try:
+            LOGGER.info("[紫鸟][IP检测页] 开始打开 url=%s", ip_check_url)
             driver.get(ip_check_url)
             driver.find_element(By.XPATH, '//button[contains(@class, "styles_btn--success")]')
+            LOGGER.info("[紫鸟][IP检测页] 成功找到检测通过按钮")
             return True
         except NoSuchElementException:
             LOGGER.error("紫鸟 IP 检测页未找到成功元素")
@@ -355,11 +383,107 @@ class ZiniaoClient:
 
     @staticmethod
     def open_launcher_page(driver: webdriver.Chrome, launcher_page: str) -> None:
-        """按官方示例打开紫鸟返回的平台主页并等待页面稳定。"""
+        """打开紫鸟返回的平台主页；导航超时后检查状态并进行有限重试。"""
         if not launcher_page:
             raise RuntimeError("紫鸟 startBrowser 没有返回 launcherPage")
-        driver.get(launcher_page)
-        time.sleep(6)
+
+        last_error: Exception | None = None
+        max_attempts = LAUNCHER_PAGE_RETRY_TIMES + 1
+        for attempt in range(max_attempts):
+            attempt_number = attempt + 1
+            try:
+                LOGGER.info(
+                    "[紫鸟][launcherPage] 开始导航，第 %s/%s 次，url=%s，超时=%s秒",
+                    attempt_number,
+                    max_attempts,
+                    launcher_page,
+                    ZINIAO_NAVIGATION_TIMEOUT_SECONDS,
+                )
+                driver.set_page_load_timeout(ZINIAO_NAVIGATION_TIMEOUT_SECONDS)
+                driver.get(launcher_page)
+                if ZiniaoClient._wait_driver_document_ready(driver, LAUNCHER_PAGE_READY_TIMEOUT_SECONDS):
+                    LOGGER.info(
+                        "[紫鸟][launcherPage] 导航成功，第 %s/%s 次，current_url=%s，readyState 已就绪",
+                        attempt_number,
+                        max_attempts,
+                        ZiniaoClient._driver_current_url(driver),
+                    )
+                    time.sleep(LAUNCHER_PAGE_SETTLE_SECONDS)
+                    return
+                raise TimeoutException(
+                    f"document.readyState 在 {LAUNCHER_PAGE_READY_TIMEOUT_SECONDS} 秒内未进入 interactive/complete"
+                )
+            except Exception as exc:
+                # Selenium 的导航超时有时会直接透出 urllib3.exceptions.ReadTimeoutError，
+                # 不一定继承 selenium.common.TimeoutException；这里统一按导航异常处理，
+                # 先检查页面状态，再进入有限重试。
+                last_error = exc
+                current_url = ZiniaoClient._driver_current_url(driver)
+                ready_state = ZiniaoClient._driver_ready_state(driver)
+                LOGGER.warning(
+                    "[紫鸟][launcherPage] 导航异常，第 %s/%s 次，异常=%s，current_url=%s，readyState=%s",
+                    attempt_number,
+                    max_attempts,
+                    exc,
+                    current_url or "<空>",
+                    ready_state or "<未知>",
+                )
+
+                # driver.get() 超时不一定代表页面没有打开；若当前 URL 已经离开空白页，且
+                # document 已进入 interactive/complete，则页面可交给后续 DrissionPage 继续处理。
+                if current_url and not current_url.startswith(("about:blank", "chrome://newtab")):
+                    if ready_state in {"interactive", "complete"}:
+                        LOGGER.warning(
+                            "[紫鸟][launcherPage] 虽然导航抛出超时，但页面已可用，继续执行，current_url=%s",
+                            current_url,
+                        )
+                        time.sleep(LAUNCHER_PAGE_SETTLE_SECONDS)
+                        return
+
+                if attempt < max_attempts - 1:
+                    wait_seconds = 5 * (attempt + 1)
+                    LOGGER.warning(
+                        "[紫鸟][launcherPage] 第 %s 次失败后等待 %s 秒再重试",
+                        attempt_number,
+                        wait_seconds,
+                    )
+                    time.sleep(wait_seconds)
+
+        raise RuntimeError(
+            f"紫鸟 launcherPage 连续 {max_attempts} 次导航失败，最后错误={last_error}，"
+            f"current_url={ZiniaoClient._driver_current_url(driver) or '<空>'}"
+        ) from last_error
+
+    @staticmethod
+    def _driver_current_url(driver: webdriver.Chrome) -> str:
+        """安全读取 WebDriver 当前 URL，供导航超时后的诊断和恢复判断。"""
+        try:
+            return str(driver.current_url or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _driver_ready_state(driver: webdriver.Chrome) -> str:
+        """安全读取页面 readyState；读取失败返回空字符串。"""
+        try:
+            return str(driver.execute_script("return document.readyState;") or "").strip().lower()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _wait_driver_document_ready(driver: webdriver.Chrome, timeout_seconds: float) -> bool:
+        """等待 WebDriver 页面进入 interactive 或 complete。"""
+        deadline = time.monotonic() + timeout_seconds
+        last_state = ""
+        while time.monotonic() < deadline:
+            state = ZiniaoClient._driver_ready_state(driver)
+            if state != last_state:
+                LOGGER.info("[紫鸟][页面状态] launcherPage document.readyState=%s", state or "<空>")
+                last_state = state
+            if state in {"interactive", "complete"}:
+                return True
+            time.sleep(1)
+        return False
 
     def exit_client(self) -> None:
         """任务全部结束后通知紫鸟客户端退出。"""
