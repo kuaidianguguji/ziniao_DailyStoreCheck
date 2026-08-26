@@ -580,8 +580,8 @@ class DailyStoreCheck:
                     self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
                 store_info["状态"] = "成功"
             # DeepSeek 可能需要等待数分钟，必须先退出上下文并确认紫鸟店铺已关闭。
-            if task.platform == "shopee":
-                self._send_shopee_deepseek_analysis(task.recipient, store_info)
+            if task.platform in {"tiktok", "shopee", "mercado"}:
+                self._send_store_deepseek_analysis(task.recipient, store_info)
         except ZiniaoStoreCloseError as exc:
             LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
             store_info["状态"] = "失败"
@@ -651,37 +651,56 @@ class DailyStoreCheck:
             LOGGER.info("[飞书][DeepSeek汇总发送] 接收人姓名=%s，准备发送 AI 店铺分析", recipient_name)
             self._safe_notify_markdown(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
 
-    def _send_shopee_deepseek_analysis(self, recipient: str, store_info: dict[str, Any]) -> None:
-        """原始虾皮消息发送完毕后，同步分析单店数据并回发给同一运营人员。"""
+    def _send_store_deepseek_analysis(self, recipient: str, store_info: dict[str, Any]) -> None:
+        """原始平台消息发送完毕后，同步分析单店数据并回发同一运营人员。"""
         store_name = str(store_info.get("店铺名") or "未知店铺")
+        platform = str(store_info.get("平台") or "").strip().lower()
+        platform_name = {
+            "tiktok": "TikTok Shop",
+            "shopee": "Shopee",
+            "mercado": "Mercado Livre",
+        }.get(platform, platform or "未知平台")
         if not str(recipient or "").strip():
-            LOGGER.warning("[DeepSeek][Shopee单店跳过] 店铺=%s，没有对应运营人员", store_name)
+            LOGGER.warning("[DeepSeek][单店跳过] 平台=%s，店铺=%s，没有对应运营人员", platform_name, store_name)
             return
 
-        LOGGER.info("[DeepSeek][Shopee单店分析开始] 店铺=%s，等待分析结果后回发运营人员", store_name)
+        LOGGER.info(
+            "[DeepSeek][单店分析开始] 平台=%s，店铺=%s，等待分析结果后回发运营人员",
+            platform_name,
+            store_name,
+        )
         try:
-            analysis_text = self.deepseek.analyze_shopee_store(store_info)
+            analysis_text = self.deepseek.analyze_store(store_info)
         except Exception:
             # 单店 AI 分析属于附加步骤，失败不能覆盖已经成功的采集、写表和原始消息。
-            LOGGER.exception("[DeepSeek][Shopee单店分析失败] 店铺=%s，不影响原始数据结果", store_name)
+            LOGGER.exception(
+                "[DeepSeek][单店分析失败] 平台=%s，店铺=%s，不影响原始数据结果",
+                platform_name,
+                store_name,
+            )
             self._safe_notify_markdown(
                 recipient,
-                f"{store_name} Shopee 每日经营分析失败",
+                f"{store_name} {platform_name} 每日经营分析失败",
                 "DeepSeek 暂时未能返回分析结果，原始采集数据不受影响。请稍后查看运行日志或重试。",
             )
             return
         if not analysis_text:
-            LOGGER.warning("[DeepSeek][Shopee单店分析跳过] 店铺=%s，未获得有效分析文本", store_name)
+            LOGGER.warning(
+                "[DeepSeek][单店分析跳过] 平台=%s，店铺=%s，未获得有效分析文本",
+                platform_name,
+                store_name,
+            )
             return
 
         LOGGER.info(
-            "[飞书][DeepSeek Shopee单店发送] 店铺=%s，分析字符数=%s",
+            "[飞书][DeepSeek单店发送] 平台=%s，店铺=%s，分析字符数=%s",
+            platform_name,
             store_name,
             len(analysis_text),
         )
         self._safe_notify_markdown(
             recipient,
-            f"{store_name} Shopee 每日经营分析",
+            f"{store_name} {platform_name} 每日经营分析",
             analysis_text,
         )
 

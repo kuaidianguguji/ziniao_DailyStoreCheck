@@ -74,7 +74,7 @@ feishu:
     webhook_url: ""
     sign_secret: ""
 
-# DeepSeek 会在每个 Shopee 店铺原始消息发送后分析该店数据并回发同一运营人员；
+# DeepSeek 会在每个平台店铺原始消息发送后分析该店数据并回发同一运营人员；
 # 全部店铺处理完成后仍会分析 ALL_info，并把汇总结果推送给 summary_recipients。
 deepseek:
   enabled: true
@@ -87,8 +87,11 @@ deepseek:
   retry_times: 5
   # 相邻两次 DeepSeek 请求之间的等待秒数。
   retry_interval_seconds: 3
-  # 可选：单独覆盖 Shopee 每日经营分析提示词；不填写时使用程序内置提示词。
+  # 三个平台使用同一套 api_key、model_name 和 base_url，只分别配置系统提示词。
+  # 当前 TikTok 和美客多留空时会临时使用虾皮内置提示词。
+  tiktok_system_prompt: ""
   shopee_system_prompt: ""
+  mercado_system_prompt: ""
   # 提示词固定照搬 test/DS_an2.py；客户端会使用同样的原文。
   system_prompt: |
     在这里粘贴你的完整提示词。

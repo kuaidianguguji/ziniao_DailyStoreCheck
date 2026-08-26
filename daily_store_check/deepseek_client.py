@@ -1,4 +1,4 @@
-"""DeepSeek 全店铺分析客户端。
+"""DeepSeek 单店分析与全店铺汇总客户端。
 
 本文件按 test/DS_an2.py 的调用流程实现：使用 OpenAI SDK、参考脚本的提示词、
 原始店铺数据用户消息，以及 thinking=enabled / reasoning_effort=high 请求参数。
@@ -149,7 +149,7 @@ SHOPEE_SYSTEM_PROMPT = r"""
 
 
 class DeepSeekClient:
-    """按照 DS_an2.py 调用 DeepSeek v4 pro 的全店铺分析客户端。"""
+    """复用同一客户端执行三平台单店分析和全店铺汇总。"""
 
     def __init__(self, config: dict[str, Any]):
         """读取配置并创建与参考脚本相同的 OpenAI 客户端。"""
@@ -166,9 +166,16 @@ class DeepSeekClient:
 
         # 参考脚本中的系统提示词是固定内容，当前请求直接使用该原文。
         self.system_prompt = REFERENCE_SYSTEM_PROMPT
-        self.shopee_system_prompt = str(
+        shopee_system_prompt = str(
             deepseek_config.get("shopee_system_prompt") or SHOPEE_SYSTEM_PROMPT
         ).strip()
+        # 三个平台共用客户端、密钥和模型，仅系统提示词彼此独立。
+        # TikTok 和美客多尚未提供专用提示词时，临时回退到虾皮提示词。
+        self.platform_system_prompts = {
+            "tiktok": str(deepseek_config.get("tiktok_system_prompt") or shopee_system_prompt).strip(),
+            "shopee": shopee_system_prompt,
+            "mercado": str(deepseek_config.get("mercado_system_prompt") or shopee_system_prompt).strip(),
+        }
 
         # 保留项目原有失败重试；每次重试仍使用完全相同的 DS_an2 请求体。
         self.retry_times = max(0, int(deepseek_config.get("retry_times", 5)))
@@ -295,10 +302,10 @@ class DeepSeekClient:
         raise RuntimeError("DeepSeek 分析未返回结果")
 
     @staticmethod
-    def build_shopee_user_prompt(shop_data: str) -> str:
-        """构造单个 Shopee 店铺的分析请求，保留完整原始数据。"""
+    def build_store_user_prompt(shop_data: str, platform_name: str) -> str:
+        """构造单个平台店铺的分析请求，保留完整原始数据。"""
         return f"""
-以下是今天需要分析的单个巴西 Shopee 店铺原始数据。
+以下是今天需要分析的单个巴西 {platform_name} 店铺原始数据。
 
 请严格按照系统提示词中的规则完成分析。
 
@@ -318,24 +325,40 @@ class DeepSeekClient:
 ================ 数据结束 ================
 """
 
-    def analyze_shopee_store(self, store_info: dict[str, Any]) -> str:
-        """同步分析单个 Shopee 店铺，并返回可直接发送的 Markdown。"""
+    def analyze_store(self, store_info: dict[str, Any]) -> str:
+        """使用对应平台提示词同步分析单个店铺，并返回 Markdown。"""
+        platform = str(store_info.get("平台") or "").strip().lower()
+        platform_names = {
+            "tiktok": "TikTok Shop",
+            "shopee": "Shopee",
+            "mercado": "Mercado Livre",
+        }
+        platform_name = platform_names.get(platform, platform or "未知平台")
         if not store_info:
-            LOGGER.info("[DeepSeek][Shopee单店跳过] 店铺数据为空")
+            LOGGER.info("[DeepSeek][单店跳过] 店铺数据为空")
+            return ""
+        if platform not in self.platform_system_prompts:
+            LOGGER.warning("[DeepSeek][单店跳过] 不支持的平台=%s", platform_name)
             return ""
         if not self.enabled:
-            LOGGER.info("[DeepSeek][Shopee单店跳过] deepseek.enabled=false")
+            LOGGER.info("[DeepSeek][单店跳过] 平台=%s，deepseek.enabled=false", platform_name)
             return ""
         if not self.configured:
-            LOGGER.warning("[DeepSeek][Shopee单店跳过] 配置不完整，缺少=%s", self._missing_config_fields())
+            LOGGER.warning(
+                "[DeepSeek][单店跳过] 平台=%s，配置不完整，缺少=%s",
+                platform_name,
+                self._missing_config_fields(),
+            )
             return ""
 
         shop_data = json.dumps([store_info], ensure_ascii=False, default=str)
-        user_prompt = self.build_shopee_user_prompt(shop_data)
+        user_prompt = self.build_store_user_prompt(shop_data, platform_name)
+        system_prompt = self.platform_system_prompts[platform]
         store_name = str(store_info.get("店铺名") or "未知店铺")
         LOGGER.info(
-            "[DeepSeek][Shopee单店请求准备] 店铺=%s，url=%s，model=%s，原始数据字符数=%s，"
+            "[DeepSeek][单店请求准备] 平台=%s，店铺=%s，url=%s，model=%s，原始数据字符数=%s，"
             "timeout=%s，thinking=enabled，reasoning_effort=high，重试次数=%s",
+            platform_name,
             store_name,
             f"{self.base_url}/chat/completions",
             self.model_name,
@@ -347,7 +370,8 @@ class DeepSeekClient:
         total_attempts = self.retry_times + 1
         for attempt in range(1, total_attempts + 1):
             LOGGER.info(
-                "[DeepSeek][Shopee单店分析请求] 店铺=%s，第 %s/%s 次尝试",
+                "[DeepSeek][单店分析请求] 平台=%s，店铺=%s，第 %s/%s 次尝试",
+                platform_name,
                 store_name,
                 attempt,
                 total_attempts,
@@ -356,7 +380,7 @@ class DeepSeekClient:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": self.shopee_system_prompt},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
                     extra_body={
@@ -368,7 +392,8 @@ class DeepSeekClient:
                 if not answer:
                     raise RuntimeError("DeepSeek 返回内容为空")
                 LOGGER.info(
-                    "[DeepSeek][Shopee单店分析成功] 店铺=%s，第 %s/%s 次请求成功，返回字符数=%s",
+                    "[DeepSeek][单店分析成功] 平台=%s，店铺=%s，第 %s/%s 次请求成功，返回字符数=%s",
+                    platform_name,
                     store_name,
                     attempt,
                     total_attempts,
@@ -378,7 +403,8 @@ class DeepSeekClient:
             except Exception as exc:
                 if attempt >= total_attempts:
                     LOGGER.exception(
-                        "[DeepSeek][Shopee单店分析最终失败] 店铺=%s，已完成 %s 次请求",
+                        "[DeepSeek][单店分析最终失败] 平台=%s，店铺=%s，已完成 %s 次请求",
+                        platform_name,
                         store_name,
                         total_attempts,
                     )
@@ -386,7 +412,8 @@ class DeepSeekClient:
                         f"DeepSeek 对店铺 {store_name} 的分析连续 {total_attempts} 次失败: {exc}"
                     ) from exc
                 LOGGER.warning(
-                    "[DeepSeek][Shopee单店分析失败准备重试] 店铺=%s，第 %s/%s 次失败；%.1f 秒后重试",
+                    "[DeepSeek][单店分析失败准备重试] 平台=%s，店铺=%s，第 %s/%s 次失败；%.1f 秒后重试",
+                    platform_name,
                     store_name,
                     attempt,
                     total_attempts,
@@ -396,6 +423,10 @@ class DeepSeekClient:
                     time.sleep(self.retry_interval_seconds)
 
         raise RuntimeError("DeepSeek 单店分析未返回结果")
+
+    def analyze_shopee_store(self, store_info: dict[str, Any]) -> str:
+        """兼容原有调用名称，实际进入三平台共用的单店分析流程。"""
+        return self.analyze_store(store_info)
 
     def _missing_config_fields(self) -> list[str]:
         """返回日志用的缺失配置名。"""

@@ -37,7 +37,7 @@ ziniao_DailyStoreCheck_codex_two/
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
 8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。
 9. `_safe_notify` 根据“推送人员”的 `open_id` 使用应用机器人定向推送；没有人员 ID 时可退回 webhook。
-10. Shopee 店铺的广告及商业分析原始消息发送后，主流程立即把该店完整数据交给 DeepSeek，同步等待结果并以 Markdown 回发同一运营人员。随后把每个店铺的状态和全部指标追加到 `ALL_info`；所有店铺完成后仍会分析非空 `ALL_info`，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送汇总结果。
+10. TikTok、Shopee、美客多店铺的原始消息发送后，主流程在紫鸟店铺关闭成功后立即把该店完整数据交给 DeepSeek，同步等待结果并以 Markdown 回发同一运营人员。三个平台共用密钥和模型，分别使用独立系统提示词；当前 TikTok 和美客多暂时回退到虾皮提示词。随后把每个店铺的状态和全部指标追加到 `ALL_info`；所有店铺完成后仍会分析非空 `ALL_info`，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送汇总结果。
 11. `_cleanup_retention` 清理三张短期多维表中的过期数据，并退出紫鸟客户端。
 
 ## 4. 文件、函数和关键变量
@@ -136,7 +136,7 @@ ziniao_DailyStoreCheck_codex_two/
 ### `daily_store_check/deepseek_client.py`
 
 - `DeepSeekClient.analyze_all_info`：将结构化 `ALL_info` 序列化为 JSON 文本，调用 Chat Completions 接口并严格解析 `choices[0].message.content`。
-- `DeepSeekClient.analyze_shopee_store`：将单个 Shopee 店铺的广告和商业分析完整数据序列化为 JSON，使用 Shopee 专用运营提示词同步分析；返回内容由编排器发送给该店铺控制表中指定的运营人员。
+- `DeepSeekClient.analyze_store`：将单个平台店铺的完整数据序列化为 JSON，按 `tiktok_system_prompt`、`shopee_system_prompt`、`mercado_system_prompt` 选择提示词并同步分析；返回内容由编排器发送给该店铺控制表中指定的运营人员。
 - API Key、系统提示词、模型、地址、温度、输出长度和超时均来自 `deepseek` 配置节点；日志不会输出 API Key。HTTP 失败、响应解析失败、响应结构错误或返回文本为空时，首次失败后按配置最多重试 5 次。
 
 ### `run_daily_store_check.py`
