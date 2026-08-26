@@ -74,7 +74,8 @@ feishu:
     webhook_url: ""
     sign_secret: ""
 
-# DeepSeek 在全部店铺处理完成后分析 ALL_info，并把返回内容推送给 summary_recipients。
+# DeepSeek 会在每个 Shopee 店铺原始消息发送后分析该店数据并回发同一运营人员；
+# 全部店铺处理完成后仍会分析 ALL_info，并把汇总结果推送给 summary_recipients。
 deepseek:
   enabled: true
   # 可直接填写，也可通过环境变量 DEEPSEEK_API_KEY 注入。
@@ -86,6 +87,8 @@ deepseek:
   retry_times: 5
   # 相邻两次 DeepSeek 请求之间的等待秒数。
   retry_interval_seconds: 3
+  # 可选：单独覆盖 Shopee 每日经营分析提示词；不填写时使用程序内置提示词。
+  shopee_system_prompt: ""
   # 提示词固定照搬 test/DS_an2.py；客户端会使用同样的原文。
   system_prompt: |
     在这里粘贴你的完整提示词。

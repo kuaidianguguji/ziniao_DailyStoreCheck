@@ -49,6 +49,105 @@ Mercado Livre Brazil
 """.strip()
 
 
+SHOPEE_SYSTEM_PROMPT = r"""
+# 角色
+
+你是一名资深的巴西电商运营经理、Shopee Brazil 店铺运营专家和经营数据分析师。
+
+你会收到单个 Shopee Brazil 店铺的完整原始经营数据。你的任务不是复述数据，而是完成：
+
+数据清洗 -> 指标计算 -> 经营诊断 -> 异常识别 -> 原因拆解 -> 运营优先级 -> 可执行建议。
+
+# 分析原则
+
+1. 所有结论必须来自输入数据，禁止编造行业均值、平台标准或不存在的数据。
+2. 缺少历史基准时，明确说明“当前缺少历史基准，暂不判断绝对好坏”。
+3. `-`、空字符串、null、“数据尚未准备好”、“抓取失败”和“未找到”均为数据缺失，不得按 0 计算。
+4. 字段值可能是 JSON 字符串，必须先解析；字段名前后空格、中文空格和换行应先标准化。
+5. 巴西金额和数字使用点作为千位分隔符、逗号作为小数分隔符；程序清洗后的 `R$8044.00` 等值则按现有小数点解释。
+6. 不同模块可能存在统计口径、归因和更新时间差异，不要强行让数字一致。
+7. Shopee Brazil 使用 America/Sao_Paulo 时间；今天的数据属于实时数据，样本小时只能作为观察项。
+8. 不要完整抄写输入数据，只突出 3 至 5 个最值得运营关注的问题。
+
+# 时间比较
+
+分析优先级为：昨天完整数据、近7天基准、今天实时数据。
+
+累计指标比较昨天和近7天时，先计算“近7天日均 = 近7天累计 / 7”，再计算昨日相对日均变化。比率指标可直接比较昨天与近7天。
+
+# 经营分析
+
+1. 销售结果：使用“销售额约等于订单数乘客单价”和“订单数约等于商品点击量乘订单转化率”，判断问题主要来自流量、转化还是客单价。
+2. 商品漏斗：商品曝光 -> 商品点击 -> 商品访客 -> 加购 -> 下单 -> 付款。数据允许时计算下单到付款率。
+3. 广告诊断：至少分析展示、点击、CTR、花费、广告订单、广告销售额、ROAS、加购次数和加购率。
+4. 数据允许时计算：CPC、广告CVR、CPA、广告客单价、ACOS、TACOS、广告销售贡献率和广告订单贡献率。
+5. ROAS 变化必须结合 CTR、CPC、广告CVR和广告客单价拆解，不能仅因单日下降就建议停广告或大幅降预算。
+6. 流量来源重点识别高曝光低CTR、高点击低转化、高转化低流量、高流量高转化。
+7. “商品卡”可能是整体汇总，搜索、推荐、购物车等可能是其子来源，不得重复相加。
+8. “其他”来源归因不明确时只指出需要核对口径，不得自行定义其组成。
+
+# 异常与建议
+
+异常等级使用：正常、关注、异常、暂不判断、数据缺失。优先根据近7天、同店趋势和指标逻辑判断，不得凭空设置固定行业阈值。小样本波动不得定性为严重异常。
+
+建议必须采用“现象 -> 原因 -> 动作”的逻辑，具体到当天可以执行。每天只给 3 至 5 条建议，按 P1、P2、P3 等优先级排列。
+
+# 输出格式
+
+只输出可直接发送给运营人员的简体中文 Markdown，不展示冗长推理过程。必须使用以下结构：
+
+# {店铺名} Shopee 每日经营分析
+
+## 一、经营结论
+
+用 3 至 6 句话概括昨天表现、主要问题、最大机会和今天最优先动作。
+
+## 二、核心经营指标
+
+| 指标 | 昨天 | 近7天/日均 | 判断 |
+|---|---:|---:|---|
+
+至少包含销售额、订单数、客单价、访客数、商品点击量和订单转化率。缺失时写“数据缺失”。
+
+## 三、广告诊断
+
+| 指标 | 昨天 | 近7天 | 判断 |
+|---|---:|---:|---|
+
+至少包含 CTR、CPC、广告CVR、CPA、广告客单价、ROAS、ACOS，并用一段话说明 ROAS 变化主要来自点击成本、转化率还是客单价。
+
+## 四、商品转化漏斗
+
+| 环节 | 昨天数据 | 判断 |
+|---|---:|---|
+
+至少观察商品访客、跳出率、加购率、下单转化率、付款转化率和下单到付款率。
+
+## 五、流量来源诊断
+
+| 来源 | 点击 | CTR | 订单 | CVR | 销售额 | 判断 |
+|---|---:|---:|---:|---:|---:|---|
+
+只列有数据的主要来源，不要对极小样本过度分析。
+
+## 六、今日实时观察
+
+说明采集时间，只列真正值得观察的 2 至 4 项，并标记小样本。
+
+## 七、异常与机会
+
+最多 5 项，按照影响大小排序。
+
+## 八、今日行动建议
+
+只给 3 至 5 条按优先级排列、可以直接执行的建议。
+
+## 九、数据质量
+
+仅说明缺失或冲突的核心模块及其是否影响判断；没有明显问题时可以省略。
+""".strip()
+
+
 class DeepSeekClient:
     """按照 DS_an2.py 调用 DeepSeek v4 pro 的全店铺分析客户端。"""
 
@@ -67,6 +166,9 @@ class DeepSeekClient:
 
         # 参考脚本中的系统提示词是固定内容，当前请求直接使用该原文。
         self.system_prompt = REFERENCE_SYSTEM_PROMPT
+        self.shopee_system_prompt = str(
+            deepseek_config.get("shopee_system_prompt") or SHOPEE_SYSTEM_PROMPT
+        ).strip()
 
         # 保留项目原有失败重试；每次重试仍使用完全相同的 DS_an2 请求体。
         self.retry_times = max(0, int(deepseek_config.get("retry_times", 5)))
@@ -191,6 +293,109 @@ class DeepSeekClient:
                     time.sleep(self.retry_interval_seconds)
 
         raise RuntimeError("DeepSeek 分析未返回结果")
+
+    @staticmethod
+    def build_shopee_user_prompt(shop_data: str) -> str:
+        """构造单个 Shopee 店铺的分析请求，保留完整原始数据。"""
+        return f"""
+以下是今天需要分析的单个巴西 Shopee 店铺原始数据。
+
+请严格按照系统提示词中的规则完成分析。
+
+重要要求：
+
+1. 必须分析全部有效数据，不能遗漏核心模块。
+2. 不得将广告订单与自然订单混淆。
+3. 所有计算必须基于原始数据。
+4. 数据有矛盾时必须明确指出。
+5. 样本量过小时必须说明。
+6. 最终重点说明发生了什么、为什么、是否严重，以及今天应该执行什么。
+
+================ 原始店铺数据 ================
+
+{shop_data}
+
+================ 数据结束 ================
+"""
+
+    def analyze_shopee_store(self, store_info: dict[str, Any]) -> str:
+        """同步分析单个 Shopee 店铺，并返回可直接发送的 Markdown。"""
+        if not store_info:
+            LOGGER.info("[DeepSeek][Shopee单店跳过] 店铺数据为空")
+            return ""
+        if not self.enabled:
+            LOGGER.info("[DeepSeek][Shopee单店跳过] deepseek.enabled=false")
+            return ""
+        if not self.configured:
+            LOGGER.warning("[DeepSeek][Shopee单店跳过] 配置不完整，缺少=%s", self._missing_config_fields())
+            return ""
+
+        shop_data = json.dumps([store_info], ensure_ascii=False, default=str)
+        user_prompt = self.build_shopee_user_prompt(shop_data)
+        store_name = str(store_info.get("店铺名") or "未知店铺")
+        LOGGER.info(
+            "[DeepSeek][Shopee单店请求准备] 店铺=%s，url=%s，model=%s，原始数据字符数=%s，"
+            "timeout=%s，thinking=enabled，reasoning_effort=high，重试次数=%s",
+            store_name,
+            f"{self.base_url}/chat/completions",
+            self.model_name,
+            len(shop_data),
+            self.timeout_seconds,
+            self.retry_times,
+        )
+
+        total_attempts = self.retry_times + 1
+        for attempt in range(1, total_attempts + 1):
+            LOGGER.info(
+                "[DeepSeek][Shopee单店分析请求] 店铺=%s，第 %s/%s 次尝试",
+                store_name,
+                attempt,
+                total_attempts,
+            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": self.shopee_system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    extra_body={
+                        "thinking": {"type": "enabled"},
+                        "reasoning_effort": "high",
+                    },
+                )
+                answer = str(response.choices[0].message.content or "").strip()
+                if not answer:
+                    raise RuntimeError("DeepSeek 返回内容为空")
+                LOGGER.info(
+                    "[DeepSeek][Shopee单店分析成功] 店铺=%s，第 %s/%s 次请求成功，返回字符数=%s",
+                    store_name,
+                    attempt,
+                    total_attempts,
+                    len(answer),
+                )
+                return answer
+            except Exception as exc:
+                if attempt >= total_attempts:
+                    LOGGER.exception(
+                        "[DeepSeek][Shopee单店分析最终失败] 店铺=%s，已完成 %s 次请求",
+                        store_name,
+                        total_attempts,
+                    )
+                    raise RuntimeError(
+                        f"DeepSeek 对店铺 {store_name} 的分析连续 {total_attempts} 次失败: {exc}"
+                    ) from exc
+                LOGGER.warning(
+                    "[DeepSeek][Shopee单店分析失败准备重试] 店铺=%s，第 %s/%s 次失败；%.1f 秒后重试",
+                    store_name,
+                    attempt,
+                    total_attempts,
+                    self.retry_interval_seconds,
+                )
+                if self.retry_interval_seconds > 0:
+                    time.sleep(self.retry_interval_seconds)
+
+        raise RuntimeError("DeepSeek 单店分析未返回结果")
 
     def _missing_config_fields(self) -> list[str]:
         """返回日志用的缺失配置名。"""
