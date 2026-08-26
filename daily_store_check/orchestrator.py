@@ -236,16 +236,9 @@ SHOPEE_MESSAGE_GROUPS += (
     ("今天广告数据", tuple((label, field.replace("7天", "今天")) for label, field in SHOPEE_MESSAGE_GROUPS[1][1])),
 )
 
-# 商业分析页面的数据以 JSON 文本保存，机器人消息仍按页面和周期分组展示。
+# 商业分析页面的数据以 JSON 文本保存，机器人消息按页面合并三种周期展示。
 # 这些临时字段不加入固定飞书表字段，因此本阶段只推送，不写入已有多维表和二维表。
-SHOPEE_ANALYTICS_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = tuple(
-    (
-        f"{page_name}{period}",
-        (("页面完整数据", f"Shopee{page_name}_{period}"),),
-    )
-    for page_name in ("商业分析概述", "商品概述", "商品流量", "流量概述")
-    for period in ("昨天", "7天", "今天")
-)
+SHOPEE_ANALYTICS_PAGE_NAMES: tuple[str, ...] = ("商业分析概述", "商品概述", "商品流量", "流量概述")
 
 # 当爬虫没有提供“显示值”时，机器人根据字段类别补充货币符号或合适的小数位。
 SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
@@ -661,87 +654,120 @@ class DailyStoreCheck:
         store_name: str,
         rows: list[dict[str, Any]],
     ) -> None:
-        """把清洗后的商业分析数据转为业务 Markdown，按完整行拆分发送。"""
+        """把商业分析每个页面的今天、昨天、近7天合并为横向对比表。"""
         analytics_values = {
             str(row.get("指标") or ""): str(row.get("显示值") or "")
             for row in rows
             if str(row.get("指标") or "").startswith("Shopee")
         }
-        for group_name, metric_specs in SHOPEE_ANALYTICS_MESSAGE_GROUPS:
-            field_name = metric_specs[0][1]
-            payload = analytics_values.get(field_name, "")
-            if not payload:
-                LOGGER.warning("[飞书][Shopee商业分析跳过] 店铺=%s，分组=%s，没有有效数据", store_name, group_name)
+        for page_name in SHOPEE_ANALYTICS_PAGE_NAMES:
+            period_payloads: dict[str, dict[str, Any]] = {}
+            for period in ("今天", "昨天", "7天"):
+                field_name = f"Shopee{page_name}_{period}"
+                payload = analytics_values.get(field_name, "")
+                if not payload:
+                    continue
+                try:
+                    parsed_payload = json.loads(payload)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    LOGGER.warning(
+                        "[飞书][Shopee商业分析解析失败] 店铺=%s，页面=%s，时间范围=%s",
+                        store_name,
+                        page_name,
+                        period,
+                    )
+                    continue
+                if isinstance(parsed_payload, dict):
+                    period_payloads[period] = parsed_payload
+            if not period_payloads:
+                LOGGER.warning("[飞书][Shopee商业分析跳过] 店铺=%s，页面=%s，没有有效数据", store_name, page_name)
                 continue
-            try:
-                parsed_payload = json.loads(payload)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                LOGGER.warning("[飞书][Shopee商业分析解析失败] 店铺=%s，分组=%s", store_name, group_name)
-                continue
-            markdown = self._format_shopee_analytics_markdown(group_name, parsed_payload)
-            chunks = self._split_markdown_by_lines(markdown, group_name, max_chunk_size=3500)
+            markdown = self._format_shopee_analytics_period_table(page_name, period_payloads)
+            chunks = self._split_markdown_table(markdown, page_name, max_chunk_size=3500)
             for chunk_index, chunk in enumerate(chunks, start=1):
                 suffix = f"（{chunk_index}/{len(chunks)}）" if len(chunks) > 1 else ""
                 self._safe_notify_markdown(
                     recipient,
-                    f"{store_name} Shopee {group_name}{suffix}",
+                    f"{store_name} Shopee {page_name}{suffix}",
                     chunk,
                 )
 
     @staticmethod
-    def _format_shopee_analytics_markdown(group_name: str, payload: dict[str, Any]) -> str:
-        """将商业分析的清洗结构格式化为运营人员可直接阅读的 Markdown。"""
-        lines = [f"### {group_name}"]
-        metrics = payload.get("指标", [])
-        current_section = ""
-        if isinstance(metrics, list):
-            for metric in metrics:
-                if not isinstance(metric, dict):
-                    continue
-                section = str(metric.get("分组") or "").strip()
-                if section and section != current_section:
-                    lines.append(f"#### {section}")
-                    current_section = section
-                name = str(metric.get("名称") or "").strip()
-                if not name:
-                    continue
-                if all(key in metric for key in ("全部", "APP", "PC")):
-                    lines.append(
-                        f"- **{name}**：全部 {metric.get('全部', '-')} | "
-                        f"APP {metric.get('APP', '-')} | PC {metric.get('PC', '-')}"
-                    )
-                else:
-                    lines.append(f"- **{name}**：{metric.get('值', '-')}")
+    def _format_shopee_analytics_period_table(
+        page_name: str,
+        period_payloads: dict[str, dict[str, Any]],
+    ) -> str:
+        """将商业分析页面展开为“指标 × 三周期”的 Markdown 表格。"""
+        period_order = ("今天", "昨天", "7天")
+        value_maps: dict[str, dict[str, str]] = {}
+        metric_order: list[str] = []
+        for period in period_order:
+            payload = period_payloads.get(period, {})
+            values: dict[str, str] = {}
+            if payload.get("状态") == "数据尚未准备好":
+                values["状态"] = str(payload.get("提示") or "数据尚未准备好")
+            metrics = payload.get("指标", [])
+            if isinstance(metrics, list):
+                for metric in metrics:
+                    if not isinstance(metric, dict):
+                        continue
+                    name = str(metric.get("名称") or "").strip()
+                    section = str(metric.get("分组") or "").strip()
+                    if not name:
+                        continue
+                    base_name = f"{section} / {name}" if section else name
+                    if all(key in metric for key in ("全部", "APP", "PC")):
+                        for device in ("全部", "APP", "PC"):
+                            values[f"{base_name}（{device}）"] = str(metric.get(device, "-") or "-")
+                    else:
+                        values[base_name] = str(metric.get("值", "-") or "-")
+            sources = payload.get("来源分布", [])
+            if isinstance(sources, list):
+                for source in sources:
+                    if not isinstance(source, dict):
+                        continue
+                    source_name = str(source.get("流量来源") or "未知来源").strip()
+                    for field_name, field_value in source.items():
+                        if field_name == "流量来源":
+                            continue
+                        values[f"来源分布 / {source_name} / {field_name}"] = str(field_value or "-")
+            value_maps[period] = values
+            for metric_name in values:
+                if metric_name not in metric_order:
+                    metric_order.append(metric_name)
 
-        source_distribution = payload.get("来源分布", [])
-        if isinstance(source_distribution, list) and source_distribution:
-            lines.append("#### 来源分布")
-            for source in source_distribution:
-                if not isinstance(source, dict):
-                    continue
-                source_name = str(source.get("流量来源") or "未知来源")
-                values = [
-                    f"{field_name} {field_value}"
-                    for field_name, field_value in source.items()
-                    if field_name != "流量来源"
-                ]
-                lines.append(f"- **{source_name}**：{'；'.join(values) if values else '-'}")
+        lines = [f"## {page_name}", "", "| 指标 | 今天 | 昨天 | 近7天 |", "|---|---:|---:|---:|"]
+        for metric_name in metric_order:
+            cells = [DailyStoreCheck._escape_markdown_table_cell(metric_name)]
+            cells.extend(
+                DailyStoreCheck._escape_markdown_table_cell(value_maps.get(period, {}).get(metric_name, "-"))
+                for period in period_order
+            )
+            lines.append(f"| {' | '.join(cells)} |")
         return "\n".join(lines)
 
     @staticmethod
-    def _split_markdown_by_lines(content: str, group_name: str, max_chunk_size: int) -> list[str]:
-        """仅在完整 Markdown 行之间拆分，避免把指标名称或数值截成两半。"""
+    def _escape_markdown_table_cell(value: Any) -> str:
+        """转义表格单元格中的竖线和换行，避免破坏 Markdown 列结构。"""
+        return str(value if value not in (None, "") else "-").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
+
+    @staticmethod
+    def _split_markdown_table(content: str, group_name: str, max_chunk_size: int) -> list[str]:
+        """按完整数据行拆分长表格，并在每段重复标题和表头。"""
+        lines = content.splitlines()
+        table_index = next((index for index, line in enumerate(lines) if line.startswith("| 指标 |")), -1)
+        if table_index < 0 or table_index + 1 >= len(lines):
+            return [content]
+        data_rows = lines[table_index + 2:]
+        table_header = lines[table_index:table_index + 2]
         chunks: list[str] = []
-        current_lines: list[str] = []
-        current_length = 0
-        for line in content.splitlines():
-            added_length = len(line) + (1 if current_lines else 0)
-            if current_lines and current_length + added_length > max_chunk_size:
+        current_lines = lines[:table_index] + table_header
+        for row in data_rows:
+            candidate = "\n".join(current_lines + [row])
+            if len(candidate) > max_chunk_size and len(current_lines) > len(table_header):
                 chunks.append("\n".join(current_lines))
-                current_lines = [f"### {group_name}（续）"]
-                current_length = len(current_lines[0])
-            current_lines.append(line)
-            current_length += len(line) + (1 if current_length else 0)
+                current_lines = [f"## {group_name}（续）", ""] + table_header
+            current_lines.append(row)
         if current_lines:
             chunks.append("\n".join(current_lines))
         return chunks
@@ -1394,7 +1420,7 @@ class DailyStoreCheck:
 
     @staticmethod
     def _format_shopee_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
-        """整理 Shopee 机器人 Markdown，固定按昨日和最近7天两组输出。"""
+        """整理 Shopee 广告机器人消息，按今天、昨天、近7天横向对比。"""
         collected_at = ""
         display_values: dict[str, Any] = {}
         for row in rows:
@@ -1422,15 +1448,29 @@ class DailyStoreCheck:
             date_text = collected_at[:10] if collected_at else "未知日期"
 
         title = f"{store_name} shopee 推送数据 - {date_text}"
-        lines: list[str] = []
-        for group_name, metric_specs in SHOPEE_MESSAGE_GROUPS:
-            lines.append(f"### {group_name}")
-            for label, field_name in metric_specs:
-                value = display_values.get(field_name, "")
-                lines.append(f"- **{label}**：{DailyStoreCheck._format_shopee_display_value(field_name, value)}")
-            # 组间保留一个空行，防止两段数据在飞书卡片中连成一块。
-            lines.append("")
-        return title, "\n".join(lines).strip()
+        period_specs = {
+            "今天": dict(SHOPEE_MESSAGE_GROUPS[2][1]),
+            "昨天": dict(SHOPEE_MESSAGE_GROUPS[0][1]),
+            "7天": dict(SHOPEE_MESSAGE_GROUPS[1][1]),
+        }
+        metric_labels = [label for label, _ in SHOPEE_MESSAGE_GROUPS[0][1]]
+        lines = [
+            "## 📢 广告表现",
+            "",
+            "| 指标 | 今天 | 昨天 | 近7天 |",
+            "|---|---:|---:|---:|",
+        ]
+        for label in metric_labels:
+            cells = [DailyStoreCheck._escape_markdown_table_cell(label)]
+            for period in ("今天", "昨天", "7天"):
+                field_name = period_specs[period][label]
+                value = DailyStoreCheck._format_shopee_display_value(
+                    field_name,
+                    display_values.get(field_name, ""),
+                )
+                cells.append(DailyStoreCheck._escape_markdown_table_cell(value))
+            lines.append(f"| {' | '.join(cells)} |")
+        return title, "\n".join(lines)
 
     @staticmethod
     def _format_mercado_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:

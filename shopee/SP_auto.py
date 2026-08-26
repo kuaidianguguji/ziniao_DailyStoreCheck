@@ -318,8 +318,9 @@ class ShopeeAuto:
                     try:
                         self._select_data_center_period(tab, period, page_name)
                         # 日期点击后页面会重新请求数据；必须等完整业务节点并留出稳定时间再读取。
-                        self._wait_for_data_center_render(tab, page_name)
-                        time.sleep(EXTRA_PAGE_WAIT_SECONDS)
+                        notice_detected = self._wait_for_data_center_render(tab, page_name)
+                        if not notice_detected:
+                            time.sleep(EXTRA_PAGE_WAIT_SECONDS)
                         raw_payload = self._read_data_center_payload(tab, page_name)
                         payload = self._clean_data_center_payload(page_name, raw_payload)
                         field_name = f"Shopee{page_name}_{period}"
@@ -430,8 +431,8 @@ class ShopeeAuto:
             time.sleep(1)
         raise TimeoutError(f"{page_name} 选择{period}后 20 秒内未确认日期标签，期望={expected_label}")
 
-    def _wait_for_data_center_render(self, tab: Any, page_name: str) -> None:
-        """等待商业分析页面的业务节点出现，最长 120 秒，每秒检查一次。"""
+    def _wait_for_data_center_render(self, tab: Any, page_name: str) -> bool:
+        """等待业务节点出现；发现“数据尚未准备好”提示时立即返回 True。"""
         selector, minimum = DATA_CENTER_RENDER_SELECTORS[page_name]
         deadline = time.monotonic() + DATA_CENTER_RENDER_TIMEOUT_SECONDS
         last_count = 0
@@ -443,7 +444,9 @@ class ShopeeAuto:
             try:
                 result = tab.run_js(
                     "const nodes = [...document.querySelectorAll(%s)];"
-                    "return {ready: document.readyState, count: nodes.length, "
+                    "const notice = [...document.querySelectorAll('.bi-notice-bar .eds-alert--warning .eds-alert-title')]"
+                    ".map((node) => (node.innerText || '').trim()).find(Boolean) || '';"
+                    "return {ready: document.readyState, count: nodes.length, notice: notice, "
                     "signature: nodes.map((node) => (node.innerText || '').trim()).join('||')};"
                     % json.dumps(selector, ensure_ascii=False)
                 )
@@ -451,12 +454,22 @@ class ShopeeAuto:
                     last_count = int(result.get("count") or 0)
                     ready_state = str(result.get("ready") or "").lower()
                     signature = str(result.get("signature") or "")
+                    notice = str(result.get("notice") or "").strip()
                 else:
                     ready_state = ""
                     signature = ""
+                    notice = ""
             except Exception:
                 ready_state = ""
                 signature = ""
+                notice = ""
+            if notice:
+                LOGGER.warning(
+                    "[Shopee][商业分析数据未准备好] 页面=%s，提示=%s",
+                    page_name,
+                    notice,
+                )
+                return True
             if last_count >= minimum and signature:
                 stable_checks = stable_checks + 1 if signature == last_signature else 1
             else:
@@ -480,7 +493,7 @@ class ShopeeAuto:
                     DATA_CENTER_RENDER_EXTRA_WAIT_SECONDS,
                 )
                 time.sleep(DATA_CENTER_RENDER_EXTRA_WAIT_SECONDS)
-                return
+                return False
             time.sleep(DATA_CENTER_RENDER_POLL_SECONDS)
         raise TimeoutError(
             f"Shopee {page_name} 在 {DATA_CENTER_RENDER_TIMEOUT_SECONDS} 秒内未出现业务节点，"
@@ -521,7 +534,9 @@ class ShopeeAuto:
           tableSignatures.add(signature);
           return true;
         }});
-        return {{page: document.body.className || '', cards, tables}};
+        const notice = [...document.querySelectorAll('.bi-notice-bar .eds-alert--warning .eds-alert-title')]
+          .map((node) => text(node)).find(Boolean) || '';
+        return {{notice, cards, tables}};
         """
         payload = tab.run_js(script)
         return payload if isinstance(payload, dict) else {"raw": str(payload or "")}
@@ -559,6 +574,10 @@ class ShopeeAuto:
             if re.fullmatch(r"-?[\d.]+,\d+", text):
                 return f"{number:.2f}"
             return text
+
+        notice = clean_text(payload.get("notice"))
+        if notice:
+            return {"状态": "数据尚未准备好", "提示": notice}
 
         if page_name == "商业分析概述":
             metrics = [
