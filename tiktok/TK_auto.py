@@ -1904,6 +1904,9 @@ class TiktokAuto:
         configured_specs = [
             spec for spec in specs if str(spec.get("xpath") or "").strip()
         ]
+        # 同一个 XPath 只代表一个页面节点，按唯一 XPath 计数避免重复配置造成误判。
+        unique_xpaths = list(dict.fromkeys(str(spec["xpath"]) for spec in configured_specs))
+        configured_specs = [{"xpath": xpath} for xpath in unique_xpaths]
         required_count = len(configured_specs)
         if required_count == 0:
             LOGGER.warning("[TikTok][指标数量等待跳过] 页面=%s，时间范围=%s，没有有效 XPath", page_name, period)

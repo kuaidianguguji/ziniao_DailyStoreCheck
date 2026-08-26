@@ -40,6 +40,28 @@ SHOPEE_LOGIN_BUTTON_XPATH = "//form/button"
 # 已确认登录后直接打开广告页，不再点击首页的营销中心或 Shopee 广告菜单。
 SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
 
+# 商业分析四个页面入口。页面中的 API 和 DOM 可能随 Shopee 前端版本变化，
+# 这里只固定路由，指标由页面当前渲染的业务标题和表格列动态读取。
+SHOPEE_DATA_CENTER_URLS: dict[str, str] = {
+    "商业分析概述": "https://seller.shopee.com.br/datacenter/overview",
+    "商品概述": "https://seller.shopee.com.br/datacenter/product/overview",
+    "商品流量": "https://seller.shopee.com.br/datacenter/product/traffic",
+    "流量概述": "https://seller.shopee.com.br/datacenter/traffic/overview",
+}
+EXTRA_PERIODS: tuple[str, ...] = ("昨天", "7天", "今天")
+EXTRA_PERIOD_LABELS: dict[str, str] = {"昨天": "昨天", "7天": "过去7 天", "今天": "今日实时"}
+EXTRA_PAGE_WAIT_SECONDS = 5
+# 商业分析是单页应用，document.readyState 完成后仍会异步请求和渲染数据。
+DATA_CENTER_RENDER_TIMEOUT_SECONDS = 120
+DATA_CENTER_RENDER_POLL_SECONDS = 1
+DATA_CENTER_RENDER_EXTRA_WAIT_SECONDS = 3
+DATA_CENTER_RENDER_SELECTORS: dict[str, tuple[str, int]] = {
+    "商业分析概述": (".dashboard-key-metric-group .key-metric", 7),
+    "商品概述": (".product-overview .key-metric", 20),
+    "商品流量": (".traffic-sources-list tbody tr", 1),
+    "流量概述": (".metric-item", 8),
+}
+
 # 广告页单次等待 document.readyState=complete 的最长时间，单位为秒。
 # 超过 120 秒仍未完成时，本次加载判定失败，刷新当前广告页后重新尝试。
 AD_PAGE_LOAD_TIMEOUT_SECONDS = 120
@@ -262,10 +284,390 @@ class ShopeeAuto:
                 }
                 rows.append(row)
 
+        # 广告数据完成后依次进入商业分析页面，三种周期均读取当前 DOM。
+        rows.extend(self._collect_data_center_pages(tab, store_name, collected_at))
+
         valid_count = sum(row["数值"] != "" for row in rows)
         LOGGER.info("[Shopee][结果打包] rows=%s", json.dumps(rows, ensure_ascii=False, default=str))
         LOGGER.info("[Shopee][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(rows))
         return rows
+
+    def _collect_data_center_pages(self, tab: Any, store_name: str, collected_at: str) -> list[dict[str, Any]]:
+        """读取商业分析页面的卡片和表格，返回可并入现有结果的 JSON 字段。"""
+        rows: list[dict[str, Any]] = []
+        for page_name, page_url in SHOPEE_DATA_CENTER_URLS.items():
+            try:
+                if page_name == "商业分析概述":
+                    # 广告数据完成后先点击页面导航中的“商业分析”，保持与人工操作一致。
+                    analytics_link_xpath = '//a[contains(@href,"/datacenter") and normalize-space()="商业分析"]'
+                    analytics_link = self._find_visible_element(tab, analytics_link_xpath, timeout=3)
+                    if analytics_link:
+                        self._click_element_with_fallback(tab, analytics_link, analytics_link_xpath, "打开商业分析")
+                        time.sleep(1)
+                # 先带一个明确的 group 进入页面，避免前端沿用上一个广告页的周期状态。
+                initial_url = self._replace_group_in_url(page_url, PERIOD_GROUP_VALUES["昨天"])
+                current_url = self._read_current_url(tab)
+                if page_name != "商业分析概述" or "/datacenter" not in current_url:
+                    result = tab.get(initial_url, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
+                else:
+                    result = True
+                if result is False or not self._wait_for_page_ready(tab, AD_PAGE_LOAD_TIMEOUT_SECONDS):
+                    raise TimeoutError("页面未完成加载")
+                self._wait_for_data_center_render(tab, page_name)
+                for period in EXTRA_PERIODS:
+                    try:
+                        self._select_data_center_period(tab, period, page_name)
+                        # 日期点击后页面会重新请求数据；必须等完整业务节点并留出稳定时间再读取。
+                        self._wait_for_data_center_render(tab, page_name)
+                        time.sleep(EXTRA_PAGE_WAIT_SECONDS)
+                        raw_payload = self._read_data_center_payload(tab, page_name)
+                        payload = self._clean_data_center_payload(page_name, raw_payload)
+                        field_name = f"Shopee{page_name}_{period}"
+                        rows.append({
+                            "店铺名": store_name,
+                            "平台": "shopee",
+                            "采集时间": collected_at,
+                            "指标": field_name,
+                            "数值": json.dumps(payload, ensure_ascii=False),
+                            "显示值": json.dumps(payload, ensure_ascii=False),
+                            "原始数据": json.dumps({"页面": page_name, "时间范围": period, "数据": payload}, ensure_ascii=False),
+                        })
+                    except Exception as period_exc:
+                        LOGGER.warning(
+                            "[Shopee][商业分析周期失败] 店铺=%s，页面=%s，时间范围=%s，异常=%s",
+                            store_name,
+                            page_name,
+                            period,
+                            period_exc,
+                        )
+                        rows.append({
+                            "店铺名": store_name, "平台": "shopee", "采集时间": collected_at,
+                            "指标": f"Shopee{page_name}_{period}_失败", "数值": "", "显示值": str(period_exc),
+                            "原始数据": json.dumps(
+                                {"页面": page_name, "时间范围": period, "错误": str(period_exc)},
+                                ensure_ascii=False,
+                            ),
+                        })
+            except Exception as exc:
+                LOGGER.warning("[Shopee][商业分析页面失败] 店铺=%s，页面=%s，异常=%s", store_name, page_name, exc)
+                rows.append({
+                    "店铺名": store_name, "平台": "shopee", "采集时间": collected_at,
+                    "指标": f"Shopee{page_name}_失败", "数值": "", "显示值": str(exc),
+                    "原始数据": json.dumps({"页面": page_name, "错误": str(exc)}, ensure_ascii=False),
+                })
+        return rows
+
+    def _select_data_center_period(self, tab: Any, period: str, page_name: str) -> None:
+        """使用页面内原子操作打开日期菜单并点击最新快捷项，避免 Vue 重渲染导致元素失效。"""
+        label = EXTRA_PERIOD_LABELS[period]
+        label_literal = json.dumps(label, ensure_ascii=False)
+        picker_result = tab.run_js(
+            "const picker = [...document.querySelectorAll('.bi-date-input')]"
+            ".find((el) => { const rect = el.getBoundingClientRect(); "
+            "return rect.width > 0 && rect.height > 0; });"
+            "if (!picker) return {clicked: false};"
+            "picker.click(); return {clicked: true};"
+        )
+        if not isinstance(picker_result, dict) or not picker_result.get("clicked"):
+            raise RuntimeError(f"{page_name} 未找到可点击的统计时间选择器")
+
+        option_clicked = False
+        clicked_text = ""
+        for option_check_index in range(1, 21):
+            option_result = tab.run_js(
+                rf"""
+                const wanted = {label_literal}.replace(/\s+/g, '');
+                const options = [...document.querySelectorAll('li.eds-date-shortcut-item')];
+                const option = options.find((item) => {{
+                    const textNode = item.querySelector('.eds-date-shortcut-item__text') || item;
+                    const text = (textNode.innerText || '').replace(/\s+/g, '');
+                    const rect = item.getBoundingClientRect();
+                    return text === wanted && rect.width > 0 && rect.height > 0;
+                }});
+                if (!option) return {{clicked: false, count: options.length}};
+                const textNode = option.querySelector('.eds-date-shortcut-item__text') || option;
+                const text = (textNode.innerText || '').trim();
+                option.scrollIntoView({{block: 'center'}});
+                option.click();
+                return {{clicked: true, text: text, count: options.length}};
+                """
+            )
+            if isinstance(option_result, dict) and option_result.get("clicked"):
+                option_clicked = True
+                clicked_text = str(option_result.get("text") or "")
+                LOGGER.info(
+                    "[Shopee][商业分析日期点击] 页面=%s，时间范围=%s，目标文本=%r，第%s次命中最新元素",
+                    page_name,
+                    period,
+                    clicked_text,
+                    option_check_index,
+                )
+                break
+            time.sleep(0.25)
+        if not option_clicked:
+            raise RuntimeError(f"{page_name} 打开日期菜单后未找到时间范围={period}快捷项")
+
+        expected_label = EXTRA_PERIOD_LABELS[period]
+        for check_index in range(1, 21):
+            try:
+                current_label = str(
+                    tab.run_js(
+                        "return (document.querySelector('.bi-date-input .label') || {}).innerText || '';"
+                    )
+                    or ""
+                ).strip()
+            except Exception:
+                current_label = ""
+            if expected_label.replace(" ", "") in current_label.replace(" ", ""):
+                LOGGER.info(
+                    "[Shopee][商业分析日期确认] 页面=%s，时间范围=%s，页面标签=%r，第%s次确认成功",
+                    page_name,
+                    period,
+                    current_label,
+                    check_index,
+                )
+                return
+            time.sleep(1)
+        raise TimeoutError(f"{page_name} 选择{period}后 20 秒内未确认日期标签，期望={expected_label}")
+
+    def _wait_for_data_center_render(self, tab: Any, page_name: str) -> None:
+        """等待商业分析页面的业务节点出现，最长 120 秒，每秒检查一次。"""
+        selector, minimum = DATA_CENTER_RENDER_SELECTORS[page_name]
+        deadline = time.monotonic() + DATA_CENTER_RENDER_TIMEOUT_SECONDS
+        last_count = 0
+        check_index = 0
+        last_signature = ""
+        stable_checks = 0
+        while time.monotonic() < deadline:
+            check_index += 1
+            try:
+                result = tab.run_js(
+                    "const nodes = [...document.querySelectorAll(%s)];"
+                    "return {ready: document.readyState, count: nodes.length, "
+                    "signature: nodes.map((node) => (node.innerText || '').trim()).join('||')};"
+                    % json.dumps(selector, ensure_ascii=False)
+                )
+                if isinstance(result, dict):
+                    last_count = int(result.get("count") or 0)
+                    ready_state = str(result.get("ready") or "").lower()
+                    signature = str(result.get("signature") or "")
+                else:
+                    ready_state = ""
+                    signature = ""
+            except Exception:
+                ready_state = ""
+                signature = ""
+            if last_count >= minimum and signature:
+                stable_checks = stable_checks + 1 if signature == last_signature else 1
+            else:
+                stable_checks = 0
+            last_signature = signature
+            if check_index == 1 or check_index % 5 == 0 or last_count >= minimum:
+                LOGGER.info(
+                    "[Shopee][商业分析等待] 页面=%s，第%s次，readyState=%s，业务节点=%s/%s，稳定次数=%s/3",
+                    page_name,
+                    check_index,
+                    ready_state or "未知",
+                    last_count,
+                    minimum,
+                    stable_checks,
+                )
+            if last_count >= minimum and stable_checks >= 3:
+                LOGGER.info(
+                    "[Shopee][商业分析加载完成] 页面=%s，业务节点=%s，额外等待=%.1f秒",
+                    page_name,
+                    last_count,
+                    DATA_CENTER_RENDER_EXTRA_WAIT_SECONDS,
+                )
+                time.sleep(DATA_CENTER_RENDER_EXTRA_WAIT_SECONDS)
+                return
+            time.sleep(DATA_CENTER_RENDER_POLL_SECONDS)
+        raise TimeoutError(
+            f"Shopee {page_name} 在 {DATA_CENTER_RENDER_TIMEOUT_SECONDS} 秒内未出现业务节点，"
+            f"selector={selector}，最后数量={last_count}"
+        )
+
+    @staticmethod
+    def _read_data_center_payload(tab: Any, page_name: str) -> dict[str, Any]:
+        """在浏览器端按业务 class 读取卡片与表格，避免依赖随机 data-v 属性。"""
+        page_name_literal = json.dumps(page_name, ensure_ascii=False)
+        script = rf"""
+        const pageName = {page_name_literal};
+        const clean = (v) => (v || '').replace(/\s+/g, ' ').trim();
+        const text = (el) => clean(el ? el.innerText : '');
+        const selectors = {{
+          '商业分析概述': '.dashboard-key-metric-group .key-metric',
+          '商品概述': '.product-overview .key-metric',
+          '商品流量': '.eds-metrics-card',
+          '流量概述': '.metric-item'
+        }};
+        let cardElements = [...document.querySelectorAll(selectors[pageName] || '.key-metric, .metric-item')];
+        if (pageName === '商业分析概述') cardElements = cardElements.slice(0, 7);
+        const cards = cardElements.map((el) => ({{
+          title: text(el.querySelector('.title-text, .eds-metrics-card__name .title, .total-sales-title__text, .title')),
+          value: text(el.querySelector('.value .number, .value, .eds-metrics-card__value, .currency-value')),
+          values: [...el.querySelectorAll('.metric-data .value .number, .metric-data .value')].map(text).filter(Boolean),
+          className: el.className || ''
+        }})).filter((x) => x.title || x.value);
+        const tableSignatures = new Set();
+        const tables = [...document.querySelectorAll('table')].map((table) => {{
+          const headers = [...table.querySelectorAll('thead th')].map(text);
+          const rows = [...table.querySelectorAll('tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map(text));
+          return {{headers, rows}};
+        }}).filter((item) => {{
+          if (!item.headers.length && !item.rows.length) return false;
+          const signature = JSON.stringify(item);
+          if (tableSignatures.has(signature)) return false;
+          tableSignatures.add(signature);
+          return true;
+        }});
+        return {{page: document.body.className || '', cards, tables}};
+        """
+        payload = tab.run_js(script)
+        return payload if isinstance(payload, dict) else {"raw": str(payload or "")}
+
+    @staticmethod
+    def _clean_data_center_payload(page_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """按页面业务范围清洗卡片和表格，去除 DOM class、趋势值、隐藏表及操作按钮。"""
+        raw_cards = payload.get("cards", [])
+        cards = raw_cards if isinstance(raw_cards, list) else []
+
+        def clean_text(value: Any) -> str:
+            return re.sub(r"\s+", " ", str(value or "")).strip()
+
+        def clean_title(value: Any) -> str:
+            title = clean_text(value)
+            return re.sub(r"\s*Definition updated\s+\d{4}\s*", "", title, flags=re.IGNORECASE).strip()
+
+        def clean_value(value: Any) -> str:
+            text = clean_text(value)
+            if not text or text == "-":
+                return "-"
+            if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", text):
+                return text
+            number = ShopeeAuto._parse_brazilian_number(text)
+            if number is None:
+                return text
+            if "R$" in text:
+                return f"R${number:.2f}"
+            if "%" in text:
+                return f"{number:.2f}%"
+            if re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", text):
+                return str(int(text.replace(".", "")))
+            if re.fullmatch(r"-?\d+", text):
+                return str(int(number))
+            if re.fullmatch(r"-?[\d.]+,\d+", text):
+                return f"{number:.2f}"
+            return text
+
+        if page_name == "商业分析概述":
+            metrics = [
+                {"名称": clean_title(card.get("title")), "值": clean_value(card.get("value"))}
+                for card in cards[:7]
+                if isinstance(card, dict) and clean_title(card.get("title"))
+            ]
+            return {"指标": metrics}
+
+        if page_name == "商品概述":
+            group_by_key = {
+                "uv": "访问", "pv": "访问", "iv": "访问", "bounce_visitors": "访问",
+                "bounce_rate": "访问", "search_clicks": "访问", "like_unit_num": "访问",
+                "atc_uv": "加入购物车", "atc_unit_num": "加入购物车", "atc_rate": "加入购物车",
+                "placed_buyers": "已下订单", "placed_unit_num": "已下订单",
+                "placed_items": "已下订单", "placed_gmv": "已下订单",
+                "uv_to_placed_buyers_rate": "已下订单",
+                "paid_buyers": "已付款订单", "paid_unit_num": "已付款订单",
+                "paid_items": "已付款订单", "paid_gmv": "已付款订单",
+                "uv_to_paid_buyers_rate": "已付款订单",
+                "repeat_paid_order_rate": "已付款订单",
+                "average_days_to_repeat_paid_order": "已付款订单",
+            }
+            metrics: list[dict[str, str]] = []
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                class_name = clean_text(card.get("className"))
+                key_match = re.search(r"product-overview__section-list__([a-z_]+)", class_name)
+                key = key_match.group(1) if key_match else ""
+                metrics.append({
+                    "分组": group_by_key.get(key, "其他"),
+                    "名称": clean_title(card.get("title")),
+                    "值": clean_value(card.get("value")),
+                })
+            return {"指标": [metric for metric in metrics if metric["名称"]]}
+
+        if page_name == "流量概述":
+            metrics: list[dict[str, str]] = []
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                raw_values = card.get("values", [])
+                values = [clean_value(value) for value in raw_values] if isinstance(raw_values, list) else []
+                # 当前 DOM 每列会同时命中父 value 和内部 number，因此六项按每两项取一项。
+                if len(values) >= 6:
+                    values = values[::2]
+                while len(values) < 3:
+                    values.append(clean_value(card.get("value")))
+                metrics.append({
+                    "名称": clean_title(card.get("title")),
+                    "全部": values[0],
+                    "APP": values[1],
+                    "PC": values[2],
+                })
+            return {"指标": [metric for metric in metrics if metric["名称"]]}
+
+        summary_metrics = [
+            {"名称": clean_title(card.get("title")), "值": clean_value(card.get("value"))}
+            for card in cards
+            if isinstance(card, dict) and clean_title(card.get("title"))
+        ]
+        tables = payload.get("tables", [])
+        table_items = tables if isinstance(tables, list) else []
+        headers: list[str] = []
+        for table in table_items:
+            candidate = table.get("headers", []) if isinstance(table, dict) else []
+            candidate = [clean_text(header) for header in candidate]
+            if candidate and candidate[0] == "流量来源":
+                headers = candidate
+                break
+
+        row_values: list[list[str]] = []
+        if headers:
+            for table in table_items:
+                candidate_rows = table.get("rows", []) if isinstance(table, dict) else []
+                if not isinstance(candidate_rows, list):
+                    continue
+                matched_rows = [row for row in candidate_rows if isinstance(row, list) and len(row) == len(headers)]
+                if matched_rows:
+                    row_values = matched_rows
+                    break
+
+        ignored_columns = {"购买", "操作"}
+
+        def clean_table_value(header: str, value: Any) -> str:
+            text = clean_text(value)
+            if header == "流量来源":
+                return text
+            currency_match = re.search(r"R\$\s*[\d.]+(?:,\d+)?", text)
+            if currency_match:
+                return clean_value(currency_match.group(0).replace("R$ ", "R$"))
+            if any(keyword in header for keyword in ("率", "占比")):
+                percent_match = re.search(r"-?[\d.]+(?:,\d+)?%", text)
+                if percent_match:
+                    return clean_value(percent_match.group(0))
+            number_match = re.search(r"-?[\d.]+(?:,\d+)?", text)
+            return clean_value(number_match.group(0)) if number_match else (text or "-")
+
+        source_distribution: list[dict[str, str]] = []
+        for row in row_values:
+            cleaned_row = {
+                header: clean_table_value(header, value)
+                for header, value in zip(headers, row)
+                if header not in ignored_columns
+            }
+            if cleaned_row.get("流量来源"):
+                source_distribution.append(cleaned_row)
+        return {"指标": summary_metrics, "来源分布": source_distribution}
 
     def _confirm_login_state_by_url(self, tab: Any, store_name: str) -> None:
         """根据当前 URL 判断登录状态；登录页点击 Entrar 后等待卖家中心首页。"""

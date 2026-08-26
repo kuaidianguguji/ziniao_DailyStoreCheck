@@ -236,6 +236,17 @@ SHOPEE_MESSAGE_GROUPS += (
     ("今天广告数据", tuple((label, field.replace("7天", "今天")) for label, field in SHOPEE_MESSAGE_GROUPS[1][1])),
 )
 
+# 商业分析页面的数据以 JSON 文本保存，机器人消息仍按页面和周期分组展示。
+# 这些临时字段不加入固定飞书表字段，因此本阶段只推送，不写入已有多维表和二维表。
+SHOPEE_ANALYTICS_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = tuple(
+    (
+        f"{page_name}{period}",
+        (("页面完整数据", f"Shopee{page_name}_{period}"),),
+    )
+    for page_name in ("商业分析概述", "商品概述", "商品流量", "流量概述")
+    for period in ("昨天", "7天", "今天")
+)
+
 # 当爬虫没有提供“显示值”时，机器人根据字段类别补充货币符号或合适的小数位。
 SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
     field_name
@@ -568,6 +579,7 @@ class DailyStoreCheck:
                 elif task.platform == "shopee":
                     message_title, message_body = self._format_shopee_notification(task.store_name, rows)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
+                    self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows)
                 elif task.platform == "mercado":
                     message_title, message_body = self._format_mercado_notification(task.store_name, rows)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
@@ -642,6 +654,97 @@ class DailyStoreCheck:
         for recipient_name, receive_id in recipients.items():
             LOGGER.info("[飞书][DeepSeek汇总发送] 接收人姓名=%s，准备发送 AI 店铺分析", recipient_name)
             self._safe_notify_markdown(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
+
+    def _send_shopee_analytics_notifications(
+        self,
+        recipient: str,
+        store_name: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """把清洗后的商业分析数据转为业务 Markdown，按完整行拆分发送。"""
+        analytics_values = {
+            str(row.get("指标") or ""): str(row.get("显示值") or "")
+            for row in rows
+            if str(row.get("指标") or "").startswith("Shopee")
+        }
+        for group_name, metric_specs in SHOPEE_ANALYTICS_MESSAGE_GROUPS:
+            field_name = metric_specs[0][1]
+            payload = analytics_values.get(field_name, "")
+            if not payload:
+                LOGGER.warning("[飞书][Shopee商业分析跳过] 店铺=%s，分组=%s，没有有效数据", store_name, group_name)
+                continue
+            try:
+                parsed_payload = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                LOGGER.warning("[飞书][Shopee商业分析解析失败] 店铺=%s，分组=%s", store_name, group_name)
+                continue
+            markdown = self._format_shopee_analytics_markdown(group_name, parsed_payload)
+            chunks = self._split_markdown_by_lines(markdown, group_name, max_chunk_size=3500)
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                suffix = f"（{chunk_index}/{len(chunks)}）" if len(chunks) > 1 else ""
+                self._safe_notify_markdown(
+                    recipient,
+                    f"{store_name} Shopee {group_name}{suffix}",
+                    chunk,
+                )
+
+    @staticmethod
+    def _format_shopee_analytics_markdown(group_name: str, payload: dict[str, Any]) -> str:
+        """将商业分析的清洗结构格式化为运营人员可直接阅读的 Markdown。"""
+        lines = [f"### {group_name}"]
+        metrics = payload.get("指标", [])
+        current_section = ""
+        if isinstance(metrics, list):
+            for metric in metrics:
+                if not isinstance(metric, dict):
+                    continue
+                section = str(metric.get("分组") or "").strip()
+                if section and section != current_section:
+                    lines.append(f"#### {section}")
+                    current_section = section
+                name = str(metric.get("名称") or "").strip()
+                if not name:
+                    continue
+                if all(key in metric for key in ("全部", "APP", "PC")):
+                    lines.append(
+                        f"- **{name}**：全部 {metric.get('全部', '-')} | "
+                        f"APP {metric.get('APP', '-')} | PC {metric.get('PC', '-')}"
+                    )
+                else:
+                    lines.append(f"- **{name}**：{metric.get('值', '-')}")
+
+        source_distribution = payload.get("来源分布", [])
+        if isinstance(source_distribution, list) and source_distribution:
+            lines.append("#### 来源分布")
+            for source in source_distribution:
+                if not isinstance(source, dict):
+                    continue
+                source_name = str(source.get("流量来源") or "未知来源")
+                values = [
+                    f"{field_name} {field_value}"
+                    for field_name, field_value in source.items()
+                    if field_name != "流量来源"
+                ]
+                lines.append(f"- **{source_name}**：{'；'.join(values) if values else '-'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _split_markdown_by_lines(content: str, group_name: str, max_chunk_size: int) -> list[str]:
+        """仅在完整 Markdown 行之间拆分，避免把指标名称或数值截成两半。"""
+        chunks: list[str] = []
+        current_lines: list[str] = []
+        current_length = 0
+        for line in content.splitlines():
+            added_length = len(line) + (1 if current_lines else 0)
+            if current_lines and current_length + added_length > max_chunk_size:
+                chunks.append("\n".join(current_lines))
+                current_lines = [f"### {group_name}（续）"]
+                current_length = len(current_lines[0])
+            current_lines.append(line)
+            current_length += len(line) + (1 if current_length else 0)
+        if current_lines:
+            chunks.append("\n".join(current_lines))
+        return chunks
 
     def _safe_notify(self, recipient: str, title: str, content: str) -> None:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""
