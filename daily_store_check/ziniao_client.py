@@ -62,6 +62,8 @@ class ZiniaoClient:
         self.user_info = {"company": user.get("company", ""), "username": user.get("username", ""), "password": user.get("password", "")}
         self.system = platform.system()
         self._client_process: subprocess.Popen[Any] | None = None
+        # 紫鸟本地 IPC 的单次控制请求串行发送；浏览器打开后的页面操作仍完全并行。
+        self._ipc_request_lock = threading.RLock()
 
     @property
     def ipc_url(self) -> str:
@@ -70,9 +72,10 @@ class ZiniaoClient:
 
     def send_http(self, payload: dict[str, Any]) -> dict[str, Any]:
         """按官方示例方式序列化请求体并发送紫鸟 IPC 请求。"""
-        response = requests.post(self.ipc_url, json.dumps(payload).encode("utf-8"), timeout=120)
-        response.raise_for_status()
-        return json.loads(response.text)
+        with self._ipc_request_lock:
+            response = requests.post(self.ipc_url, json.dumps(payload).encode("utf-8"), timeout=120)
+            response.raise_for_status()
+            return json.loads(response.text)
 
     def _probe_ipc(self, timeout_seconds: float = 15) -> bool:
         """用合法 HTTP 请求检查紫鸟 WebDriver IPC 是否已经可用。
@@ -83,19 +86,20 @@ class ZiniaoClient:
         不能只建立 TCP 后立即断开：部分紫鸟 V6 版本会把这种空连接视为
         异常请求，影响本地 HTTP 服务稳定性。
         """
-        try:
-            payload = {"action": "getBrowserList", "requestId": str(uuid.uuid4()), **self.user_info}
-            response = requests.post(
-                self.ipc_url,
-                json.dumps(payload).encode("utf-8"),
-                timeout=timeout_seconds,
-            )
-            result = json.loads(response.text)
-            # 即使 statusCode 是登录错误，能够收到紫鸟标准 JSON 也说明 IPC
-            # 已经启动；具体业务错误交给 update_core/list_browsers 清晰报告。
-            return isinstance(result, dict) and result.get("statusCode") is not None
-        except (requests.RequestException, json.JSONDecodeError, TypeError, ValueError):
-            return False
+        with self._ipc_request_lock:
+            try:
+                payload = {"action": "getBrowserList", "requestId": str(uuid.uuid4()), **self.user_info}
+                response = requests.post(
+                    self.ipc_url,
+                    json.dumps(payload).encode("utf-8"),
+                    timeout=timeout_seconds,
+                )
+                result = json.loads(response.text)
+                # 即使 statusCode 是登录错误，能够收到紫鸟标准 JSON 也说明 IPC
+                # 已经启动；具体业务错误交给 update_core/list_browsers 清晰报告。
+                return isinstance(result, dict) and result.get("statusCode") is not None
+            except (requests.RequestException, json.JSONDecodeError, TypeError, ValueError):
+                return False
 
     def start_client(self) -> None:
         """按官方演示启动紫鸟客户端；已启动时不重复启动。
@@ -133,6 +137,11 @@ class ZiniaoClient:
         )
 
     def recover_ipc(self, timeout_seconds: float = 30) -> bool:
+        """互斥执行 IPC 恢复，避免一个店铺恢复客户端时其他线程同时发送控制命令。"""
+        with self._ipc_request_lock:
+            return self._recover_ipc_locked(timeout_seconds)
+
+    def _recover_ipc_locked(self, timeout_seconds: float = 30) -> bool:
         """IPC 失联后重新启动客户端，并确认官方 updateCore 已经可以正常执行。"""
         if self._probe_ipc(timeout_seconds=3):
             LOGGER.info("[紫鸟][IPC恢复] 端口=%s 已经可用，继续验证 updateCore", self.socket_port)

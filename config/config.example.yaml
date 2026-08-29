@@ -78,6 +78,8 @@ feishu:
 # 全部店铺处理完成后仍会分析 ALL_info，并把汇总结果推送给 summary_recipients。
 deepseek:
   enabled: true
+  # 单店原始消息之后是否调用 DeepSeek 并回发分析结果；关闭时仍保留原始数据推送和整轮汇总。
+  single_store_enabled: true
   # 可直接填写，也可通过环境变量 DEEPSEEK_API_KEY 注入。
   api_key: ""
   model_name: "deepseek-v4-pro"
@@ -122,6 +124,8 @@ deepseek:
     禁止虚构数据。
 
 data:
+  # 同时打开并采集的店铺数；单店关闭后 DeepSeek 在独立的同等并发队列中运行。
+  store_concurrency: 3
   retention_days: 90
   request_timeout_seconds: 30
   output_dir: "data"

@@ -61,7 +61,7 @@ python ziniao_webdriver_demo.py
 
 ## 每日多平台店铺检查
 
-本仓库已新增飞书控制台驱动的 TikTok、Shopee、美客多串行店铺采集流程。完整目录、配置字段、函数职责和部署方式见 [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md)。
+本仓库已新增飞书控制台驱动的 TikTok、Shopee、美客多并发店铺采集流程。默认并发数为 3，单店关闭后的 DeepSeek 分析在独立线程池运行。完整目录、配置字段、函数职责和部署方式见 [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md)。
 
 ```powershell
 pip install -r requirements-daily.txt

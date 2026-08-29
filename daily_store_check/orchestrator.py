@@ -6,8 +6,10 @@ import importlib
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any
 
@@ -415,9 +417,11 @@ class DailyStoreCheck:
         self.deepseek = DeepSeekClient(config)
         self.ziniao = ZiniaoClient(config)
         self.browser_list: list[dict[str, Any]] = []
+        self.store_concurrency = max(1, int(config.get("data", {}).get("store_concurrency", 3) or 3))
+        self._stop_opening_stores = threading.Event()
 
     def run_once(self) -> None:
-        """执行一轮任务；店铺永远按控制表顺序串行处理。"""
+        """执行一轮任务；店铺采集和单店 DeepSeek 分别使用独立并发队列。"""
         # ALL_info 保存本轮所有平台、所有店铺的采集结果和失败状态。
         # 它只在全部店铺结束后用于 summary_recipients 汇总推送，不影响每店铺即时推送。
         ALL_info: list[dict[str, Any]] = []
@@ -431,29 +435,33 @@ class DailyStoreCheck:
 
         try:
             self._prepare_ziniao()
-            close_failed = False
-            for task in tasks:
-                # 从即将打开当前店铺开始计时，直到爬取、飞书处理和店铺关闭全部执行完才停止。
-                store_started_at = time.perf_counter()
-                try:
-                    store_info = self._run_store(task)
-                finally:
-                    elapsed_seconds = time.perf_counter() - store_started_at
-                    timing_key = self._build_store_timing_key(store_processing_times, task.store_name)
-                    store_processing_times[timing_key] = {
-                        "平台": task.platform,
-                        "耗时秒": round(elapsed_seconds, 2),
-                        "耗时": self._format_elapsed_time(elapsed_seconds),
-                    }
-                ALL_info.append(store_info)
-                if store_info.get("中止后续店铺"):
-                    LOGGER.critical("店铺 %s 未确认关闭，本轮不再打开后续店铺", task.store_name)
-                    close_failed = True
-                    break
-            if close_failed:
-                LOGGER.warning("本轮因店铺未确认关闭而提前结束，跳过90天数据清理并立即进入最终收尾")
-            else:
-                self._cleanup_retention()
+            self._stop_opening_stores.clear()
+            LOGGER.info(
+                "[并发][启动] 店铺并发数=%s，DeepSeek单店分析并发数=%s，任务数=%s",
+                self.store_concurrency,
+                self.store_concurrency,
+                len(tasks),
+            )
+            with ThreadPoolExecutor(
+                max_workers=self.store_concurrency,
+                thread_name_prefix="store-collector",
+            ) as store_executor, ThreadPoolExecutor(
+                max_workers=self.store_concurrency,
+                thread_name_prefix="deepseek-store",
+            ) as deepseek_executor:
+                close_failed = self._run_concurrent_stores(
+                    tasks,
+                    store_executor,
+                    deepseek_executor,
+                    ALL_info,
+                    store_processing_times,
+                )
+                # 店铺队列结束后可以清理历史数据；已提交的 DeepSeek 仍在独立线程中继续执行。
+                if close_failed:
+                    LOGGER.warning("本轮因店铺未确认关闭而停止启动新店铺，跳过90天数据清理")
+                else:
+                    self._cleanup_retention()
+                LOGGER.info("[并发][DeepSeek等待] 店铺采集已结束，等待剩余单店分析完成")
         finally:
             # 即使旧数据清理或某个店铺异常，也尽量发送已经收集到的最终汇总；
             # 无论汇总推送是否成功，最后都必须退出紫鸟客户端。
@@ -465,6 +473,116 @@ class DailyStoreCheck:
                 finally:
                     # 用户要求在所有业务、汇总推送和紫鸟退出之后，最末尾只向终端打印计时字典。
                     self._print_store_processing_times(store_processing_times)
+
+    def _run_concurrent_stores(
+        self,
+        tasks: list[StoreTask],
+        store_executor: ThreadPoolExecutor,
+        deepseek_executor: ThreadPoolExecutor,
+        all_info: list[dict[str, Any]],
+        store_processing_times: dict[str, dict[str, Any]],
+    ) -> bool:
+        """维持固定数量的店铺任务，并在每店关闭后立即异步提交 DeepSeek。"""
+        pending: dict[Future[tuple[dict[str, Any], float]], tuple[int, StoreTask]] = {}
+        results_by_index: dict[int, dict[str, Any]] = {}
+        next_task_index = 0
+        close_failed = False
+        single_store_enabled = bool(getattr(getattr(self, "deepseek", None), "single_store_enabled", True))
+
+        def submit_available_tasks() -> None:
+            nonlocal next_task_index
+            while (
+                not self._stop_opening_stores.is_set()
+                and next_task_index < len(tasks)
+                and len(pending) < self.store_concurrency
+            ):
+                task_index = next_task_index
+                task = tasks[task_index]
+                next_task_index += 1
+                future = store_executor.submit(self._run_store_timed, task)
+                pending[future] = (task_index, task)
+                LOGGER.info(
+                    "[并发][店铺提交] 序号=%s/%s，店铺=%s，平台=%s，运行中=%s/%s",
+                    task_index + 1,
+                    len(tasks),
+                    task.store_name,
+                    task.platform,
+                    len(pending),
+                    self.store_concurrency,
+                )
+
+        submit_available_tasks()
+        while pending:
+            completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in completed:
+                task_index, task = pending.pop(future)
+                try:
+                    store_info, elapsed_seconds = future.result()
+                except Exception as exc:
+                    LOGGER.exception("[并发][店铺线程异常] 店铺=%s，平台=%s", task.store_name, task.platform)
+                    store_info = {
+                        "店铺名": task.store_name,
+                        "平台": task.platform,
+                        "状态": "失败",
+                        "采集时间": "",
+                        "数据": {},
+                        "错误": str(exc),
+                    }
+                    elapsed_seconds = 0.0
+
+                results_by_index[task_index] = store_info
+                timing_key = self._build_store_timing_key(store_processing_times, task.store_name)
+                store_processing_times[timing_key] = {
+                    "平台": task.platform,
+                    "耗时秒": round(elapsed_seconds, 2),
+                    "耗时": self._format_elapsed_time(elapsed_seconds),
+                }
+                LOGGER.info(
+                    "[并发][店铺完成] 序号=%s/%s，店铺=%s，状态=%s，耗时=%s，剩余运行=%s",
+                    task_index + 1,
+                    len(tasks),
+                    task.store_name,
+                    store_info.get("状态"),
+                    self._format_elapsed_time(elapsed_seconds),
+                    len(pending),
+                )
+
+                if store_info.get("中止后续店铺"):
+                    close_failed = True
+                    self._stop_opening_stores.set()
+                    LOGGER.critical(
+                        "店铺 %s 未确认关闭，停止提交尚未启动的店铺；当前已运行店铺继续完成并关闭",
+                        task.store_name,
+                    )
+                elif store_info.get("状态") == "成功" and task.platform in {"tiktok", "shopee", "mercado"}:
+                    if single_store_enabled:
+                        deepseek_executor.submit(self._send_store_deepseek_analysis, task.recipient, store_info)
+                        LOGGER.info(
+                            "[并发][DeepSeek提交] 店铺=%s，平台=%s；采集线程已释放，可启动下一店铺",
+                            task.store_name,
+                            task.platform,
+                        )
+                    else:
+                        LOGGER.info(
+                            "[并发][DeepSeek单店跳过] 店铺=%s，平台=%s，配置开关已关闭",
+                            task.store_name,
+                            task.platform,
+                        )
+
+            submit_available_tasks()
+
+        # ALL_info 仍按飞书控制表顺序排列，避免并发完成顺序影响最终经理汇总。
+        all_info.extend(results_by_index[index] for index in sorted(results_by_index))
+        skipped_count = len(tasks) - len(results_by_index)
+        if skipped_count:
+            LOGGER.warning("[并发][未启动店铺] 因关闭失败跳过=%s", skipped_count)
+        return close_failed
+
+    def _run_store_timed(self, task: StoreTask) -> tuple[dict[str, Any], float]:
+        """执行单店采集并返回不包含 DeepSeek 等待时间的耗时。"""
+        started_at = time.perf_counter()
+        store_info = self._run_store(task)
+        return store_info, time.perf_counter() - started_at
 
     @staticmethod
     def _build_store_timing_key(store_processing_times: dict[str, Any], store_name: str) -> str:
@@ -541,7 +659,7 @@ class DailyStoreCheck:
         self.browser_list = self.ziniao.list_browsers()
 
     def _run_store(self, task: StoreTask) -> dict[str, Any]:
-        """处理一间店铺并返回 ALL_info 项；context manager 确保店铺串行关闭。"""
+        """处理一间店铺并返回 ALL_info 项；context manager 确保该店正确关闭。"""
         store_info: dict[str, Any] = {
             "店铺名": task.store_name,
             "平台": task.platform,
@@ -579,9 +697,6 @@ class DailyStoreCheck:
                 else:
                     self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
                 store_info["状态"] = "成功"
-            # DeepSeek 可能需要等待数分钟，必须先退出上下文并确认紫鸟店铺已关闭。
-            if task.platform in {"tiktok", "shopee", "mercado"}:
-                self._send_store_deepseek_analysis(task.recipient, store_info)
         except ZiniaoStoreCloseError as exc:
             LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
             store_info["状态"] = "失败"
@@ -653,6 +768,9 @@ class DailyStoreCheck:
 
     def _send_store_deepseek_analysis(self, recipient: str, store_info: dict[str, Any]) -> None:
         """原始平台消息发送完毕后，同步分析单店数据并回发同一运营人员。"""
+        if not bool(getattr(getattr(self, "deepseek", None), "single_store_enabled", True)):
+            LOGGER.info("[DeepSeek][单店跳过] 配置开关 deepseek.single_store_enabled=false")
+            return
         store_name = str(store_info.get("店铺名") or "未知店铺")
         platform = str(store_info.get("平台") or "").strip().lower()
         platform_name = {

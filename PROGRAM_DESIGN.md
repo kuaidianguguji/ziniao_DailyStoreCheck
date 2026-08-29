@@ -2,7 +2,7 @@
 
 ## 1. 目标与边界
 
-程序每天在配置时间执行一次，从飞书多维表“控制台”读取店铺名、推送人员、开关和平台。开关为空或暂停时不处理；其余店铺严格串行执行：打开一间紫鸟店铺、运行对应平台广告爬虫、写入飞书、推送结果、关闭店铺，关闭完成后才处理下一间。
+程序每天在配置时间执行一次，从飞书多维表“控制台”读取店铺名、推送人员、开关和平台。开关为空或暂停时不处理；其余店铺按照 `data.store_concurrency` 并发执行，默认同时打开并采集 3 间紫鸟店铺。每间店铺独立完成采集、飞书写入、原始消息推送和关闭确认。
 
 短期多维表 `TK_数据`、`SP_数据`、`MKD_数据` 只保留最近 `retention_days` 天，默认 90 天。三个飞书电子表只追加，不删除，作为完整历史记录。
 
@@ -14,10 +14,10 @@ ziniao_DailyStoreCheck_codex_two/
 ├─ config/config.yaml                  # 本机运行配置，已被 Git 忽略
 ├─ daily_store_check/
 │  ├─ config.py                        # 配置加载、平台名标准化、开关判断、StoreTask
-│  ├─ deepseek_client.py               # ALL_info 的 DeepSeek 请求和响应解析
+│  ├─ deepseek_client.py               # 单店及 ALL_info 的 DeepSeek 请求和响应解析
 │  ├─ feishu_client.py                 # 飞书 token、多维表、电子表、机器人
 │  ├─ ziniao_client.py                 # 紫鸟 IPC、店铺开关、WebDriver 会话
-│  └─ orchestrator.py                  # 串行业务流程和平台爬虫注册
+│  └─ orchestrator.py                  # 并发业务流程和平台爬虫注册
 ├─ tiktok/TK_auto.py                   # TikTok 独立自动化和爬虫
 ├─ shopee/SP_auto.py                   # Shopee 独立自动化和爬虫
 ├─ mercado/MKD_auto.py                 # 美客多独立自动化和爬虫
@@ -37,7 +37,7 @@ ziniao_DailyStoreCheck_codex_two/
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
 8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。
 9. `_safe_notify` 根据“推送人员”的 `open_id` 使用应用机器人定向推送；没有人员 ID 时可退回 webhook。
-10. TikTok、Shopee、美客多店铺的原始消息发送后，主流程在紫鸟店铺关闭成功后立即把该店完整数据交给 DeepSeek，同步等待结果并以 Markdown 回发同一运营人员。三个平台共用密钥和模型，分别使用独立系统提示词；当前 TikTok 和美客多暂时回退到虾皮提示词。随后把每个店铺的状态和全部指标追加到 `ALL_info`；所有店铺完成后仍会分析非空 `ALL_info`，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送汇总结果。
+10. TikTok、Shopee、美客多店铺的原始消息发送且紫鸟店铺关闭成功后，主流程立即把该店完整数据提交到独立 DeepSeek 线程池，并释放采集线程启动下一个店铺。三个平台共用密钥、模型和并发数，分别使用独立系统提示词；当前 TikTok 和美客多暂时回退到虾皮提示词。单店结果以 Markdown 回发对应运营人员；全部单店分析完成后仍会分析非空 `ALL_info`，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送汇总结果。
 11. `_cleanup_retention` 清理三张短期多维表中的过期数据，并退出紫鸟客户端。
 
 ## 4. 文件、函数和关键变量
@@ -55,6 +55,8 @@ ziniao_DailyStoreCheck_codex_two/
 - `feishu.bitable.default_app_token`：如果四张多维表属于同一个应用，可以填公共 token，子项只填 `table_id`。
 - `spreadsheets`：三个历史电子表分别填写 `token + sheet_id`；也可以额外指定完整 `range`。
 - `deepseek.api_key/system_prompt`：DeepSeek API Key 和固定系统提示词；API Key 也可用环境变量 `DEEPSEEK_API_KEY` 覆盖。
+- `data.store_concurrency`：店铺采集与单店 DeepSeek 分析的并发数，默认 `3`；两个任务池相互独立，AI 等待不会占用浏览器采集名额。
+- `deepseek.single_store_enabled`：是否在每个平台单店原始消息后调用 DeepSeek 并回发分析；设为 `false` 时只跳过单店分析，不影响原始数据推送和整轮汇总。
 - `retention_days`：短期多维表保留天数。
 - `platforms.*.crawler`：平台到 Python 爬虫类的映射，格式 `模块:类名`。
 
@@ -123,7 +125,8 @@ ziniao_DailyStoreCheck_codex_two/
 
 ### `daily_store_check/orchestrator.py`
 
-- `run_once`：一轮完整任务，唯一店铺循环位于这里，未使用线程池。
+- `run_once`：一轮完整任务；使用独立线程池并发执行店铺采集和单店 DeepSeek 分析，所有单店结果完成后再执行最终汇总。
+- `_run_concurrent_stores`：按固定并发数滚动提交店铺任务；店铺关闭后立即提交 AI 分析并补充下一个采集任务，结果仍按控制表顺序写入 `ALL_info`。
 - `_find_browser_identifier`：先执行 Unicode/空白归一化后的精确匹配；失败后提取 `tiktok/TK`、`shopee/虾皮`、`mercado/美客多`及店号，按“平台:店号”匹配，支持公司名前缀、空格和末尾“店”等紫鸟名称差异。
 - `_load_crawler`：动态加载平台类，新增平台时不需要修改循环逻辑。
 - `_write_feishu`：一份标准爬虫结果同时转换为多维表记录和电子表行。

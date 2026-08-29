@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -41,6 +42,9 @@ class FeishuClient:
         # 同一轮任务中每张表的字段结构只读取一次，避免每个店铺重复请求字段接口。
         self._table_field_names_cache: dict[tuple[str, str], set[str]] = {}
         self.session = requests.Session()
+        # requests.Session、tenant token 和字段缓存由所有店铺线程共享；
+        # 仅串行化短暂的飞书 HTTP 请求，不影响多个浏览器并行采集。
+        self._request_lock = threading.RLock()
 
     @property
     def configured(self) -> bool:
@@ -125,6 +129,11 @@ class FeishuClient:
         return field_names
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """通过共享可重入锁发送飞书请求，保证并发店铺使用同一 Session 时安全。"""
+        with self._request_lock:
+            return self._request_locked(method, path, **kwargs)
+
+    def _request_locked(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """统一发送请求并检查飞书 code，避免每个接口重复写错误处理。"""
         safe_path = self._safe_path_for_log(path)
         request_log = {
@@ -236,17 +245,18 @@ class FeishuClient:
 
     def _get_tenant_token(self) -> str:
         """按需获取 tenant_access_token，并在进程内复用。"""
-        if self._tenant_token:
+        with self._request_lock:
+            if self._tenant_token:
+                return self._tenant_token
+            payload = self._request(
+                "POST",
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.config.get("app_id"), "app_secret": self.config.get("app_secret")},
+            )
+            self._tenant_token = payload.get("tenant_access_token", "")
+            if not self._tenant_token:
+                raise RuntimeError("飞书没有返回 tenant_access_token")
             return self._tenant_token
-        payload = self._request(
-            "POST",
-            "/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": self.config.get("app_id"), "app_secret": self.config.get("app_secret")},
-        )
-        self._tenant_token = payload.get("tenant_access_token", "")
-        if not self._tenant_token:
-            raise RuntimeError("飞书没有返回 tenant_access_token")
-        return self._tenant_token
 
     def _headers(self) -> dict[str, str]:
         """生成带租户 token 的飞书标准请求头。"""

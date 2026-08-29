@@ -159,6 +159,14 @@ class DeepSeekClient:
 
         enabled_value = deepseek_config.get("enabled", True)
         self.enabled = str(enabled_value).strip().lower() not in {"false", "0", "no", "off", "关闭"}
+        single_store_enabled_value = deepseek_config.get("single_store_enabled", True)
+        self.single_store_enabled = str(single_store_enabled_value).strip().lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
+            "关闭",
+        }
         self.api_key = str(deepseek_config.get("api_key") or "").strip()
         self.model_name = str(deepseek_config.get("model_name") or "deepseek-v4-pro").strip()
         self.base_url = str(deepseek_config.get("base_url") or "https://api.deepseek.com").rstrip("/")
@@ -340,6 +348,12 @@ class DeepSeekClient:
             return ""
         if not self.enabled:
             LOGGER.info("[DeepSeek][单店跳过] 平台=%s，deepseek.enabled=false", platform_name)
+            return ""
+        if not self.single_store_enabled:
+            LOGGER.info(
+                "[DeepSeek][单店跳过] 平台=%s，deepseek.single_store_enabled=false",
+                platform_name,
+            )
             return ""
         if not self.configured:
             LOGGER.warning(
