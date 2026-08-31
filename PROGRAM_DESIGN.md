@@ -56,6 +56,8 @@ ziniao_DailyStoreCheck_codex_two/
 - `spreadsheets`：三个历史电子表分别填写 `token + sheet_id`；也可以额外指定完整 `range`。
 - `deepseek.api_key/system_prompt`：DeepSeek API Key 和固定系统提示词；API Key 也可用环境变量 `DEEPSEEK_API_KEY` 覆盖。
 - `data.store_concurrency`：店铺采集与单店 DeepSeek 分析的并发数，默认 `3`；两个任务池相互独立，AI 等待不会占用浏览器采集名额。
+- `platforms.tiktok.periods`、`platforms.shopee.periods`：分别控制今天、昨天、7天是否抓取；每项为布尔值，缺省时默认开启。
+- `platforms.mercado.periods`：控制今天、7天、30天是否抓取；每项为布尔值，缺省时默认开启。
 - `deepseek.single_store_enabled`：是否在每个平台单店原始消息后调用 DeepSeek 并回发分析；设为 `false` 时只跳过单店分析，不影响原始数据推送和整轮汇总。
 - `retention_days`：短期多维表保留天数。
 - `platforms.*.crawler`：平台到 Python 爬虫类的映射，格式 `模块:类名`。

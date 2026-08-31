@@ -63,6 +63,8 @@ python ziniao_webdriver_demo.py
 
 本仓库已新增飞书控制台驱动的 TikTok、Shopee、美客多并发店铺采集流程。默认并发数为 3，单店关闭后的 DeepSeek 分析在独立线程池运行。完整目录、配置字段、函数职责和部署方式见 [PROGRAM_DESIGN.md](PROGRAM_DESIGN.md)。
 
+三个平台的抓取周期可以在 `config/config.yaml` 中分别开关：TikTok、Shopee 使用 `today`、`yesterday`、`7d`；美客多使用 `today`、`7d`、`30d`。将某个值设为 `false` 后，该周期不会执行页面切换和指标读取，其余周期照常运行。
+
 ```powershell
 pip install -r requirements-daily.txt
 Copy-Item config/config.example.yaml config/config.yaml

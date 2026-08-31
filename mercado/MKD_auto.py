@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from DrissionPage import Chromium
+from daily_store_check.config import is_period_enabled
 
 
 # 当前模块日志会由 run_daily_store_check.py 同时输出到控制台和日志文件。
@@ -182,6 +183,9 @@ class MercadoAuto:
 
         # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
         for period in ("7天", "30天", "今天"):
+            if not is_period_enabled(self.config, period):
+                LOGGER.info("[美客多][指标] 时间范围=%s 已按配置关闭，跳过", period)
+                continue
             LOGGER.info("[美客多][指标] 开始切换并采集时间范围=%s", period)
             # 日期选项点击后，以对应选项“最长 30 秒内变为不可见”作为点击成功标志。
             # 元素不需要从 HTML 中移除；只要 DrissionPage 判断它不再显示即可。

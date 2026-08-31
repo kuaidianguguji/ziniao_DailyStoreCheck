@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 import requests
 from DrissionPage import Chromium
+from daily_store_check.config import is_period_enabled
 
 
 LOGGER = logging.getLogger(__name__)
@@ -390,11 +391,11 @@ class TiktokAuto:
         LOGGER.info("[TikTok][广告] 已确认登录，直接打开广告页=%s", AD_PAGE_URL)
         ad_fields: dict[str, Any] = {}
         ad_raw_values: dict[str, str] = {}
-        ad_page_ready = self._open_business_page(
-            tab,
-            AD_PAGE_URL,
-            AD_TIME_BUTTON_XPATH,
-            "TikTok广告页时间面板按钮",
+        enabled_ad_periods = tuple(
+            period for period in ("昨天", "7天", "今天") if is_period_enabled(self.config, period)
+        )
+        ad_page_ready = bool(enabled_ad_periods) and self._open_business_page(
+            tab, AD_PAGE_URL, AD_TIME_BUTTON_XPATH, "TikTok广告页时间面板按钮"
         )
         if not ad_page_ready:
             LOGGER.error("[TikTok][广告页面失败] 直接打开广告页后未确认时间面板按钮出现，本店铺两个广告周期均按空值处理")
@@ -402,6 +403,9 @@ class TiktokAuto:
             LOGGER.info("[TikTok][广告页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("昨天", "7天", "今天"):
+            if not is_period_enabled(self.config, period):
+                LOGGER.info("[TikTok][广告] 时间范围=%s 已按配置关闭，跳过", period)
+                continue
             LOGGER.info("[TikTok][广告] 开始切换并采集时间范围=%s", period)
             if not ad_page_ready:
                 self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "未进入店铺广告页面")
@@ -440,11 +444,11 @@ class TiktokAuto:
         LOGGER.info("[TikTok][概览] 直接打开数据概览页=%s", OVERVIEW_PAGE_URL)
         overview_fields: dict[str, Any] = {}
         overview_raw_values: dict[str, str] = {}
-        overview_page_ready = self._open_business_page(
-            tab,
-            OVERVIEW_PAGE_URL,
-            OVERVIEW_TIME_BUTTON_XPATH,
-            "TikTok数据概览页时间面板按钮",
+        enabled_overview_periods = tuple(
+            period for period in ("昨天", "7天", "今天") if is_period_enabled(self.config, period)
+        )
+        overview_page_ready = bool(enabled_overview_periods) and self._open_business_page(
+            tab, OVERVIEW_PAGE_URL, OVERVIEW_TIME_BUTTON_XPATH, "TikTok数据概览页时间面板按钮"
         )
         if not overview_page_ready:
             LOGGER.error("[TikTok][概览页面失败] 直接打开数据概览页后未确认时间面板按钮出现，本店铺两个概览周期均按空值处理")
@@ -452,6 +456,9 @@ class TiktokAuto:
             LOGGER.info("[TikTok][概览页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("昨天", "7天", "今天"):
+            if not is_period_enabled(self.config, period):
+                LOGGER.info("[TikTok][概览] 时间范围=%s 已按配置关闭，跳过", period)
+                continue
             LOGGER.info("[TikTok][概览] 开始切换并采集时间范围=%s", period)
             if not overview_page_ready:
                 self._record_empty_period_metrics(

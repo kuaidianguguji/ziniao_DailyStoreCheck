@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from DrissionPage import Chromium
+from daily_store_check.config import is_period_enabled
 
 
 LOGGER = logging.getLogger(__name__)
@@ -210,6 +211,9 @@ class ShopeeAuto:
 
         rows: list[dict[str, Any]] = []
         for period in ("昨天", "7天", "今天"):
+            if not is_period_enabled(self.config, period):
+                LOGGER.info("[Shopee][广告] 时间范围=%s 已按配置关闭，跳过", period)
+                continue
             group_value = PERIOD_GROUP_VALUES[period]
             period_url = self._replace_group_in_url(template_url, group_value)
             LOGGER.info(
@@ -305,7 +309,13 @@ class ShopeeAuto:
                         self._click_element_with_fallback(tab, analytics_link, analytics_link_xpath, "打开商业分析")
                         time.sleep(1)
                 # 先带一个明确的 group 进入页面，避免前端沿用上一个广告页的周期状态。
-                initial_url = self._replace_group_in_url(page_url, PERIOD_GROUP_VALUES["昨天"])
+                enabled_periods = tuple(
+                    period for period in EXTRA_PERIODS if is_period_enabled(self.config, period)
+                )
+                if not enabled_periods:
+                    LOGGER.info("[Shopee][商业分析] 页面=%s 的所有时间范围均已关闭，跳过", page_name)
+                    continue
+                initial_url = self._replace_group_in_url(page_url, PERIOD_GROUP_VALUES[enabled_periods[0]])
                 current_url = self._read_current_url(tab)
                 if page_name != "商业分析概述" or "/datacenter" not in current_url:
                     result = tab.get(initial_url, timeout=AD_PAGE_LOAD_TIMEOUT_SECONDS)
@@ -315,6 +325,9 @@ class ShopeeAuto:
                     raise TimeoutError("页面未完成加载")
                 self._wait_for_data_center_render(tab, page_name)
                 for period in EXTRA_PERIODS:
+                    if not is_period_enabled(self.config, period):
+                        LOGGER.info("[Shopee][商业分析] 页面=%s，时间范围=%s 已按配置关闭，跳过", page_name, period)
+                        continue
                     try:
                         self._select_data_center_period(tab, period, page_name)
                         # 日期点击后页面会重新请求数据；必须等完整业务节点并留出稳定时间再读取。
