@@ -13,7 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any
 
-from .config import StoreTask, normalise_platform
+from .config import StoreTask, is_period_enabled, normalise_platform
 from .deepseek_client import DeepSeekClient
 from .feishu_client import FeishuClient
 from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
@@ -684,15 +684,16 @@ class DailyStoreCheck:
                 store_info["采集时间"] = collected_at
                 store_info["数据"] = metric_values
                 self._write_feishu(task, rows)
+                platform_config = self.config.get("platforms", {}).get(task.platform, {})
                 if task.platform == "tiktok":
-                    message_title, message_body = self._format_tiktok_notification(task.store_name, rows)
+                    message_title, message_body = self._format_tiktok_notification(task.store_name, rows, platform_config)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
                 elif task.platform == "shopee":
-                    message_title, message_body = self._format_shopee_notification(task.store_name, rows)
+                    message_title, message_body = self._format_shopee_notification(task.store_name, rows, platform_config)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
-                    self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows)
+                    self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows, platform_config)
                 elif task.platform == "mercado":
-                    message_title, message_body = self._format_mercado_notification(task.store_name, rows)
+                    message_title, message_body = self._format_mercado_notification(task.store_name, rows, platform_config)
                     self._safe_notify_markdown(task.recipient, message_title, message_body)
                 else:
                     self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
@@ -827,6 +828,7 @@ class DailyStoreCheck:
         recipient: str,
         store_name: str,
         rows: list[dict[str, Any]],
+        platform_config: dict[str, Any] | None = None,
     ) -> None:
         """把商业分析每个页面的今天、昨天、近7天合并为横向对比表。"""
         analytics_values = {
@@ -837,6 +839,8 @@ class DailyStoreCheck:
         for page_name in SHOPEE_ANALYTICS_PAGE_NAMES:
             period_payloads: dict[str, dict[str, Any]] = {}
             for period in ("今天", "昨天", "7天"):
+                if not is_period_enabled(platform_config, period):
+                    continue
                 field_name = f"Shopee{page_name}_{period}"
                 payload = analytics_values.get(field_name, "")
                 if not payload:
@@ -856,7 +860,7 @@ class DailyStoreCheck:
             if not period_payloads:
                 LOGGER.warning("[飞书][Shopee商业分析跳过] 店铺=%s，页面=%s，没有有效数据", store_name, page_name)
                 continue
-            markdown = self._format_shopee_analytics_period_table(page_name, period_payloads)
+            markdown = self._format_shopee_analytics_period_table(page_name, period_payloads, platform_config)
             chunks = self._split_markdown_table(markdown, page_name, max_chunk_size=3500)
             for chunk_index, chunk in enumerate(chunks, start=1):
                 suffix = f"（{chunk_index}/{len(chunks)}）" if len(chunks) > 1 else ""
@@ -870,9 +874,14 @@ class DailyStoreCheck:
     def _format_shopee_analytics_period_table(
         page_name: str,
         period_payloads: dict[str, dict[str, Any]],
+        platform_config: dict[str, Any] | None = None,
     ) -> str:
         """将商业分析页面展开为“指标 × 三周期”的 Markdown 表格。"""
-        period_order = ("今天", "昨天", "7天")
+        period_order = tuple(
+            period for period in ("今天", "昨天", "7天") if is_period_enabled(platform_config, period)
+        )
+        if not period_order:
+            return f"## {page_name}\n\n本次未开启任何商业分析时间范围。"
         value_maps: dict[str, dict[str, str]] = {}
         metric_order: list[str] = []
         for period in period_order:
@@ -1554,8 +1563,12 @@ class DailyStoreCheck:
                     LOGGER.info("平台 %s 清理旧数据 %s 条", platform, removed)
 
     @staticmethod
-    def _format_tiktok_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
-        """整理 TK 机器人 Markdown 标题和正文，固定按四个业务分组输出。"""
+    def _format_tiktok_notification(
+        store_name: str,
+        rows: list[dict[str, Any]],
+        platform_config: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """整理 TK 机器人 Markdown，只输出配置启用的时间范围。"""
         modules: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         collected_at = ""
         for row in rows:
@@ -1582,6 +1595,9 @@ class DailyStoreCheck:
         title = f"{store_name} tiktok 广告数据 - {date_text}"
         lines: list[str] = []
         for group_name, metric_specs in TIKTOK_MESSAGE_GROUPS:
+            period = "今天" if "今天" in group_name else "7天" if "7天" in group_name else "昨天"
+            if not is_period_enabled(platform_config, period):
+                continue
             source_name = "概览" if "概览" in group_name else "广告"
             fields, raw_values = modules.get(source_name, ({}, {}))
             lines.append(f"### {group_name}")
@@ -1593,8 +1609,12 @@ class DailyStoreCheck:
         return title, "\n".join(lines).strip()
 
     @staticmethod
-    def _format_shopee_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
-        """整理 Shopee 广告机器人消息，按今天、昨天、近7天横向对比。"""
+    def _format_shopee_notification(
+        store_name: str,
+        rows: list[dict[str, Any]],
+        platform_config: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """整理 Shopee 广告机器人消息，只显示配置启用的时间范围。"""
         collected_at = ""
         display_values: dict[str, Any] = {}
         for row in rows:
@@ -1628,15 +1648,13 @@ class DailyStoreCheck:
             "7天": dict(SHOPEE_MESSAGE_GROUPS[1][1]),
         }
         metric_labels = [label for label, _ in SHOPEE_MESSAGE_GROUPS[0][1]]
-        lines = [
-            "## 📢 广告表现",
-            "",
-            "| 指标 | 今天 | 昨天 | 近7天 |",
-            "|---|---:|---:|---:|",
-        ]
+        enabled_periods = tuple(period for period in ("今天", "昨天", "7天") if is_period_enabled(platform_config, period))
+        if not enabled_periods:
+            return title, "## 📢 广告表现\n\n本次未开启任何广告时间范围。"
+        lines = ["## 📢 广告表现", "", "| 指标 | " + " | ".join(enabled_periods) + " |", "|---|" + "---:|" * len(enabled_periods)]
         for label in metric_labels:
             cells = [DailyStoreCheck._escape_markdown_table_cell(label)]
-            for period in ("今天", "昨天", "7天"):
+            for period in enabled_periods:
                 field_name = period_specs[period][label]
                 value = DailyStoreCheck._format_shopee_display_value(
                     field_name,
@@ -1647,8 +1665,12 @@ class DailyStoreCheck:
         return title, "\n".join(lines)
 
     @staticmethod
-    def _format_mercado_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
-        """整理美客多机器人 Markdown，固定按最近 7 天和最近 30 天输出。"""
+    def _format_mercado_notification(
+        store_name: str,
+        rows: list[dict[str, Any]],
+        platform_config: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """整理美客多机器人 Markdown，只输出配置启用的时间范围。"""
         collected_at = ""
         display_values: dict[str, Any] = {}
         for row in rows:
@@ -1675,6 +1697,9 @@ class DailyStoreCheck:
         title = f"{store_name} mercado 推送数据 - {date_text}"
         lines: list[str] = []
         for group_name, metric_specs in MERCADO_MESSAGE_GROUPS:
+            period = "30天" if "30" in group_name else "7天"
+            if not is_period_enabled(platform_config, period):
+                continue
             lines.append(f"### {group_name}")
             for label, field_name in metric_specs:
                 value = display_values.get(field_name, "")
