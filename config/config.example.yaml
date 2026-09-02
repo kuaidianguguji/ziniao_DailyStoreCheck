@@ -166,8 +166,18 @@ platforms:
       # 未登录后用于触发验证码的按钮 XPath；该元素位于 reCAPTCHA 外层 iframe 内。
       captcha_trigger_button_xpath: '//div[@class="recaptcha-checkbox-border"]'
       after_trigger_wait_seconds: 2
-      # 验证码通过后的登录按钮 XPath，后续阶段再填写；当前不会执行。
-      post_captcha_login_button_xpath: ""
+      # 验证码成功后的登录按钮流程；每次点击后等待下一目标，超时则重新点击上一按钮。
+      post_captcha_wait_seconds: 1
+      captcha_success_submit_button_xpath: '//button[@type="submit"]'
+      login_type_button_xpath: '//button[@aria-labelledby="password_validation-content"]'
+      confirm_login_button_xpath: '//button[@type="submit"]'
+      login_step_wait_timeout_seconds: 10
+      login_step_max_attempts: 3
+      # 确认登录后必须等待首页文档完成、首页标志出现，再固定等待 8 秒。
+      homepage_ready_timeout_seconds: 30
+      homepage_marker_xpath: '(//div[@class="filter-section"]//label)[1]'
+      homepage_marker_timeout_seconds: 30
+      homepage_settle_seconds: 8
       captcha:
         enabled: true
         # 挑战框题目会在 iframe 中读取，再使用顶层 deepseek 配置匹配题型 ID；无需监听 reload 请求。

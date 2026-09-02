@@ -38,6 +38,18 @@ GENERAL_METRICS_PAGE_URL = "https://www.mercadolivre.com.br/metricas#sc-menu"
 # 美客多登录页的状态判断只依赖 URL；验证码触发按钮由配置提供，默认留空。
 MERCADO_LOGIN_URL_KEYWORDS = ("/login", "/auth")
 
+# 验证码通过后的登录流程默认参数；config.yaml 可以覆盖。
+CAPTCHA_SUCCESS_SUBMIT_BUTTON_XPATH = '//button[@type="submit"]'
+LOGIN_TYPE_BUTTON_XPATH = '//button[@aria-labelledby="password_validation-content"]'
+CONFIRM_LOGIN_BUTTON_XPATH = '//button[@type="submit"]'
+POST_CAPTCHA_WAIT_SECONDS = 1.0
+LOGIN_STEP_WAIT_TIMEOUT_SECONDS = 10.0
+LOGIN_STEP_MAX_ATTEMPTS = 3
+LOGIN_HOMEPAGE_READY_TIMEOUT_SECONDS = 30.0
+LOGIN_HOMEPAGE_MARKER_XPATH = '(//div[@class="filter-section"]//label)[1]'
+LOGIN_HOMEPAGE_MARKER_TIMEOUT_SECONDS = 30.0
+LOGIN_HOMEPAGE_SETTLE_SECONDS = 8.0
+
 # 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
 PAGE_READY_TIMEOUT_SECONDS = 60
 AFTER_PAGE_READY_WAIT_SECONDS = 10
@@ -182,10 +194,8 @@ class MercadoAuto:
         if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "紫鸟初始店铺页"):
             raise TimeoutError("美客多初始店铺页在 60 秒内未加载完成，停止本店铺采集")
 
-        # 只有确认未登录后才触发验证码；测试阶段完成验证码后立即结束本店铺。
-        if self._ensure_logged_in(tab, store_name):
-            LOGGER.info("[美客多][验证码测试结束] 店铺=%s，验证码已通过；后续登录按钮流程暂未启用", store_name)
-            return []
+        # 只有确认未登录后才触发验证码；登录成功后继续原有经营指标采集。
+        self._ensure_logged_in(tab, store_name)
 
         # 使用当前已登录的紫鸟标签页直接进入经营指标页；新页面必须再次加载完成后才允许操作。
         self._open_metrics_page(tab)
@@ -289,7 +299,7 @@ class MercadoAuto:
             raise RuntimeError("经营指标页加载后未发现日期切换按钮，停止本店铺采集")
 
     def _ensure_logged_in(self, tab: Any, store_name: str) -> bool:
-        """确认登录状态；测试阶段未登录时只执行验证码并返回是否已完成验证码。"""
+        """确认登录状态；未登录时完成验证码及后续按钮流程。"""
         login_config = self.config.get("login", {})
         if not isinstance(login_config, dict):
             login_config = {}
@@ -317,8 +327,317 @@ class MercadoAuto:
         if not bool(captcha_config.get("enabled", True)):
             raise RuntimeError("美客多检测到 reCAPTCHA，但 platforms.mercado.login.captcha.enabled 为 false")
         solver.solve()
-        LOGGER.info("[美客多][验证码完成] 店铺=%s，后续登录按钮流程按要求留空", store_name)
+        LOGGER.info("[美客多][验证码完成] 店铺=%s，开始执行验证码后的登录流程", store_name)
+        self._complete_post_captcha_login(tab, login_config, store_name)
         return True
+
+    def _complete_post_captcha_login(
+        self,
+        tab: Any,
+        login_config: dict[str, Any],
+        store_name: str,
+    ) -> None:
+        """验证码成功后依次提交、选择登录类型、确认登录并等待进入首页。"""
+        after_captcha_wait = max(
+            0.0,
+            float(login_config.get("post_captcha_wait_seconds", POST_CAPTCHA_WAIT_SECONDS) or 0),
+        )
+        wait_timeout = max(
+            0.1,
+            float(
+                login_config.get(
+                    "login_step_wait_timeout_seconds",
+                    LOGIN_STEP_WAIT_TIMEOUT_SECONDS,
+                )
+                or LOGIN_STEP_WAIT_TIMEOUT_SECONDS
+            ),
+        )
+        max_attempts = max(
+            1,
+            int(
+                login_config.get("login_step_max_attempts", LOGIN_STEP_MAX_ATTEMPTS)
+                or LOGIN_STEP_MAX_ATTEMPTS
+            ),
+        )
+        homepage_ready_timeout = max(
+            0.1,
+            float(
+                login_config.get(
+                    "homepage_ready_timeout_seconds",
+                    LOGIN_HOMEPAGE_READY_TIMEOUT_SECONDS,
+                )
+                or LOGIN_HOMEPAGE_READY_TIMEOUT_SECONDS
+            ),
+        )
+        homepage_marker_xpath = str(
+            login_config.get("homepage_marker_xpath") or LOGIN_HOMEPAGE_MARKER_XPATH
+        ).strip()
+        homepage_marker_timeout = max(
+            0.1,
+            float(
+                login_config.get(
+                    "homepage_marker_timeout_seconds",
+                    LOGIN_HOMEPAGE_MARKER_TIMEOUT_SECONDS,
+                )
+                or LOGIN_HOMEPAGE_MARKER_TIMEOUT_SECONDS
+            ),
+        )
+        homepage_settle_seconds = max(
+            0.0,
+            float(
+                login_config.get(
+                    "homepage_settle_seconds",
+                    LOGIN_HOMEPAGE_SETTLE_SECONDS,
+                )
+                or 0
+            ),
+        )
+        captcha_submit_xpath = str(
+            login_config.get("captcha_success_submit_button_xpath")
+            or CAPTCHA_SUCCESS_SUBMIT_BUTTON_XPATH
+        ).strip()
+        login_type_xpath = str(
+            login_config.get("login_type_button_xpath") or LOGIN_TYPE_BUTTON_XPATH
+        ).strip()
+        confirm_login_xpath = str(
+            login_config.get("confirm_login_button_xpath") or CONFIRM_LOGIN_BUTTON_XPATH
+        ).strip()
+
+        LOGGER.info(
+            "[美客多][登录后续] 店铺=%s，验证码通过后等待 %.1f 秒再提交",
+            store_name,
+            after_captcha_wait,
+        )
+        if after_captcha_wait > 0:
+            time.sleep(after_captcha_wait)
+
+        self._click_until_next_target(
+            tab=tab,
+            click_xpath=captcha_submit_xpath,
+            next_xpath=login_type_xpath,
+            step_name="提交验证码结果",
+            next_name="登录类型按钮",
+            wait_timeout=wait_timeout,
+            max_attempts=max_attempts,
+        )
+        self._click_until_next_target(
+            tab=tab,
+            click_xpath=login_type_xpath,
+            next_xpath=confirm_login_xpath,
+            step_name="选择登录类型",
+            next_name="确认登录按钮",
+            wait_timeout=wait_timeout,
+            max_attempts=max_attempts,
+        )
+        self._click_until_homepage(
+            tab=tab,
+            click_xpath=confirm_login_xpath,
+            store_name=store_name,
+            wait_timeout=wait_timeout,
+            max_attempts=max_attempts,
+            homepage_ready_timeout=homepage_ready_timeout,
+            homepage_marker_xpath=homepage_marker_xpath,
+            homepage_marker_timeout=homepage_marker_timeout,
+            homepage_settle_seconds=homepage_settle_seconds,
+        )
+        LOGGER.info("[美客多][登录成功] 店铺=%s，已确认进入首页", store_name)
+
+    def _click_until_next_target(
+        self,
+        tab: Any,
+        click_xpath: str,
+        next_xpath: str,
+        step_name: str,
+        next_name: str,
+        wait_timeout: float,
+        max_attempts: int,
+    ) -> None:
+        """点击按钮并等待下一目标；目标未出现时重新查找并点击上一按钮。"""
+        for attempt in range(1, max_attempts + 1):
+            if self._find_visible_element(tab, next_xpath, timeout=0.5):
+                LOGGER.info(
+                    "[美客多][登录步骤成功] 步骤=%s，%s 已出现，无需重复点击",
+                    step_name,
+                    next_name,
+                )
+                return
+
+            LOGGER.info(
+                "[美客多][登录按钮查找] 步骤=%s，第 %s/%s 次，最长等待 %.1f 秒，xpath=%s",
+                step_name,
+                attempt,
+                max_attempts,
+                wait_timeout,
+                click_xpath,
+            )
+            button = self._wait_for_visible_element(tab, click_xpath, wait_timeout)
+            if not button:
+                LOGGER.warning(
+                    "[美客多][登录按钮未出现] 步骤=%s，第 %s/%s 次",
+                    step_name,
+                    attempt,
+                    max_attempts,
+                )
+                continue
+            try:
+                button.click()
+            except Exception as exc:
+                LOGGER.warning(
+                    "[美客多][登录按钮点击失败] 步骤=%s，第 %s/%s 次，异常=%s",
+                    step_name,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                continue
+
+            LOGGER.info(
+                "[美客多][登录按钮已点击] 步骤=%s，第 %s/%s 次，等待%s",
+                step_name,
+                attempt,
+                max_attempts,
+                next_name,
+            )
+            if self._wait_for_visible_element(tab, next_xpath, wait_timeout):
+                LOGGER.info(
+                    "[美客多][登录步骤成功] 步骤=%s，第 %s/%s 次，%s 已出现",
+                    step_name,
+                    attempt,
+                    max_attempts,
+                    next_name,
+                )
+                return
+            LOGGER.warning(
+                "[美客多][登录步骤重试] 步骤=%s，第 %s/%s 次点击后 %.1f 秒内未出现%s，"
+                "判定上一次点击未生效",
+                step_name,
+                attempt,
+                max_attempts,
+                wait_timeout,
+                next_name,
+            )
+
+        raise RuntimeError(
+            f"美客多登录步骤“{step_name}”连续 {max_attempts} 次未成功，未出现{next_name}"
+        )
+
+    def _click_until_homepage(
+        self,
+        tab: Any,
+        click_xpath: str,
+        store_name: str,
+        wait_timeout: float,
+        max_attempts: int,
+        homepage_ready_timeout: float,
+        homepage_marker_xpath: str,
+        homepage_marker_timeout: float,
+        homepage_settle_seconds: float,
+    ) -> None:
+        """点击确认登录按钮，并严格等待首页文档及标志元素加载完成。"""
+        for attempt in range(1, max_attempts + 1):
+            LOGGER.info(
+                "[美客多][确认登录按钮查找] 店铺=%s，第 %s/%s 次，最长等待 %.1f 秒，xpath=%s",
+                store_name,
+                attempt,
+                max_attempts,
+                wait_timeout,
+                click_xpath,
+            )
+            button = self._wait_for_visible_element(tab, click_xpath, wait_timeout)
+            if not button:
+                LOGGER.warning(
+                    "[美客多][确认登录按钮未出现] 店铺=%s，第 %s/%s 次",
+                    store_name,
+                    attempt,
+                    max_attempts,
+                )
+                continue
+            try:
+                button.click()
+            except Exception as exc:
+                LOGGER.warning(
+                    "[美客多][确认登录按钮点击失败] 店铺=%s，第 %s/%s 次，异常=%s",
+                    store_name,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                continue
+
+            LOGGER.info(
+                "[美客多][确认登录按钮已点击] 店铺=%s，第 %s/%s 次，等待进入首页",
+                store_name,
+                attempt,
+                max_attempts,
+            )
+            if self._wait_until_login_page_left(tab, wait_timeout):
+                if not self._wait_for_page_ready(
+                    tab,
+                    homepage_ready_timeout,
+                    "登录后首页",
+                ):
+                    raise TimeoutError(
+                        f"美客多店铺 {store_name} 登录后首页在 "
+                        f"{homepage_ready_timeout:.1f} 秒内未达到 document.readyState=complete"
+                    )
+                LOGGER.info(
+                    "[美客多][首页标志等待] 店铺=%s，最长等待 %.1f 秒，xpath=%s",
+                    store_name,
+                    homepage_marker_timeout,
+                    homepage_marker_xpath,
+                )
+                if not self._wait_for_visible_element(
+                    tab,
+                    homepage_marker_xpath,
+                    homepage_marker_timeout,
+                ):
+                    raise TimeoutError(
+                        f"美客多店铺 {store_name} 首页在 {homepage_marker_timeout:.1f} 秒内"
+                        f"未出现标志元素：{homepage_marker_xpath}"
+                    )
+                LOGGER.info(
+                    "[美客多][首页标志出现] 店铺=%s，固定等待 %.1f 秒使首页业务内容稳定",
+                    store_name,
+                    homepage_settle_seconds,
+                )
+                if homepage_settle_seconds > 0:
+                    time.sleep(homepage_settle_seconds)
+                return
+            LOGGER.warning(
+                "[美客多][确认登录重试] 店铺=%s，第 %s/%s 次点击后 %.1f 秒内未确认进入首页",
+                store_name,
+                attempt,
+                max_attempts,
+                wait_timeout,
+            )
+
+        raise RuntimeError(f"美客多店铺 {store_name} 连续 {max_attempts} 次未能确认进入首页")
+
+    def _wait_for_visible_element(self, tab: Any, xpath: str, timeout_seconds: float) -> Any:
+        """在给定时间内轮询可见元素，并返回最新元素对象。"""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            element = self._find_visible_element(tab, xpath, timeout=min(1.0, timeout_seconds))
+            if element:
+                return element
+            time.sleep(0.5)
+        return None
+
+    def _has_left_login_page(self, tab: Any) -> bool:
+        """当前 URL 不再属于登录路径时视为已经开始进入首页。"""
+        current_url = self._read_current_url(tab)
+        return bool(current_url) and not any(
+            keyword in current_url.casefold() for keyword in MERCADO_LOGIN_URL_KEYWORDS
+        )
+
+    def _wait_until_login_page_left(self, tab: Any, timeout_seconds: float) -> bool:
+        """等待当前标签页离开登录 URL。"""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self._has_left_login_page(tab):
+                return True
+            time.sleep(0.5)
+        return False
 
     @staticmethod
     def _read_current_url(tab: Any) -> str:
