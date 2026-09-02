@@ -45,6 +45,8 @@ CONFIRM_LOGIN_BUTTON_XPATH = '//button[@type="submit"]'
 POST_CAPTCHA_WAIT_SECONDS = 1.0
 LOGIN_STEP_WAIT_TIMEOUT_SECONDS = 10.0
 LOGIN_STEP_MAX_ATTEMPTS = 3
+LOGIN_BUTTON_CLICK_DELAY_MIN_SECONDS = 2.0
+LOGIN_BUTTON_CLICK_DELAY_MAX_SECONDS = 3.0
 LOGIN_HOMEPAGE_READY_TIMEOUT_SECONDS = 30.0
 LOGIN_HOMEPAGE_MARKER_XPATH = '(//div[@class="filter-section"]//label)[1]'
 LOGIN_HOMEPAGE_MARKER_TIMEOUT_SECONDS = 30.0
@@ -480,6 +482,7 @@ class MercadoAuto:
                 )
                 continue
             try:
+                self._wait_before_login_button_click(step_name)
                 button.click()
             except Exception as exc:
                 LOGGER.warning(
@@ -553,6 +556,7 @@ class MercadoAuto:
                 )
                 continue
             try:
+                self._wait_before_login_button_click("确认登录")
                 button.click()
             except Exception as exc:
                 LOGGER.warning(
@@ -612,6 +616,20 @@ class MercadoAuto:
             )
 
         raise RuntimeError(f"美客多店铺 {store_name} 连续 {max_attempts} 次未能确认进入首页")
+
+    @staticmethod
+    def _wait_before_login_button_click(step_name: str) -> None:
+        """登录按钮出现后随机等待 2～3 秒，再执行点击。"""
+        delay = random.uniform(
+            LOGIN_BUTTON_CLICK_DELAY_MIN_SECONDS,
+            LOGIN_BUTTON_CLICK_DELAY_MAX_SECONDS,
+        )
+        LOGGER.info(
+            "[美客多][登录按钮延迟] 步骤=%s，按钮已出现，随机等待 %.2f 秒后点击",
+            step_name,
+            delay,
+        )
+        time.sleep(delay)
 
     def _wait_for_visible_element(self, tab: Any, xpath: str, timeout_seconds: float) -> Any:
         """在给定时间内轮询可见元素，并返回最新元素对象。"""
