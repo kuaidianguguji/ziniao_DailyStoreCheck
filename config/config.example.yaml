@@ -78,6 +78,8 @@ feishu:
 # 全部店铺处理完成后仍会分析 ALL_info，并把汇总结果推送给 summary_recipients。
 deepseek:
   enabled: true
+  # 美客多验证码题型匹配也复用这里的 API Key、模型、地址、超时及重试参数。
+  # single_store_enabled 只控制店铺运营分析，不控制验证码题型匹配。
   # 单店原始消息之后是否调用 DeepSeek 并回发分析结果；关闭时仍保留原始数据推送和整轮汇总。
   single_store_enabled: true
   # 可直接填写，也可通过环境变量 DEEPSEEK_API_KEY 注入。
@@ -161,13 +163,14 @@ platforms:
     # 美客多未登录时的登录与 reCAPTCHA 处理参数。
     login:
       enabled: true
-      # 未登录后用于触发验证码的按钮 XPath；当前阶段留空，等待页面自行显示验证码。
-      captcha_trigger_button_xpath: ""
+      # 未登录后用于触发验证码的按钮 XPath；该元素位于 reCAPTCHA 外层 iframe 内。
+      captcha_trigger_button_xpath: '//div[@class="recaptcha-checkbox-border"]'
       after_trigger_wait_seconds: 2
       # 验证码通过后的登录按钮 XPath，后续阶段再填写；当前不会执行。
       post_captcha_login_button_xpath: ""
       captcha:
         enabled: true
+        # 挑战框题目会在 iframe 中读取，再使用顶层 deepseek 配置匹配题型 ID；无需监听 reload 请求。
         # 建议使用环境变量 MERCADO_YESCAPTCHA_API_KEY，不要把密钥提交到配置文件。
         api_key: ""
         wait_timeout_seconds: 25

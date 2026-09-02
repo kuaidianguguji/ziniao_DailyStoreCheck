@@ -304,29 +304,19 @@ class MercadoAuto:
             return False
 
         LOGGER.warning("[美客多][确认未登录] 店铺=%s，url=%s，准备执行登录流程", store_name, current_url or "<空>")
-        trigger_xpath = str(login_config.get("captcha_trigger_button_xpath") or "").strip()
-        if trigger_xpath:
-            if not self._click_with_retry(tab, trigger_xpath, "美客多验证码触发按钮"):
-                raise RuntimeError(f"美客多店铺 {store_name} 验证码触发按钮点击失败")
-            time.sleep(float(login_config.get("after_trigger_wait_seconds", 2) or 2))
-        else:
-            LOGGER.info("[美客多][验证码触发] 未配置 captcha_trigger_button_xpath，等待页面自行显示验证码")
 
         captcha_config = login_config.get("captcha", {})
         if not isinstance(captcha_config, dict):
             captcha_config = {}
-        captcha_wait = max(1.0, float(captcha_config.get("appearance_timeout_seconds", 25) or 25))
-        captcha_deadline = time.monotonic() + captcha_wait
-        captcha_frame = None
-        while time.monotonic() < captcha_deadline and not captcha_frame:
-            captcha_frame = self._find_visible_element(tab, '//iframe[@title="reCAPTCHA"]', timeout=1)
-            if not captcha_frame:
-                time.sleep(1)
-        if not captcha_frame:
-            raise TimeoutError(f"美客多店铺 {store_name} 未在 {captcha_wait:.0f} 秒内出现 reCAPTCHA")
+        # 验证码触发 XPath 位于 reCAPTCHA 外层 iframe 内，由求解器切入 iframe 后点击。
+        captcha_config = dict(captcha_config)
+        captcha_config["captcha_trigger_button_xpath"] = str(
+            login_config.get("captcha_trigger_button_xpath") or ""
+        ).strip()
+        solver = MercadoRecaptchaSolver(tab, captcha_config)
         if not bool(captcha_config.get("enabled", True)):
             raise RuntimeError("美客多检测到 reCAPTCHA，但 platforms.mercado.login.captcha.enabled 为 false")
-        MercadoRecaptchaSolver(tab, captcha_config).solve()
+        solver.solve()
         LOGGER.info("[美客多][验证码完成] 店铺=%s，后续登录按钮流程按要求留空", store_name)
         return True
 

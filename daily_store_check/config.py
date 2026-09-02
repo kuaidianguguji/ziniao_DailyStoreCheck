@@ -37,6 +37,20 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     mercado_captcha["api_key"] = os.getenv(
         "MERCADO_YESCAPTCHA_API_KEY", mercado_captcha.get("api_key", "")
     )
+    # 验证码题型匹配复用顶层 DeepSeek 配置，仅在内存中传给美客多求解器。
+    # single_store_enabled 只控制运营分析，不影响验证码题型匹配。
+    mercado_captcha["deepseek"] = {
+        key: deepseek.get(key)
+        for key in (
+            "enabled",
+            "api_key",
+            "model_name",
+            "base_url",
+            "timeout_seconds",
+            "retry_times",
+            "retry_interval_seconds",
+        )
+    }
     ziniao = config.setdefault("ziniao", {})
     user_info = ziniao.setdefault("user_info", {})
     for key, env_name in (("company", "ZINIAO_COMPANY"), ("username", "ZINIAO_USERNAME"), ("password", "ZINIAO_PASSWORD")):
