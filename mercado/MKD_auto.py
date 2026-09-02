@@ -655,6 +655,12 @@ class MercadoAuto:
                 text = text.replace(".", "").replace(",", ".")
             elif "," in text:
                 text = text.replace(",", ".")
+            elif "." in text:
+                # Mercado Livre 在巴西页面中可能省略小数部分，例如 R$ 3.522。
+                # 点后每组正好 3 位时表示千位分隔；普通小数（如 3.5）保持不变。
+                parts = text.split(".")
+                if len(parts) > 1 and len(parts[0]) <= 3 and all(len(part) == 3 for part in parts[1:]):
+                    text = "".join(parts)
             return float(text)
         except (TypeError, ValueError):
             return None

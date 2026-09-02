@@ -1723,6 +1723,11 @@ class DailyStoreCheck:
                 # 巴西格式如 18.558,26；同时兼容爬虫内部的 18558.26。
                 if "," in cleaned and "." in cleaned:
                     cleaned = cleaned.replace(".", "").replace(",", ".")
+                elif "." in cleaned:
+                    # 只有点号且点后为 3 位时是千位分隔，例如 R$ 3.522 应显示为 R$3522.00。
+                    parts = cleaned.split(".")
+                    if len(parts) > 1 and len(parts[0]) <= 3 and all(len(part) == 3 for part in parts[1:]):
+                        cleaned = "".join(parts)
                 else:
                     cleaned = cleaned.replace(",", ".")
                 return f"R${float(cleaned):.2f}"
@@ -1735,6 +1740,11 @@ class DailyStoreCheck:
                 # 1,400 是计数字段的千位分隔，不能按小数 1.4 处理。
                 if "," in cleaned and "." not in cleaned and len(cleaned.rsplit(",", 1)[-1]) == 3:
                     cleaned = cleaned.replace(",", "")
+                elif "." in cleaned and "," not in cleaned:
+                    # 巴西计数字段也可能使用点号千位分隔，例如 3.522。
+                    parts = cleaned.split(".")
+                    if len(parts) > 1 and len(parts[0]) <= 3 and all(len(part) == 3 for part in parts[1:]):
+                        cleaned = "".join(parts)
                 else:
                     cleaned = cleaned.replace(",", ".")
                 return str(int(float(cleaned)))
