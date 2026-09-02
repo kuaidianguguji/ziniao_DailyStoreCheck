@@ -30,6 +30,13 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     deepseek = config.setdefault("deepseek", {})
     # API Key 既可以直接填写在 config.yaml，也可以在部署环境中用 DEEPSEEK_API_KEY 覆盖。
     deepseek["api_key"] = os.getenv("DEEPSEEK_API_KEY", deepseek.get("api_key", ""))
+    platforms = config.setdefault("platforms", {})
+    mercado = platforms.setdefault("mercado", {})
+    mercado_login = mercado.setdefault("login", {})
+    mercado_captcha = mercado_login.setdefault("captcha", {})
+    mercado_captcha["api_key"] = os.getenv(
+        "MERCADO_YESCAPTCHA_API_KEY", mercado_captcha.get("api_key", "")
+    )
     ziniao = config.setdefault("ziniao", {})
     user_info = ziniao.setdefault("user_info", {})
     for key, env_name in (("company", "ZINIAO_COMPANY"), ("username", "ZINIAO_USERNAME"), ("password", "ZINIAO_PASSWORD")):

@@ -158,6 +158,24 @@ platforms:
       7d: true
   mercado:
     crawler: "mercado.MKD_auto:MercadoAuto"
+    # 美客多未登录时的登录与 reCAPTCHA 处理参数。
+    login:
+      enabled: true
+      # 未登录后用于触发验证码的按钮 XPath；当前阶段留空，等待页面自行显示验证码。
+      captcha_trigger_button_xpath: ""
+      after_trigger_wait_seconds: 2
+      # 验证码通过后的登录按钮 XPath，后续阶段再填写；当前不会执行。
+      post_captcha_login_button_xpath: ""
+      captcha:
+        enabled: true
+        # 建议使用环境变量 MERCADO_YESCAPTCHA_API_KEY，不要把密钥提交到配置文件。
+        api_key: ""
+        wait_timeout_seconds: 25
+        appearance_timeout_seconds: 25
+        max_retry: 3
+        retry_interval_seconds: 5
+        create_task_url: "https://api.yescaptcha.com/createTask"
+        result_url: "https://api.yescaptcha.com/getTaskResult"
     # 美客多实际使用今天、7天和30天三个时间范围。
     periods:
       today: true

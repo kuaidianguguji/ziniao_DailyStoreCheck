@@ -20,6 +20,7 @@ from typing import Any
 
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
+from mercado.recaptcha_solver import MercadoRecaptchaSolver
 
 
 # 当前模块日志会由 run_daily_store_check.py 同时输出到控制台和日志文件。
@@ -33,6 +34,9 @@ HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
 METRICS_PAGE_URL = "https://vendedores.mercadolivre.com.br/metricas/negocio/visao-geral#from=seller-menu"
 # 紫鸟当前网址不包含 vendedores、为空或读取失败时，使用普通美客多域名的指标页面。
 GENERAL_METRICS_PAGE_URL = "https://www.mercadolivre.com.br/metricas#sc-menu"
+
+# 美客多登录页的状态判断只依赖 URL；验证码触发按钮由配置提供，默认留空。
+MERCADO_LOGIN_URL_KEYWORDS = ("/login", "/auth")
 
 # 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
 PAGE_READY_TIMEOUT_SECONDS = 60
@@ -178,6 +182,11 @@ class MercadoAuto:
         if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "紫鸟初始店铺页"):
             raise TimeoutError("美客多初始店铺页在 60 秒内未加载完成，停止本店铺采集")
 
+        # 只有确认未登录后才触发验证码；测试阶段完成验证码后立即结束本店铺。
+        if self._ensure_logged_in(tab, store_name):
+            LOGGER.info("[美客多][验证码测试结束] 店铺=%s，验证码已通过；后续登录按钮流程暂未启用", store_name)
+            return []
+
         # 使用当前已登录的紫鸟标签页直接进入经营指标页；新页面必须再次加载完成后才允许操作。
         self._open_metrics_page(tab)
 
@@ -278,6 +287,48 @@ class MercadoAuto:
             "经营指标页日期切换按钮",
         ):
             raise RuntimeError("经营指标页加载后未发现日期切换按钮，停止本店铺采集")
+
+    def _ensure_logged_in(self, tab: Any, store_name: str) -> bool:
+        """确认登录状态；测试阶段未登录时只执行验证码并返回是否已完成验证码。"""
+        login_config = self.config.get("login", {})
+        if not isinstance(login_config, dict):
+            login_config = {}
+        if not bool(login_config.get("enabled", True)):
+            LOGGER.info("[美客多][登录流程] 店铺=%s，登录流程已按配置关闭", store_name)
+            return False
+
+        current_url = self._read_current_url(tab)
+        login_page = any(keyword in current_url.casefold() for keyword in MERCADO_LOGIN_URL_KEYWORDS)
+        if not login_page:
+            LOGGER.info("[美客多][登录判断] 店铺=%s，未发现登录入口，视为已登录，url=%s", store_name, current_url)
+            return False
+
+        LOGGER.warning("[美客多][确认未登录] 店铺=%s，url=%s，准备执行登录流程", store_name, current_url or "<空>")
+        trigger_xpath = str(login_config.get("captcha_trigger_button_xpath") or "").strip()
+        if trigger_xpath:
+            if not self._click_with_retry(tab, trigger_xpath, "美客多验证码触发按钮"):
+                raise RuntimeError(f"美客多店铺 {store_name} 验证码触发按钮点击失败")
+            time.sleep(float(login_config.get("after_trigger_wait_seconds", 2) or 2))
+        else:
+            LOGGER.info("[美客多][验证码触发] 未配置 captcha_trigger_button_xpath，等待页面自行显示验证码")
+
+        captcha_config = login_config.get("captcha", {})
+        if not isinstance(captcha_config, dict):
+            captcha_config = {}
+        captcha_wait = max(1.0, float(captcha_config.get("appearance_timeout_seconds", 25) or 25))
+        captcha_deadline = time.monotonic() + captcha_wait
+        captcha_frame = None
+        while time.monotonic() < captcha_deadline and not captcha_frame:
+            captcha_frame = self._find_visible_element(tab, '//iframe[@title="reCAPTCHA"]', timeout=1)
+            if not captcha_frame:
+                time.sleep(1)
+        if not captcha_frame:
+            raise TimeoutError(f"美客多店铺 {store_name} 未在 {captcha_wait:.0f} 秒内出现 reCAPTCHA")
+        if not bool(captcha_config.get("enabled", True)):
+            raise RuntimeError("美客多检测到 reCAPTCHA，但 platforms.mercado.login.captcha.enabled 为 false")
+        MercadoRecaptchaSolver(tab, captcha_config).solve()
+        LOGGER.info("[美客多][验证码完成] 店铺=%s，后续登录按钮流程按要求留空", store_name)
+        return True
 
     @staticmethod
     def _read_current_url(tab: Any) -> str:
