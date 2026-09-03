@@ -7,11 +7,26 @@ ziniao:
     socket_port: 16851
     # 店铺运行期间每隔多少秒用只读请求维持并检查紫鸟 IPC，建议保持 60 秒。
     ipc_keepalive_seconds: 60
+
   # 推荐在环境变量中填写，不要提交真实账号和密码。
   user_info:
     company: ""
     username: ""
     password: ""
+
+# 跨平台真人鼠标交互总开关；关闭后使用普通元素点击。
+human_interaction:
+  enabled: true
+  move_min_seconds: 0.3
+  move_max_seconds: 1.0
+  jitter_pixels: 1.0
+  click_pause_min_seconds: 0.2
+  click_pause_max_seconds: 0.6
+  safe_inset_ratio: 0.18
+  fallback_x_min: 80
+  fallback_x_max: 700
+  fallback_y_min: 80
+  fallback_y_max: 500
 
 # 启动后常驻后台，每天等待到 07:00 执行；--run-now 会立即执行第一轮并继续常驻。
 schedule:

@@ -20,6 +20,7 @@ from typing import Any
 
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
+from daily_store_check.human_interaction import HumanInteraction
 from mercado.recaptcha_solver import MercadoRecaptchaSolver
 
 
@@ -177,6 +178,7 @@ class MercadoAuto:
     def __init__(self, config: dict[str, Any] | None = None):
         """保存美客多独立配置；指标 XPath 直接维护在本文件的 METRIC_SPECS。"""
         self.config = config or {}
+        self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，读取今天、7 天和 30 天经营指标。"""
@@ -325,6 +327,7 @@ class MercadoAuto:
         captcha_config["captcha_trigger_button_xpath"] = str(
             login_config.get("captcha_trigger_button_xpath") or ""
         ).strip()
+        captcha_config["human_interaction"] = self.config.get("human_interaction", {})
         solver = MercadoRecaptchaSolver(tab, captcha_config)
         if not bool(captcha_config.get("enabled", True)):
             raise RuntimeError("美客多检测到 reCAPTCHA，但 platforms.mercado.login.captcha.enabled 为 false")
@@ -483,7 +486,10 @@ class MercadoAuto:
                 continue
             try:
                 self._wait_before_login_button_click(step_name)
-                button.click()
+                try:
+                    self._human_interaction.click_element(tab, button)
+                except Exception:
+                    button.click()
             except Exception as exc:
                 LOGGER.warning(
                     "[美客多][登录按钮点击失败] 步骤=%s，第 %s/%s 次，异常=%s",
@@ -557,7 +563,10 @@ class MercadoAuto:
                 continue
             try:
                 self._wait_before_login_button_click("确认登录")
-                button.click()
+                try:
+                    self._human_interaction.click_element(tab, button)
+                except Exception:
+                    button.click()
             except Exception as exc:
                 LOGGER.warning(
                     "[美客多][确认登录按钮点击失败] 店铺=%s，第 %s/%s 次，异常=%s",
@@ -778,7 +787,10 @@ class MercadoAuto:
                 if not element:
                     LOGGER.warning("[美客多][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
                     continue
-                element.click()
+                try:
+                    self._human_interaction.click_element(tab, element)
+                except Exception:
+                    element.click()
                 if success_xpath and success_state:
                     LOGGER.info("[美客多][按钮已点击] 步骤=%s，第 %s/%s 次已发送点击，开始验证页面状态", step_name, attempt + 1, max_attempts)
                     verified = self._wait_for_element_state(

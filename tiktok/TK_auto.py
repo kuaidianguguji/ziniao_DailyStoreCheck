@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 import requests
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
+from daily_store_check.human_interaction import HumanInteraction
 
 
 LOGGER = logging.getLogger(__name__)
@@ -361,6 +362,7 @@ class TiktokAuto:
     def __init__(self, config: dict[str, Any] | None = None):
         """保存 TikTok 独立配置；按钮和指标 XPath 直接维护在本文件顶部。"""
         self.config = config or {}
+        self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
         # 记录最近一次真实点击的时间；后续每次点击都会据此补足随机的人类操作间隔。
         self._last_button_click_at: float | None = None
 
@@ -1328,39 +1330,11 @@ class TiktokAuto:
         return converted
 
     def _click_captcha_points(self, tab: Any, points: list[tuple[float, float]]) -> None:
-        """通过 CDP 在当前紫鸟标签页按贝塞尔轨迹依次点击两个验证码坐标。"""
-        viewport_center = tab.run_js("return [window.innerWidth / 2, window.innerHeight / 2];")
-        if not isinstance(viewport_center, (list, tuple)) or len(viewport_center) != 2:
-            viewport_center = (400, 300)
-        current_x, current_y = float(viewport_center[0]), float(viewport_center[1])
-
+        """通过公共真人交互层在当前标签页依次点击验证码坐标。"""
         for index, (target_x, target_y) in enumerate(points, start=1):
-            path = self._bezier_mouse_path(current_x, current_y, target_x, target_y)
-            for path_x, path_y in path:
-                tab.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=path_x, y=path_y)
-                time.sleep(random.uniform(0.015, 0.035))
-            tab.run_cdp(
-                "Input.dispatchMouseEvent",
-                type="mousePressed",
-                x=target_x,
-                y=target_y,
-                button="left",
-                buttons=1,
-                clickCount=1,
-            )
-            time.sleep(random.uniform(0.05, 0.12))
-            tab.run_cdp(
-                "Input.dispatchMouseEvent",
-                type="mouseReleased",
-                x=target_x,
-                y=target_y,
-                button="left",
-                buttons=0,
-                clickCount=1,
-            )
+            self._human_interaction.click_point(tab, (target_x, target_y))
             LOGGER.info("[TikTok][验证码坐标点击] 已点击第%s个物体，坐标=(%.1f, %.1f)", index, target_x, target_y)
-            current_x, current_y = target_x, target_y
-            time.sleep(random.uniform(0.35, 0.65))
+            time.sleep(random.uniform(0.35, 0.65) if self._human_interaction.enabled else 0.01)
 
     @staticmethod
     def _bezier_mouse_path(
@@ -1400,7 +1374,10 @@ class TiktokAuto:
         if not confirm_button:
             raise RuntimeError("TikTok 验证码确认按钮不可见")
         self._prepare_human_click(tab, confirm_button, "验证码-点击确认按钮")
-        confirm_button.click()
+        try:
+            self._human_interaction.click_element(tab, confirm_button)
+        except Exception:
+            confirm_button.click()
         self._record_button_click()
         LOGGER.info("[TikTok][验证码提交] 已点击确认按钮，开始等待验证结果")
 
@@ -1467,6 +1444,8 @@ class TiktokAuto:
 
     def _prepare_human_click(self, tab: Any, element: Any, step_name: str) -> None:
         """在真实点击前补足随机间隔，并执行居中滚动、鼠标移动和短暂停留。"""
+        if not self._human_interaction.enabled:
+            return
         target_interval = random.uniform(HUMAN_CLICK_INTERVAL_MIN_SECONDS, HUMAN_CLICK_INTERVAL_MAX_SECONDS)
         if self._last_button_click_at is None:
             # 第一个按钮前也稍作停留，避免页面刚加载完就立即发生机械点击。
@@ -1505,14 +1484,14 @@ class TiktokAuto:
                 to_see(center=True)
                 scrolled = True
         except Exception as exc:
-            LOGGER.debug("[TikTok][仿人滚动] 步骤=%s，DrissionPage 居中滚动失败=%s", step_name, exc)
+            LOGGER.debug("[TikTok][元素定位] 步骤=%s，DrissionPage 居中定位失败=%s", step_name, exc)
         if not scrolled:
             try:
                 element.run_js("this.scrollIntoView({behavior:'smooth', block:'center', inline:'center'});")
                 scrolled = True
             except Exception as exc:
-                LOGGER.debug("[TikTok][仿人滚动] 步骤=%s，JavaScript 居中滚动失败=%s", step_name, exc)
-        LOGGER.info("[TikTok][仿人滚动] 步骤=%s，滚动到按钮附近结果=%s", step_name, "成功" if scrolled else "跳过")
+                LOGGER.debug("[TikTok][元素定位] 步骤=%s，JavaScript 居中定位失败=%s", step_name, exc)
+        LOGGER.info("[TikTok][元素定位] 步骤=%s，目标进入视口结果=%s", step_name, "成功" if scrolled else "跳过")
 
         scroll_pause = random.uniform(HUMAN_PRE_CLICK_PAUSE_MIN_SECONDS, HUMAN_PRE_CLICK_PAUSE_MAX_SECONDS)
         self._human_wait(tab, scroll_pause)
@@ -1527,16 +1506,12 @@ class TiktokAuto:
         # 此处直接停留，不再调用会随机移动鼠标的 _human_wait，确保光标停在目标附近再点击。
         time.sleep(hover_pause)
 
-    @staticmethod
-    def _human_mouse_move_to_element(tab: Any, element: Any) -> bool:
-        """把鼠标平滑移动到目标元素；失败时保留原有随机移动作为后备。"""
+    def _human_mouse_move_to_element(self, tab: Any, element: Any) -> bool:
+        """把鼠标平滑移动到目标元素；失败时保留随机坐标作为后备。"""
         try:
-            from DrissionPage import Actions
-
-            Actions(tab).move_to(element, duration=random.uniform(0.4, 0.9))
-            return True
+            return self._human_interaction.move_to_element(tab, element)
         except Exception:
-            TiktokAuto._human_mouse_move(tab)
+            self._human_interaction.move_to_fallback(tab)
             return False
 
     def _record_button_click(self) -> None:
@@ -1684,7 +1659,10 @@ class TiktokAuto:
                     )
                     continue
                 self._prepare_human_click(tab, element, step_name)
-                element.click()
+                try:
+                    self._human_interaction.click_element(tab, element)
+                except Exception:
+                    element.click()
                 click_dispatched = True
                 self._record_button_click()
                 if stop_when_authenticated and self._login_step_already_authenticated(tab, f"{step_name} 第{attempt + 1}次点击后"):
@@ -2000,6 +1978,9 @@ class TiktokAuto:
 
     def _human_wait(self, tab: Any, seconds: float) -> None:
         """分段等待并穿插鼠标移动，避免长时间完全静止。"""
+        if not self._human_interaction.enabled:
+            time.sleep(max(0.0, seconds))
+            return
         deadline = time.monotonic() + max(0, seconds)
         while time.monotonic() < deadline:
             self._human_mouse_move(tab)
@@ -2008,25 +1989,10 @@ class TiktokAuto:
                 break
             time.sleep(min(remaining, random.uniform(0.8, 1.5)))
 
-    @staticmethod
-    def _human_mouse_move(tab: Any) -> None:
-        """优先用 DrissionPage Actions 移动鼠标，失败时退回页面 mousemove 事件。"""
-        x = random.randint(80, 700)
-        y = random.randint(80, 500)
-        try:
-            from DrissionPage import Actions
-
-            Actions(tab).move_to((x, y), duration=random.uniform(0.2, 0.6))
-            return
-        except Exception:
-            pass
-        try:
-            tab.run_js(
-                "document.dispatchEvent(new MouseEvent('mousemove', "
-                f"{{clientX:{x}, clientY:{y}, bubbles:true}}));"
-            )
-        except Exception:
-            pass
+    def _human_mouse_move(self, tab: Any) -> None:
+        """在总开关开启时执行随机坐标的平滑移动。"""
+        if self._human_interaction.enabled:
+            self._human_interaction.move_to_fallback(tab)
 
     def _read_xpath(self, tab: Any, xpath: str, field_name: str = "未命名指标") -> str:
         """读取一个 XPath 文本；XPath 为空、元素不存在或异常时返回空字符串。"""

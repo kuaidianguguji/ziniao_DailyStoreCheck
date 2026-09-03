@@ -1088,7 +1088,9 @@ class DailyStoreCheck:
             raise ValueError(f"平台 {platform} 未配置 crawler")
         module_name, class_name = crawler_path.split(":", 1)
         crawler_class = getattr(importlib.import_module(module_name), class_name)
-        platform_config = self.config.get("platforms", {}).get(platform, {})
+        platform_config = dict(self.config.get("platforms", {}).get(platform, {}) or {})
+        # 真人鼠标设置是跨平台总开关，平台配置不得单独覆盖。
+        platform_config["human_interaction"] = dict(self.config.get("human_interaction", {}) or {})
         return crawler_class(platform_config)
 
     def _write_feishu(self, task: StoreTask, rows: list[dict[str, Any]]) -> None:

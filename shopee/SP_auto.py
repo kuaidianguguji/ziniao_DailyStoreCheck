@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
+from daily_store_check.human_interaction import HumanInteraction
 
 
 LOGGER = logging.getLogger(__name__)
@@ -186,6 +187,7 @@ class ShopeeAuto:
     def __init__(self, config: dict[str, Any] | None = None):
         """保存 Shopee 独立配置；所有 XPath 集中维护在本文件顶部。"""
         self.config = config or {}
+        self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
 
     def collect(
         self,
@@ -1435,7 +1437,7 @@ class ShopeeAuto:
     def _click_element_with_fallback(self, tab: Any, element: Any, xpath: str, step_name: str) -> None:
         """点击元素；无尺寸时依次尝试可点击父节点和 JavaScript click。"""
         try:
-            element.click()
+            self._human_interaction.click_element(tab, element)
             return
         except Exception as first_error:
             LOGGER.warning(
