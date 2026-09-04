@@ -1034,22 +1034,32 @@ class MercadoAuto:
 
     @staticmethod
     def _parse_number(raw_text: str) -> float | None:
-        """解析巴西常见格式，例如 ``R$ 1.234,56`` 或 ``12,5%``。"""
+        """解析巴西常见格式，例如 ``R$ 1.234,56``、``1,635 雷亚尔`` 或 ``12,5%``。"""
         text = str(raw_text).strip().replace("%", "")
         text = re.sub(r"[^0-9,.-]", "", text)
         if not text or text in {"-", ".", ","}:
             return None
         try:
-            # 同时有点和逗号时，按巴西格式把点当千位分隔、逗号当小数点。
+            # 巴西页面通常使用点分组千位、逗号表示小数。
             if "." in text and "," in text:
                 text = text.replace(".", "").replace(",", ".")
             elif "," in text:
-                text = text.replace(",", ".")
+                comma_parts = text.split(",")
+                # 单逗号末组三位时，页面通常把它作为千位分隔符，
+                # 例如“1,635 雷亚尔”应为 1635，而不是 1.635。
+                if len(comma_parts) == 1:
+                    text = comma_parts[0]
+                elif len(comma_parts[-1]) == 3 and all(
+                    len(part) == 3 for part in comma_parts[1:]
+                ):
+                    text = "".join(comma_parts)
+                else:
+                    # 末尾一到两位按巴西小数处理；前面的逗号仍视为千位分隔。
+                    text = "".join(comma_parts[:-1]) + "." + comma_parts[-1]
             elif "." in text:
-                # Mercado Livre 在巴西页面中可能省略小数部分，例如 R$ 3.522。
-                # 点后每组正好 3 位时表示千位分隔；普通小数（如 3.5）保持不变。
+                # Mercado Livre 在巴西页面中可能使用点作为千位分隔，例如 R$ 3.522。
                 parts = text.split(".")
-                if len(parts) > 1 and len(parts[0]) <= 3 and all(len(part) == 3 for part in parts[1:]):
+                if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]):
                     text = "".join(parts)
             return float(text)
         except (TypeError, ValueError):
