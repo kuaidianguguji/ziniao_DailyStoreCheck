@@ -107,6 +107,21 @@ SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS = 60
 # 登录按钮首次点击失败后允许再次尝试的次数。总尝试次数为 1 + 此值。
 SHOPEE_LOGIN_CLICK_RETRY_TIMES = 3
 
+# 每次点击尝试查找登录按钮的最长时间。超时后刷新页面并重新查找，最多刷新 2 次。
+SHOPEE_LOGIN_BUTTON_WAIT_SECONDS = 30
+SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES = 2
+
+# 登录按钮出现后、实际点击前的随机停留时间。
+SHOPEE_LOGIN_BUTTON_CLICK_DELAY_MIN_SECONDS = 1.5
+SHOPEE_LOGIN_BUTTON_CLICK_DELAY_MAX_SECONDS = 3.0
+
+# 点击登录按钮后，等待按钮从页面消失的最长时间。
+SHOPEE_LOGIN_BUTTON_DISAPPEAR_WAIT_SECONDS = 6
+
+# 登录后首页的业务标志。该标志等待失败也不阻断后续广告页流程。
+SHOPEE_LOGIN_HOME_MARKER_XPATH = '//div[@class="ads-data-title"][1]'
+SHOPEE_LOGIN_HOME_MARKER_WAIT_SECONDS = 60
+
 # Shopee 广告弹窗关闭按钮按顺序检查：先使用现有奖励弹窗定位，找不到时再检查广告升级通知弹窗。
 # 后续如果出现更多类型，只需在列表末尾追加 XPath，不需要修改关闭函数。
 AD_POPUP_CLOSE_XPATHS: list[str] = [
@@ -715,6 +730,7 @@ class ShopeeAuto:
             SHOPEE_LOGIN_PAGE_URL,
             SHOPEE_SELLER_HOST,
         )
+        next_mouse_move_at = time.monotonic() + random.uniform(2.0, 4.0)
         while time.monotonic() < deadline:
             current_url = self._read_current_url(tab)
             if current_url != last_url:
@@ -739,6 +755,10 @@ class ShopeeAuto:
                     time.monotonic() - started_at,
                 )
                 return
+            now = time.monotonic()
+            if self._human_interaction.enabled and now >= next_mouse_move_at:
+                self._human_interaction.move_to_fallback(tab)
+                next_mouse_move_at = time.monotonic() + random.uniform(2.5, 5.0)
             time.sleep(1)
 
         raise RuntimeError(
@@ -763,7 +783,7 @@ class ShopeeAuto:
                     interval,
                     SHOPEE_LOGIN_BUTTON_XPATH,
                 )
-                time.sleep(interval)
+                self._wait_with_human_mouse(tab, interval)
 
             try:
                 LOGGER.info(
@@ -773,14 +793,18 @@ class ShopeeAuto:
                     max_attempts,
                     SHOPEE_LOGIN_BUTTON_XPATH,
                 )
-                login_button = self._find_action_element(
-                    tab,
-                    SHOPEE_LOGIN_BUTTON_XPATH,
-                    timeout=3,
-                    target_name="Shopee登录Entrar按钮",
+                login_button = self._find_login_button_with_refresh(tab, store_name)
+
+                click_delay = random.uniform(
+                    SHOPEE_LOGIN_BUTTON_CLICK_DELAY_MIN_SECONDS,
+                    SHOPEE_LOGIN_BUTTON_CLICK_DELAY_MAX_SECONDS,
                 )
-                if not login_button:
-                    raise RuntimeError("未找到可点击的 Entrar 登录按钮")
+                LOGGER.info(
+                    "[Shopee][登录按钮等待] 店铺=%s，按钮已出现，点击前随机等待 %.2f 秒",
+                    store_name,
+                    click_delay,
+                )
+                self._wait_with_human_mouse(tab, click_delay)
 
                 self._click_element_with_fallback(
                     tab,
@@ -794,8 +818,31 @@ class ShopeeAuto:
                     attempt_number,
                     max_attempts,
                 )
-                self._wait_for_login_home(tab, store_name)
-                return
+                disappeared = self._wait_for_login_button_disappear(tab, store_name)
+                if disappeared:
+                    LOGGER.info(
+                        "[Shopee][登录按钮消失] 店铺=%s，第 %s/%s 次点击后按钮已消失，按点击成功继续进入首页",
+                        store_name,
+                        attempt_number,
+                        max_attempts,
+                    )
+                    self._wait_for_login_home(tab, store_name)
+                    return
+
+                # 按钮仍存在时只复核一次 URL；仍在登录页才进入原有点击重试。
+                current_url = self._read_current_url(tab)
+                if self._classify_login_url(current_url) != "not_logged_in":
+                    LOGGER.warning(
+                        "[Shopee][登录按钮未消失但URL已离开登录页] 店铺=%s，第 %s/%s 次，"
+                        "当前url=%s，按登录成功继续进入首页",
+                        store_name,
+                        attempt_number,
+                        max_attempts,
+                        current_url or "<空>",
+                    )
+                    self._wait_for_login_home(tab, store_name)
+                    return
+                raise RuntimeError("点击后登录按钮在 6 秒内未消失，且 URL 仍为未登录状态")
             except Exception as exc:
                 last_error = str(exc)
                 LOGGER.warning(
@@ -819,6 +866,7 @@ class ShopeeAuto:
                         max_attempts,
                         current_url,
                     )
+                    self._wait_for_login_home(tab, store_name)
                     return
                 LOGGER.info(
                     "[Shopee][登录失败后URL复核仍未登录] 店铺=%s，第 %s/%s 次失败后，继续重试，url=%s",
@@ -832,6 +880,94 @@ class ShopeeAuto:
             f"Shopee 店铺 {store_name} 登录按钮连续 {max_attempts} 次未能完成，最后错误={last_error}；"
             "已停止本店铺采集。"
         )
+
+    def _find_login_button_with_refresh(self, tab: Any, store_name: str) -> Any:
+        """查找登录按钮；每轮等待 30 秒，未找到时刷新并最多重试 2 轮。"""
+        for refresh_attempt in range(SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES + 1):
+            started_at = time.monotonic()
+            deadline = started_at + SHOPEE_LOGIN_BUTTON_WAIT_SECONDS
+            next_mouse_move_at = started_at + random.uniform(2.0, 4.0)
+            LOGGER.info(
+                "[Shopee][登录按钮等待] 店铺=%s，第 %s/%s 轮，最长等待 %.1f 秒，xpath=%s",
+                store_name,
+                refresh_attempt + 1,
+                SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES + 1,
+                SHOPEE_LOGIN_BUTTON_WAIT_SECONDS,
+                SHOPEE_LOGIN_BUTTON_XPATH,
+            )
+            while time.monotonic() < deadline:
+                remaining = max(0.1, deadline - time.monotonic())
+                login_button = self._find_action_element(
+                    tab,
+                    SHOPEE_LOGIN_BUTTON_XPATH,
+                    timeout=min(1.0, remaining),
+                    target_name="Shopee登录Entrar按钮",
+                )
+                if login_button:
+                    LOGGER.info(
+                        "[Shopee][登录按钮出现] 店铺=%s，第 %s/%s 轮，等待耗时 %.2f 秒",
+                        store_name,
+                        refresh_attempt + 1,
+                        SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES + 1,
+                        time.monotonic() - started_at,
+                    )
+                    return login_button
+
+                now = time.monotonic()
+                if self._human_interaction.enabled and now >= next_mouse_move_at:
+                    self._human_interaction.move_to_fallback(tab)
+                    next_mouse_move_at = time.monotonic() + random.uniform(2.5, 5.0)
+                time.sleep(0.25)
+
+            if refresh_attempt < SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES:
+                LOGGER.warning(
+                    "[Shopee][登录按钮未出现] 店铺=%s，第 %s/%s 轮等待 %.1f 秒仍未找到，刷新网页后继续",
+                    store_name,
+                    refresh_attempt + 1,
+                    SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES + 1,
+                    SHOPEE_LOGIN_BUTTON_WAIT_SECONDS,
+                )
+                try:
+                    tab.refresh()
+                except Exception as exc:
+                    LOGGER.warning("[Shopee][登录页面刷新失败] 店铺=%s，异常=%s，仍继续等待下一轮", store_name, exc)
+                self._wait_with_human_mouse(tab, random.uniform(1.0, 2.0))
+
+        raise RuntimeError(
+            f"Shopee 店铺 {store_name} 查找登录按钮失败：每轮等待 {SHOPEE_LOGIN_BUTTON_WAIT_SECONDS} 秒，"
+            f"刷新并重试 {SHOPEE_LOGIN_BUTTON_REFRESH_RETRY_TIMES} 次后仍未出现"
+        )
+
+    def _wait_for_login_button_disappear(self, tab: Any, store_name: str) -> bool:
+        """点击后等待登录按钮消失；等待期间间歇执行真人鼠标移动。"""
+        deadline = time.monotonic() + SHOPEE_LOGIN_BUTTON_DISAPPEAR_WAIT_SECONDS
+        next_mouse_move_at = time.monotonic() + random.uniform(1.5, 2.5)
+        while time.monotonic() < deadline:
+            button = self._find_visible_element(tab, SHOPEE_LOGIN_BUTTON_XPATH, timeout=0.25)
+            if not button:
+                return True
+            now = time.monotonic()
+            if self._human_interaction.enabled and now >= next_mouse_move_at:
+                self._human_interaction.move_to_fallback(tab)
+                next_mouse_move_at = time.monotonic() + random.uniform(2.0, 4.0)
+            time.sleep(0.25)
+        LOGGER.warning(
+            "[Shopee][登录按钮未消失] 店铺=%s，点击后等待 %.1f 秒仍检测到按钮",
+            store_name,
+            SHOPEE_LOGIN_BUTTON_DISAPPEAR_WAIT_SECONDS,
+        )
+        return False
+
+    def _wait_with_human_mouse(self, tab: Any, seconds: float) -> None:
+        """等待指定时长，并以随机间隔穿插少量真人鼠标移动。"""
+        deadline = time.monotonic() + max(0.0, seconds)
+        next_mouse_move_at = time.monotonic() + random.uniform(1.5, 3.0)
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if self._human_interaction.enabled and now >= next_mouse_move_at:
+                self._human_interaction.move_to_fallback(tab)
+                next_mouse_move_at = time.monotonic() + random.uniform(2.0, 4.0)
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
     def _wait_for_login_home(self, tab: Any, store_name: str) -> None:
         """等待登录后 URL 回到卖家中心，并确认首页主文档加载完成。"""
@@ -853,8 +989,19 @@ class ShopeeAuto:
 
             if self._classify_login_url(current_url) == "logged_in":
                 remaining = max(1.0, deadline - time.monotonic())
-                page_ready = self._wait_for_page_ready(tab, min(remaining, AD_PAGE_LOAD_TIMEOUT_SECONDS))
+                page_ready = self._wait_for_page_ready(
+                    tab,
+                    min(remaining, AD_PAGE_LOAD_TIMEOUT_SECONDS),
+                    human_mouse=True,
+                )
                 if page_ready:
+                    marker_found = self._wait_for_login_home_marker(tab, store_name)
+                    LOGGER.info(
+                        "[Shopee][登录后首页标志] 店铺=%s，xpath=%s，结果=%s；无论成功或超时均继续后续流程",
+                        store_name,
+                        SHOPEE_LOGIN_HOME_MARKER_XPATH,
+                        "已出现" if marker_found else "未出现",
+                    )
                     LOGGER.info(
                         "[Shopee][登录成功] 店铺=%s，已回到卖家中心首页，耗时=%.2f秒，url=%s",
                         store_name,
@@ -873,6 +1020,32 @@ class ShopeeAuto:
             f"Shopee 店铺 {store_name} 点击 Entrar 后在 {SHOPEE_LOGIN_HOME_TIMEOUT_SECONDS} 秒内未确认首页加载完成，"
             f"最后网址={last_url or '<空>'}"
         )
+
+    def _wait_for_login_home_marker(self, tab: Any, store_name: str) -> bool:
+        """等待登录后首页业务标志，超时只记录日志，不阻断后续流程。"""
+        deadline = time.monotonic() + SHOPEE_LOGIN_HOME_MARKER_WAIT_SECONDS
+        next_mouse_move_at = time.monotonic() + random.uniform(2.0, 4.0)
+        while time.monotonic() < deadline:
+            marker = self._find_visible_element(tab, SHOPEE_LOGIN_HOME_MARKER_XPATH, timeout=0.5)
+            if marker:
+                LOGGER.info(
+                    "[Shopee][登录后首页标志出现] 店铺=%s，等待耗时 %.2f 秒",
+                    store_name,
+                    SHOPEE_LOGIN_HOME_MARKER_WAIT_SECONDS - max(0.0, deadline - time.monotonic()),
+                )
+                return True
+            now = time.monotonic()
+            if self._human_interaction.enabled and now >= next_mouse_move_at:
+                self._human_interaction.move_to_fallback(tab)
+                next_mouse_move_at = time.monotonic() + random.uniform(2.5, 5.0)
+            time.sleep(0.5)
+        LOGGER.warning(
+            "[Shopee][登录后首页标志超时] 店铺=%s，等待 %.1f 秒未找到 xpath=%s，继续后续流程",
+            store_name,
+            SHOPEE_LOGIN_HOME_MARKER_WAIT_SECONDS,
+            SHOPEE_LOGIN_HOME_MARKER_XPATH,
+        )
+        return False
 
     def _open_ad_page(self, tab: Any, store_name: str) -> str:
         """打开广告入口并取得包含 Shopee 动态参数和 group 的完整模板 URL。"""
@@ -1490,11 +1663,12 @@ class ShopeeAuto:
 
         raise RuntimeError(f"原始点击和父节点/JS回退均失败：{first_error}")
 
-    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
-        """等待 Shopee 主文档加载完成。"""
+    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float, human_mouse: bool = False) -> bool:
+        """等待 Shopee 主文档加载完成；登录后首页可选间歇移动鼠标。"""
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
         last_state = ""
+        next_mouse_move_at = started_at + random.uniform(2.0, 4.0)
         LOGGER.info("[Shopee][页面等待] 等待 document.readyState=complete，最长 %.1f 秒", timeout_seconds)
         while time.monotonic() < deadline:
             try:
@@ -1507,6 +1681,11 @@ class ShopeeAuto:
                     return True
             except Exception as exc:
                 LOGGER.warning("[Shopee][页面异常] 读取 document.readyState 失败：%s", exc)
+            if human_mouse:
+                now = time.monotonic()
+                if now >= next_mouse_move_at and self._human_interaction.enabled:
+                    self._human_interaction.move_to_fallback(tab)
+                    next_mouse_move_at = time.monotonic() + random.uniform(2.5, 5.0)
             time.sleep(1)
         LOGGER.error("[Shopee][页面超时] 等待 %.1f 秒仍未加载完成，本轮页面加载判定失败", timeout_seconds)
         return False

@@ -17,6 +17,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
@@ -459,6 +460,7 @@ class MercadoAuto:
     ) -> None:
         """点击按钮并等待下一目标；目标未出现时重新查找并点击上一按钮。"""
         for attempt in range(1, max_attempts + 1):
+            self._log_login_debug_state(tab, f"{step_name} 第{attempt}次点击前")
             if self._find_visible_element(tab, next_xpath, timeout=0.5):
                 LOGGER.info(
                     "[美客多][登录步骤成功] 步骤=%s，%s 已出现，无需重复点击",
@@ -475,7 +477,7 @@ class MercadoAuto:
                 wait_timeout,
                 click_xpath,
             )
-            button = self._wait_for_visible_element(tab, click_xpath, wait_timeout)
+            button = self._wait_for_clickable_element(tab, click_xpath, wait_timeout)
             if not button:
                 LOGGER.warning(
                     "[美客多][登录按钮未出现] 步骤=%s，第 %s/%s 次",
@@ -486,10 +488,9 @@ class MercadoAuto:
                 continue
             try:
                 self._wait_before_login_button_click(step_name)
-                try:
-                    self._human_interaction.click_element(tab, button)
-                except Exception:
-                    button.click()
+                self._log_login_element(button, step_name, "点击前")
+                self._click_login_button(tab, button, step_name)
+                self._log_login_debug_state(tab, f"{step_name} 点击后立即")
             except Exception as exc:
                 LOGGER.warning(
                     "[美客多][登录按钮点击失败] 步骤=%s，第 %s/%s 次，异常=%s",
@@ -507,7 +508,7 @@ class MercadoAuto:
                 max_attempts,
                 next_name,
             )
-            if self._wait_for_visible_element(tab, next_xpath, wait_timeout):
+            if self._wait_for_login_target(tab, next_xpath, wait_timeout, step_name, next_name):
                 LOGGER.info(
                     "[美客多][登录步骤成功] 步骤=%s，第 %s/%s 次，%s 已出现",
                     step_name,
@@ -525,6 +526,7 @@ class MercadoAuto:
                 wait_timeout,
                 next_name,
             )
+            self._log_login_debug_state(tab, f"{step_name} 等待{next_name}超时")
 
         raise RuntimeError(
             f"美客多登录步骤“{step_name}”连续 {max_attempts} 次未成功，未出现{next_name}"
@@ -552,7 +554,7 @@ class MercadoAuto:
                 wait_timeout,
                 click_xpath,
             )
-            button = self._wait_for_visible_element(tab, click_xpath, wait_timeout)
+            button = self._wait_for_clickable_element(tab, click_xpath, wait_timeout)
             if not button:
                 LOGGER.warning(
                     "[美客多][确认登录按钮未出现] 店铺=%s，第 %s/%s 次",
@@ -563,10 +565,9 @@ class MercadoAuto:
                 continue
             try:
                 self._wait_before_login_button_click("确认登录")
-                try:
-                    self._human_interaction.click_element(tab, button)
-                except Exception:
-                    button.click()
+                self._log_login_element(button, "确认登录", "点击前")
+                self._click_login_button(tab, button, "确认登录")
+                self._log_login_debug_state(tab, "确认登录点击后立即")
             except Exception as exc:
                 LOGGER.warning(
                     "[美客多][确认登录按钮点击失败] 店铺=%s，第 %s/%s 次，异常=%s",
@@ -616,6 +617,7 @@ class MercadoAuto:
                 if homepage_settle_seconds > 0:
                     time.sleep(homepage_settle_seconds)
                 return
+            self._log_login_debug_state(tab, f"确认登录第{attempt}次后仍在登录页")
             LOGGER.warning(
                 "[美客多][确认登录重试] 店铺=%s，第 %s/%s 次点击后 %.1f 秒内未确认进入首页",
                 store_name,
@@ -649,6 +651,181 @@ class MercadoAuto:
                 return element
             time.sleep(0.5)
         return None
+
+    def _wait_for_clickable_element(self, tab: Any, xpath: str, timeout_seconds: float) -> Any:
+        """等待元素同时满足可见、未禁用和具备可点击状态。"""
+        deadline = time.monotonic() + timeout_seconds
+        last_disabled_log_at = 0.0
+        while time.monotonic() < deadline:
+            element = self._find_visible_element(tab, xpath, timeout=min(1.0, max(0.1, deadline - time.monotonic())))
+            if element and self._element_is_enabled(element):
+                return element
+            if element and time.monotonic() - last_disabled_log_at >= 2.0:
+                LOGGER.info("[美客多][登录按钮等待] xpath=%s 已出现但暂不可点击，继续等待启用", xpath)
+                last_disabled_log_at = time.monotonic()
+            time.sleep(0.25)
+        return None
+
+    @staticmethod
+    def _element_is_enabled(element: Any) -> bool:
+        """兼容不同 DrissionPage 版本判断元素是否被 disabled 或 aria-disabled。"""
+        try:
+            states = getattr(element, "states", None)
+            enabled = getattr(states, "is_enabled", None) if states is not None else None
+            if callable(enabled):
+                enabled = enabled()
+            if enabled is False:
+                return False
+            disabled_attr = str(element.attr("disabled") or "").strip().casefold()
+            if disabled_attr and disabled_attr not in {"false", "0", "none"}:
+                return False
+            aria_disabled = str(element.attr("aria-disabled") or "").strip().casefold()
+            if aria_disabled in {"true", "1", "disabled"}:
+                return False
+            try:
+                result = element.run_js(
+                    "const e=this; return !!e && !e.disabled && "
+                    "e.getAttribute('aria-disabled') !== 'true' && "
+                    "getComputedStyle(e).pointerEvents !== 'none';"
+                )
+                if result is False:
+                    return False
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return True
+
+    def _click_login_button(self, tab: Any, button: Any, step_name: str) -> None:
+        """先执行真人鼠标移动，再用元素原生点击确保登录表单事件被触发。"""
+        if self._human_interaction.enabled:
+            self._human_interaction.move_to_element(tab, button)
+        try:
+            # 登录表单按钮优先使用 DrissionPage 原生点击，避免 CDP 坐标在页面过渡期间命中错误层。
+            button.click()
+            LOGGER.info("[美客多][登录按钮点击派发] 步骤=%s，已调用元素原生 click", step_name)
+        except Exception as native_error:
+            LOGGER.warning(
+                "[美客多][登录按钮原生点击失败] 步骤=%s，异常=%s，改用真人 CDP 点击",
+                step_name,
+                native_error,
+            )
+            self._human_interaction.click_element(tab, button)
+
+    def _wait_for_login_target(
+        self,
+        tab: Any,
+        xpath: str,
+        timeout_seconds: float,
+        step_name: str,
+        target_name: str,
+    ) -> Any:
+        """等待登录后续目标，并按固定间隔输出诊断快照。"""
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        next_log_at = started_at
+        while time.monotonic() < deadline:
+            element = self._find_visible_element(tab, xpath, timeout=0.5)
+            now = time.monotonic()
+            if element:
+                LOGGER.info(
+                    "[美客多][登录目标出现] 步骤=%s，目标=%s，耗时=%.2f秒，xpath=%s",
+                    step_name,
+                    target_name,
+                    now - started_at,
+                    xpath,
+                )
+                self._log_login_element(element, target_name, "出现后")
+                return element
+            if now >= next_log_at:
+                self._log_login_debug_state(tab, f"{step_name} 等待{target_name} {now - started_at:.1f}秒")
+                next_log_at = now + 1.0
+            time.sleep(0.25)
+        return None
+
+    @staticmethod
+    def _log_login_element(element: Any, step_name: str, phase: str) -> None:
+        """输出登录按钮的关键 DOM 状态，不输出完整 HTML 或敏感内容。"""
+        try:
+            states = getattr(element, "states", None)
+            enabled = getattr(states, "is_enabled", None) if states is not None else None
+            if callable(enabled):
+                enabled = enabled()
+            rect = getattr(element, "rect", None)
+            location = getattr(rect, "viewport_location", None) if rect is not None else None
+            size = getattr(rect, "size", None) if rect is not None else None
+            LOGGER.info(
+                "[美客多][登录按钮状态] 步骤=%s，阶段=%s，text=%r，type=%r，aria-labelledby=%r，"
+                "disabled=%r，aria-disabled=%r，enabled=%r，位置=%r，尺寸=%r",
+                step_name,
+                phase,
+                str(getattr(element, "text", "") or "").strip()[:120],
+                element.attr("type"),
+                element.attr("aria-labelledby"),
+                element.attr("disabled"),
+                element.attr("aria-disabled"),
+                enabled,
+                location,
+                size,
+            )
+        except Exception as exc:
+            LOGGER.warning("[美客多][登录按钮状态读取失败] 步骤=%s，阶段=%s，异常=%s", step_name, phase, exc)
+
+    @staticmethod
+    def _log_login_debug_state(tab: Any, stage: str) -> None:
+        """输出验证码后登录阶段的页面状态快照；URL 只保留协议、域名和路径。"""
+        try:
+            state = tab.run_js(
+                """
+                const compact = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+                const info = (button) => {
+                  const rect = button.getBoundingClientRect();
+                  const style = getComputedStyle(button);
+                  return {
+                    text: compact(button.innerText),
+                    type: button.getAttribute('type') || '',
+                    labelledby: button.getAttribute('aria-labelledby') || '',
+                    disabled: !!button.disabled,
+                    ariaDisabled: button.getAttribute('aria-disabled') || '',
+                    display: style.display,
+                    visibility: style.visibility,
+                    pointerEvents: style.pointerEvents,
+                    rect: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+                  };
+                };
+                return {
+                  readyState: document.readyState,
+                  submitButtons: [...document.querySelectorAll('button[type="submit"]')].map(info),
+                  loginTypeButtons: [...document.querySelectorAll('button[aria-labelledby="password_validation-content"]')].map(info),
+                  iframeCount: document.querySelectorAll('iframe').length,
+                  visibleText: compact(document.body ? document.body.innerText : '')
+                };
+                """
+            )
+            current_url = ""
+            try:
+                current_url = getattr(tab, "url", "")
+                if callable(current_url):
+                    current_url = current_url()
+                current_url = str(current_url or "").strip()
+            except Exception:
+                current_url = ""
+            parsed = urlsplit(current_url)
+            safe_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else "<空>"
+            if len(safe_url) > 240:
+                safe_url = safe_url[:237] + "..."
+            if isinstance(state, dict):
+                # 页面正文只保留长度，避免日志写入账号、邮箱或业务数据。
+                state = dict(state)
+                state["visibleTextLength"] = len(str(state.pop("visibleText", "")))
+            LOGGER.info(
+                "[美客多][登录诊断] 阶段=%s，安全URL=%s，状态=%s",
+                stage,
+                safe_url,
+                json.dumps(state, ensure_ascii=False, default=str),
+            )
+        except Exception as exc:
+            LOGGER.warning("[美客多][登录诊断失败] 阶段=%s，异常=%s", stage, exc)
 
     def _has_left_login_page(self, tab: Any) -> bool:
         """当前 URL 不再属于登录路径时视为已经开始进入首页。"""

@@ -389,6 +389,7 @@ class MercadoRecaptchaSolver:
             except Exception as exc:
                 last_error = exc
                 LOGGER.warning("[美客多][验证码] 第 %s 次识别失败：%s", attempt + 1, exc)
+                LOGGER.debug("[美客多][验证码] 第 %s 次识别失败：%s", attempt + 1, exc)
                 if attempt < self.max_retry - 1:
                     time.sleep(self.retry_interval)
 
