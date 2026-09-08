@@ -209,6 +209,11 @@ platforms:
       today: true
       7d: true
       30d: true
+    ad_capture:
+      # 经营指标抓取完成后，是否监听广告概览接口。
+      enabled: true
+      page_url: "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
+      request_timeout_seconds: 60
   meicado:
     crawler: "mercado.MKD_auto:MercadoAuto"
 

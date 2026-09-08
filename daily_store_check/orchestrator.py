@@ -362,18 +362,37 @@ MERCADO_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 )
 MERCADO_MESSAGE_GROUPS += (
     ("今天经营数据", tuple((label, field.replace("7天", "今天")) for label, field in MERCADO_MESSAGE_GROUPS[0][1])),
+    (
+        "今天广告数据",
+        (
+            ("销售额", "今天广告销售额"),
+            ("曝光数", "今天广告曝光数"),
+            ("访客数", "今天广告访客数"),
+            ("新粉丝数", "今天广告新粉丝数"),
+            ("广告成本", "今天广告成本"),
+            ("点击量", "今天广告点击量"),
+            ("销售量", "今天广告销售量"),
+        ),
+    ),
 )
 
-# 美客多历史电子表暂时只保留原有 7 天和 30 天字段；“今天”只用于消息发送，
-# 不能追加到既有电子表或多维表，避免表头未建立导致写入失败。
+# 美客多电子表保留原有 7 天和 30 天经营字段，并追加今天广告接口的 7 个字段；
+# 今天经营指标仍只用于机器人消息，广告字段暂不写入多维表。
 MERCADO_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
     "店铺名",
     *(
         field_name
         for group_name, metric_specs in MERCADO_MESSAGE_GROUPS
-        if group_name != "今天经营数据"
+        if group_name not in {"今天经营数据", "今天广告数据"}
         for _, field_name in metric_specs
     ),
+    "今天广告销售额",
+    "今天广告曝光数",
+    "今天广告访客数",
+    "今天广告新粉丝数",
+    "今天广告成本",
+    "今天广告点击量",
+    "今天广告销售量",
     "采集时间",
 )
 
@@ -388,6 +407,8 @@ MERCADO_CURRENCY_FIELDS: frozenset[str] = frozenset(
         "30天平均单价",
         "30天取消的销售价值",
         "30天退货价值",
+        "今天广告销售额",
+        "今天广告成本",
     }
 )
 MERCADO_CURRENCY_FIELDS = MERCADO_CURRENCY_FIELDS | frozenset(
@@ -404,6 +425,15 @@ MERCADO_INTEGER_FIELDS: frozenset[str] = frozenset(
 )
 MERCADO_INTEGER_FIELDS = MERCADO_INTEGER_FIELDS | frozenset(
     field.replace("7天", "今天") for field in MERCADO_INTEGER_FIELDS
+)
+MERCADO_INTEGER_FIELDS = MERCADO_INTEGER_FIELDS | frozenset(
+    {
+        "今天广告曝光数",
+        "今天广告访客数",
+        "今天广告新粉丝数",
+        "今天广告点击量",
+        "今天广告销售量",
+    }
 )
 
 
@@ -1130,7 +1160,7 @@ class DailyStoreCheck:
             if isinstance(spreadsheet_cfg, dict):
                 token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
                 sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-                range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AF"}
+                range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AM"}
                 range_end = range_end_by_platform.get(task.platform, "Z")
                 range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
                 self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
@@ -1699,7 +1729,12 @@ class DailyStoreCheck:
         title = f"{store_name} mercado 推送数据 - {date_text}"
         lines: list[str] = []
         for group_name, metric_specs in MERCADO_MESSAGE_GROUPS:
-            period = "30天" if "30" in group_name else "7天"
+            if group_name == "今天广告数据":
+                period = "今天"
+            elif group_name == "今天经营数据":
+                period = "今天"
+            else:
+                period = "30天" if "30" in group_name else "7天"
             if not is_period_enabled(platform_config, period):
                 continue
             lines.append(f"### {group_name}")

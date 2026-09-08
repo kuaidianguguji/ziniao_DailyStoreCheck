@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
 from daily_store_check.human_interaction import HumanInteraction
+from mercado.ad_capture import MercadoAdCapture
 from mercado.recaptcha_solver import MercadoRecaptchaSolver
 
 
@@ -180,6 +181,7 @@ class MercadoAuto:
         """保存美客多独立配置；指标 XPath 直接维护在本文件的 METRIC_SPECS。"""
         self.config = config or {}
         self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
+        self._ad_capture = MercadoAdCapture(self.config.get("ad_capture", {}))
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，读取今天、7 天和 30 天经营指标。"""
@@ -193,7 +195,7 @@ class MercadoAuto:
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
         feishu_fields: dict[str, Any] = {}
-        raw_values: dict[str, str] = {}
+        raw_values: dict[str, Any] = {}
 
         # 先确认紫鸟打开的美客多初始店铺页已经完整加载，避免登录状态尚未建立就跳转。
         if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "紫鸟初始店铺页"):
@@ -252,6 +254,14 @@ class MercadoAuto:
                         raw_text,
                         value_kind,
                     )
+
+        # 经营指标全部读取完成后，才启动广告页精准监听；广告接口不使用 requests 重放。
+        if is_period_enabled(self.config, "今天"):
+            ad_fields, ad_summary = self._ad_capture.collect_today(tab, store_name)
+            feishu_fields.update(ad_fields)
+            raw_values["今天广告接口"] = ad_summary
+        else:
+            LOGGER.info("[美客多][广告] 店铺=%s，今天时间范围已关闭，跳过广告页监听", store_name)
 
         # “飞书字段”由 orchestrator 合并进已建立的同名多维表字段。
         # 标准字段仍保留，便于历史电子表和旧版数据表兼容。
