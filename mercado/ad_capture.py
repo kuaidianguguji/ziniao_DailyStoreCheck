@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+import random
 import time
 from datetime import datetime
 from typing import Any
@@ -17,6 +19,8 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_AD_PAGE_URL = "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
 DEFAULT_FALLBACK_REQUEST_TIMEOUT_SECONDS = 60.0
+DEFAULT_FALLBACK_DOUBLE_CLICK_MIN_INTERVAL_MS = 80.0
+DEFAULT_FALLBACK_DOUBLE_CLICK_MAX_INTERVAL_MS = 180.0
 TARGET_PATH_RE = re.compile(r"^/advertiser-hub/api/general-metrics/([^/]+)/chart$")
 FALLBACK_PATH_RE = re.compile(r"^/pa/api/admin-pads/ajax/campaigns/search$")
 PERIOD_BUTTON_XPATH = '//div[@class="andes-floating-menu"]//button[@aria-label="Período" or @aria-label="周期"]'
@@ -50,6 +54,33 @@ class MercadoAdCapture:
             1.0,
             float(config.get("fallback_request_timeout_seconds", DEFAULT_FALLBACK_REQUEST_TIMEOUT_SECONDS) or DEFAULT_FALLBACK_REQUEST_TIMEOUT_SECONDS),
         )
+        self.fallback_double_click_min_interval_ms = self._read_non_negative_float(
+            config.get(
+                "fallback_double_click_min_interval_ms",
+                DEFAULT_FALLBACK_DOUBLE_CLICK_MIN_INTERVAL_MS,
+            ),
+            DEFAULT_FALLBACK_DOUBLE_CLICK_MIN_INTERVAL_MS,
+        )
+        self.fallback_double_click_max_interval_ms = self._read_non_negative_float(
+            config.get(
+                "fallback_double_click_max_interval_ms",
+                DEFAULT_FALLBACK_DOUBLE_CLICK_MAX_INTERVAL_MS,
+            ),
+            DEFAULT_FALLBACK_DOUBLE_CLICK_MAX_INTERVAL_MS,
+        )
+        if self.fallback_double_click_min_interval_ms > self.fallback_double_click_max_interval_ms:
+            LOGGER.warning(
+                "[美客多][广告备用双击配置] 最小间隔 %.1fms 大于最大间隔 %.1fms，已自动交换",
+                self.fallback_double_click_min_interval_ms,
+                self.fallback_double_click_max_interval_ms,
+            )
+            (
+                self.fallback_double_click_min_interval_ms,
+                self.fallback_double_click_max_interval_ms,
+            ) = (
+                self.fallback_double_click_max_interval_ms,
+                self.fallback_double_click_min_interval_ms,
+            )
 
     def collect_today(self, tab: Any, store_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """跳转广告页并返回飞书字段、原始响应摘要。"""
@@ -126,7 +157,7 @@ class MercadoAdCapture:
             today = self._wait_element(tab, TODAY_CALENDAR_XPATH, 10.0)
             if today is None:
                 raise TimeoutError("美客多广告备用流程未找到今天日期按钮")
-            self._click_element(today, tab, "选择今天日期")
+            self._double_click_element(today, tab, "选择今天日期")
             packet = self._wait_for_fallback_packet(listener, store_name)
             payload = self._packet_json(packet, store_name)
             fields, summary = self._extract_fallback(payload, store_name)
@@ -161,6 +192,39 @@ class MercadoAdCapture:
                 element.run_js("this.click()")
             except Exception as exc:
                 raise RuntimeError(f"{action_name}失败：{exc}") from exc
+
+    def _double_click_element(self, element: Any, tab: Any, action_name: str) -> None:
+        """以随机间隔连续点击两次日期元素，兼容第一次点击后的节点重绘。"""
+        self._click_element(element, tab, f"{action_name}第1次点击")
+        interval_ms = random.uniform(
+            self.fallback_double_click_min_interval_ms,
+            self.fallback_double_click_max_interval_ms,
+        )
+        LOGGER.info(
+            "[美客多][广告备用双击] 步骤=%s，第1次点击完成，随机间隔=%.1fms",
+            action_name,
+            interval_ms,
+        )
+        time.sleep(interval_ms / 1000.0)
+
+        # 日期控件第一次点击后可能整体重绘，第二次点击前重新查找最新节点。
+        second_element = self._wait_element(tab, TODAY_CALENDAR_XPATH, 2.0)
+        if second_element is None:
+            second_element = element
+            LOGGER.warning(
+                "[美客多][广告备用双击] 步骤=%s，第二次查找未找到日期节点，回退使用第一次节点",
+                action_name,
+            )
+        else:
+            LOGGER.info(
+                "[美客多][广告备用双击] 步骤=%s，第二次点击已重新定位日期节点",
+                action_name,
+            )
+        self._click_element(second_element, tab, f"{action_name}第2次点击")
+        LOGGER.info(
+            "[美客多][广告备用双击] 步骤=%s，第2次点击完成",
+            action_name,
+        )
 
     def _wait_for_fallback_packet(self, listener: Any, store_name: str) -> Any:
         deadline = time.monotonic() + self.fallback_request_timeout_seconds
@@ -306,3 +370,14 @@ class MercadoAdCapture:
     def _safe_url(url: str) -> str:
         parsed = urlsplit(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else "<空网址>"
+
+    @staticmethod
+    def _read_non_negative_float(value: Any, default: float) -> float:
+        """读取非负浮点配置，非法值回退默认值。"""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(parsed) or parsed < 0:
+            return default
+        return parsed

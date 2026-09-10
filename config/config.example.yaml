@@ -184,6 +184,10 @@ platforms:
       # 验证码成功后的登录按钮流程；每次点击后等待下一目标，超时则重新点击上一按钮。
       post_captcha_wait_seconds: 1
       captcha_success_submit_button_xpath: '//button[@type="submit"]'
+      # 身份识别页面账号输入框的稳定 XPath；不要使用动态 id。
+      account_input_xpath: '//form[contains(@class,"identification-form")]//input[@data-andes-textfield-input="true" and @data-andes-textfield-input-type="input"]'
+      # 按当前任务店铺名称填写账号；请在本机配置文件中自行补充账号。
+      account_by_store: {}
       login_type_button_xpath: '//button[@aria-labelledby="password_validation-content"]'
       confirm_login_button_xpath: '//button[@type="submit"]'
       login_step_wait_timeout_seconds: 10
@@ -215,6 +219,9 @@ platforms:
       page_url: "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
       request_timeout_seconds: 60
       fallback_request_timeout_seconds: 60
+      # 点击今天日期按钮时两次点击之间的随机间隔，单位为毫秒。
+      fallback_double_click_min_interval_ms: 80
+      fallback_double_click_max_interval_ms: 180
   meicado:
     crawler: "mercado.MKD_auto:MercadoAuto"
 
