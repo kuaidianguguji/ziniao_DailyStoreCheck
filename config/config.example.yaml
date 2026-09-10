@@ -214,6 +214,7 @@ platforms:
       enabled: true
       page_url: "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
       request_timeout_seconds: 60
+      fallback_request_timeout_seconds: 60
   meicado:
     crawler: "mercado.MKD_auto:MercadoAuto"
 
