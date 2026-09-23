@@ -35,7 +35,7 @@ ziniao_DailyStoreCheck_codex_two/
 5. `ZiniaoStoreSession` 严格调用官方 `startBrowser` 打开一间店铺，连接 WebDriver，完成 `ipDetectionPage` 检测后打开 `launcherPage`；当前紫鸟 V6 环境中先 `driver.quit` 会使 16851 IPC 失联，因此 `with` 结束时先调用官方 `stopBrowser` 确认关闭店铺，再清理 WebDriver 会话。
 6. `_load_crawler` 根据配置动态载入 `TK_auto.py`、`SP_auto.py` 或 `MKD_auto.py`。
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
-8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。
+8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。写入前，`_save_store_capture` 已把该店原始结果保存到 `data/captures`。
 9. `_safe_notify` 根据“推送人员”的 `open_id` 使用应用机器人定向推送；没有人员 ID 时可退回 webhook。
 10. TikTok、Shopee、美客多店铺的原始消息发送且紫鸟店铺关闭成功后，主流程立即把该店完整数据提交到独立 DeepSeek 线程池，并释放采集线程启动下一个店铺。三个平台共用密钥、模型和并发数，分别使用独立系统提示词；当前 TikTok 和美客多暂时回退到虾皮提示词。单店结果以 Markdown 回发对应运营人员；全部单店分析完成后仍会分析非空 `ALL_info`，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送汇总结果。
 11. `_cleanup_retention` 清理三张短期多维表中的过期数据，并退出紫鸟客户端。
@@ -59,6 +59,8 @@ ziniao_DailyStoreCheck_codex_two/
 - `platforms.tiktok.periods`、`platforms.shopee.periods`：分别控制今天、昨天、7天是否抓取；每项为布尔值，缺省时默认开启。
 - `platforms.mercado.periods`：控制今天、7天、30天是否抓取；每项为布尔值，缺省时默认开启。
 - `deepseek.single_store_enabled`：是否在每个平台单店原始消息后调用 DeepSeek 并回发分析；设为 `false` 时只跳过单店分析，不影响原始数据推送和整轮汇总。
+- `output_dir`：日志和本机采集结果目录，默认 `data`。
+- `capture_retention_days`：`output_dir/captures` 中采集 JSON 的保留天数，默认 90 天。
 - `retention_days`：短期多维表保留天数。
 - `platforms.*.crawler`：平台到 Python 爬虫类的映射，格式 `模块:类名`。
 
@@ -131,8 +133,9 @@ ziniao_DailyStoreCheck_codex_two/
 - `_run_concurrent_stores`：按固定并发数滚动提交店铺任务；店铺关闭后立即提交 AI 分析并补充下一个采集任务，结果仍按控制表顺序写入 `ALL_info`。
 - `_find_browser_identifier`：先执行 Unicode/空白归一化后的精确匹配；失败后提取 `tiktok/TK`、`shopee/虾皮`、`mercado/美客多`及店号，按“平台:店号”匹配，支持公司名前缀、空格和末尾“店”等紫鸟名称差异。
 - `_load_crawler`：动态加载平台类，新增平台时不需要修改循环逻辑。
+- `_save_store_capture`：采集完成后、写飞书前，把店铺原始结果写入 `output_dir/captures`。
 - `_write_feishu`：一份标准爬虫结果同时转换为多维表记录和电子表行。
-- `_cleanup_retention`：只清理短期多维表。
+- `_cleanup_retention`：只清理短期多维表，并按 `capture_retention_days` 删除过期的本机采集 JSON。
 - `_safe_notify`：消息推送失败不会阻断下一个店铺。
 - `_extract_all_info_values`：统一提取三个平台的全部指标，空指标也保留在 `ALL_info` 中方便排错。
 - `_send_all_info_summary`：整轮任务末尾调用 DeepSeek 分析非空 `ALL_info`，再把返回 Markdown 通过 interactive 卡片发送给全部 `summary_recipients`。
@@ -146,7 +149,7 @@ ziniao_DailyStoreCheck_codex_two/
 
 ### `run_daily_store_check.py`
 
-- `configure_logging`：控制台和 5 MB 滚动文件日志，保留 5 个备份。
+- `configure_logging`：控制台显示全部信息。`daily_store_check.log` 只保留警告和错误，避免选择器明细滚掉失败记录；`daily_store_check.debug.log` 只保留平台爬虫和业务流程的普通明细。
 - `wait_for_schedule`：按配置时区等待每日时间，每 60 秒重新计算一次；一轮完成后即使当前仍早于当天计划时间，也会等待到第二天，避免同一天重复运行。
 - `--run-now`：立即执行第一轮，完成后不退出，继续常驻等待第二天的计划时间。
 - `--once`：明确要求执行一轮后退出；临时测试通常组合使用 `--run-now --once`。

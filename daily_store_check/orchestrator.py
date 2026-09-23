@@ -11,9 +11,10 @@ import time
 import unicodedata
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from .config import StoreTask, is_period_enabled, normalise_platform
+from .config import PROJECT_ROOT, StoreTask, is_period_enabled, normalise_platform
 from .deepseek_client import DeepSeekClient
 from .feishu_client import FeishuClient
 from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
@@ -713,6 +714,11 @@ class DailyStoreCheck:
                 collected_at, metric_values = self._extract_all_info_values(rows)
                 store_info["采集时间"] = collected_at
                 store_info["数据"] = metric_values
+                # 先落本机，再写飞书。飞书失败时不必重新打开紫鸟店铺；落盘失败也不丢弃已采集结果。
+                try:
+                    self._save_store_capture(task, rows, store_info)
+                except Exception:
+                    LOGGER.exception("[采集][本机保存失败] 店铺=%s，继续写入飞书", task.store_name)
                 self._write_feishu(task, rows)
                 platform_config = self.config.get("platforms", {}).get(task.platform, {})
                 if task.platform == "tiktok":
@@ -740,6 +746,37 @@ class DailyStoreCheck:
             store_info["错误"] = str(exc)
             self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", str(exc))
         return store_info
+
+    def _save_store_capture(
+        self,
+        task: StoreTask,
+        rows: list[dict[str, Any]],
+        store_info: dict[str, Any],
+    ) -> None:
+        """把已采集的店铺结果写入本机 JSON，供飞书或消息失败后补写。"""
+        output_dir = PROJECT_ROOT / str(self.config.get("data", {}).get("output_dir", "data") or "data")
+        capture_dir = output_dir / "captures"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        collected_at = store_info.get("采集时间") or datetime.now(timezone.utc).isoformat()
+        timestamp = re.sub(r"[^0-9]", "", str(collected_at))[:14] or datetime.now().strftime("%Y%m%d%H%M%S")
+        safe_name = re.sub(r'[<>:"/\\|?*\s]+', "_", task.store_name).strip("._") or "store"
+        path = capture_dir / f"{timestamp}_{task.platform}_{safe_name}.json"
+        suffix = 2
+        while path.exists():
+            path = capture_dir / f"{timestamp}_{task.platform}_{safe_name}_{suffix}.json"
+            suffix += 1
+        payload = {
+            "店铺名": task.store_name,
+            "平台": task.platform,
+            "采集时间": collected_at,
+            "推送人员": task.recipient,
+            "数据": store_info.get("数据", {}),
+            "原始结果": rows,
+        }
+        temporary_path = path.with_suffix(".json.tmp")
+        temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        temporary_path.replace(path)
+        LOGGER.info("[采集][本机已保存] 店铺=%s，平台=%s，文件=%s", task.store_name, task.platform, path.name)
 
     @staticmethod
     def _extract_all_info_values(rows: list[dict[str, Any]]) -> tuple[Any, dict[str, Any]]:
@@ -1593,6 +1630,27 @@ class DailyStoreCheck:
                 removed = self.feishu.remove_old_records(table_id, fields.get("collected_at", "采集时间"), retention, app_token=app_token)
                 if removed:
                     LOGGER.info("平台 %s 清理旧数据 %s 条", platform, removed)
+        self._cleanup_old_captures()
+
+    def _cleanup_old_captures(self) -> None:
+        """删除超过保留天数的本机采集 JSON，避免 data/captures 无限增长。"""
+        data_config = self.config.get("data", {})
+        retention_days = int(data_config.get("capture_retention_days", data_config.get("retention_days", 90)) or 90)
+        output_dir = PROJECT_ROOT / str(data_config.get("output_dir", "data") or "data")
+        capture_dir = output_dir / "captures"
+        if not capture_dir.is_dir():
+            return
+        cutoff = time.time() - retention_days * 24 * 60 * 60
+        removed = 0
+        for path in capture_dir.glob("*.json"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                LOGGER.warning("[采集][本机清理失败] 文件=%s", path.name, exc_info=True)
+        if removed:
+            LOGGER.info("[采集][本机清理] 删除超过 %s 天的采集文件 %s 个", retention_days, removed)
 
     @staticmethod
     def _format_tiktok_notification(

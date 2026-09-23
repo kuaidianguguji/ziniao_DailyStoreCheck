@@ -78,6 +78,8 @@ python run_daily_store_check.py --run-now
 python run_daily_store_check.py --run-now --once
 ```
 
+每家店铺采集成功后，原始结果先写入 `data/captures`，再写入飞书。飞书写入失败时可以直接用对应 JSON 补写，不必重新打开紫鸟店铺。`data/daily_store_check.log` 只保留警告和错误；点击、XPath 和原始值写在 `data/daily_store_check.debug.log`。
+
 ## 扩展脚本
 ### 一、增加亚马逊店铺任务
 1、创建脚本文件，例如： feedback_export.py

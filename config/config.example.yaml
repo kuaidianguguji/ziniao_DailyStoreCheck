@@ -146,6 +146,8 @@ data:
   retention_days: 90
   request_timeout_seconds: 30
   output_dir: "data"
+  # 采集结果在写飞书前保存到 output_dir/captures，保留最近这么多天，默认与多维表一致。
+  capture_retention_days: 90
 
 platforms:
   tiktok:

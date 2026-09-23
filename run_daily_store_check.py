@@ -19,16 +19,61 @@ from daily_store_check.config import PROJECT_ROOT, load_config
 from daily_store_check.orchestrator import DailyStoreCheck
 
 
+# 平台爬虫会记录每次点击、XPath 和原始值。这些明细只进调试日志，
+# 避免一轮运行把主日志里的失败记录滚掉。
+CRAWLER_LOGGER_NAMES = (
+    "tiktok",
+    "shopee",
+    "mercado",
+)
+
+
+class _BelowWarningFilter(logging.Filter):
+    """只保留普通运行明细，警告和错误留给业务日志。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
+
+
 def configure_logging(config: dict) -> None:
-    """同时输出控制台和滚动日志，便于无人值守排查。"""
+    """业务日志只保留警告和错误；平台爬虫明细写入独立调试日志。"""
     output_dir = PROJECT_ROOT / config.get("data", {}).get("output_dir", "data")
     output_dir.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+
     console = logging.StreamHandler()
     console.setFormatter(formatter)
-    file_handler = RotatingFileHandler(output_dir / "daily_store_check.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logging.basicConfig(level=logging.INFO, handlers=[console, file_handler], force=True)
+
+    business_handler = RotatingFileHandler(
+        output_dir / "daily_store_check.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    business_handler.setLevel(logging.WARNING)
+    business_handler.setFormatter(formatter)
+
+    debug_handler = RotatingFileHandler(
+        output_dir / "daily_store_check.debug.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    debug_handler.setLevel(logging.INFO)
+    debug_handler.addFilter(_BelowWarningFilter())
+    debug_handler.setFormatter(formatter)
+
+    logging.basicConfig(level=logging.INFO, handlers=[console, business_handler, debug_handler], force=True)
+    for logger_name in CRAWLER_LOGGER_NAMES:
+        crawler_logger = logging.getLogger(logger_name)
+        for handler in list(crawler_logger.handlers):
+            crawler_logger.removeHandler(handler)
+        crawler_logger.setLevel(logging.INFO)
+        # 子日志会冒泡到这里后停止，因此 tiktok.TK_auto 这类明细不会再进入根日志。
+        crawler_logger.propagate = False
+        crawler_logger.addHandler(debug_handler)
+        crawler_logger.addHandler(business_handler)
+        crawler_logger.addHandler(console)
 
 
 def wait_for_schedule(schedule: dict, run_now: bool = False, force_next_day: bool = False) -> None:
