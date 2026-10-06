@@ -30,8 +30,8 @@ LOGGER = logging.getLogger(__name__)
 # 一、Shopee 广告页面 URL、等待参数和弹窗 XPath
 # ---------------------------------------------------------------------------
 
-# Shopee 登录页和卖家中心域名。URL 查询参数不参与判断。
-# 如果当前 URL 中包含 login，视为需要执行登录按钮点击流程。
+# Shopee 登录页和卖家中心域名。URL 查询参数和片段不参与判断。
+# 仅域名或路径中包含 login 时视为登录页，避免将 is_from_login=true 误判为未登录。
 SHOPEE_LOGIN_PAGE_URL = "https://accounts.shopee.com.br/seller/login"
 SHOPEE_SELLER_HOST = "seller.shopee.com.br"
 
@@ -1442,16 +1442,16 @@ class ShopeeAuto:
 
     @staticmethod
     def _classify_login_url(current_url: str) -> str:
-        """返回 not_logged_in、logged_in 或 unknown；URL 中出现 login 即视为登录页。"""
+        """根据域名和路径判断登录状态，忽略 is_from_login 等查询参数。"""
         url_text = str(current_url or "").strip()
-        if "login" in url_text.casefold():
-            return "not_logged_in"
         try:
             parsed = urlparse(url_text)
         except (TypeError, ValueError):
             return "unknown"
         host = parsed.netloc.casefold().split(":", 1)[0]
         path = parsed.path.rstrip("/").casefold()
+        if "login" in host or "login" in path:
+            return "not_logged_in"
         login_parsed = urlparse(SHOPEE_LOGIN_PAGE_URL)
         if host == login_parsed.netloc.casefold() and path == login_parsed.path.rstrip("/").casefold():
             return "not_logged_in"
