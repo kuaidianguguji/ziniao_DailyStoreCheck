@@ -154,7 +154,7 @@ class MercadoAdCapture:
             if custom is None:
                 raise TimeoutError("美客多广告备用流程未找到自定义时间按钮")
             self._click_element(custom, tab, "选择自定义时间")
-            today = self._wait_element(tab, TODAY_CALENDAR_XPATH, 10.0)
+            today = self._wait_element(tab, TODAY_CALENDAR_XPATH, 20.0)
             if today is None:
                 raise TimeoutError("美客多广告备用流程未找到今天日期按钮")
             self._double_click_element(today, tab, "选择今天日期")

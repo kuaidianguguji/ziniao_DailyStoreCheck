@@ -833,7 +833,7 @@ class DailyStoreCheck:
         )
         for recipient_name, receive_id in recipients.items():
             LOGGER.info("[飞书][DeepSeek汇总发送] 接收人姓名=%s，准备发送 AI 店铺分析", recipient_name)
-            self._safe_notify_markdown(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
+            self._safe_notify_markdown(receive_id, "DeepSeek全部店铺数据分析", analysis_text, compact=True)
 
     def _send_store_deepseek_analysis(self, recipient: str, store_info: dict[str, Any]) -> None:
         """原始平台消息发送完毕后，同步分析单店数据并回发同一运营人员。"""
@@ -1043,7 +1043,9 @@ class DailyStoreCheck:
         except Exception:
             LOGGER.exception("飞书消息推送失败 recipient=%s", recipient)
 
-    def _safe_notify_markdown(self, recipient: str, title: str, content: str) -> None:
+    def _safe_notify_markdown(
+        self, recipient: str, title: str, content: str, *, compact: bool = False,
+    ) -> None:
         """以 interactive Markdown 卡片发送 DeepSeek 汇总，失败时不影响任务收尾。"""
         try:
             LOGGER.info(
@@ -1052,7 +1054,10 @@ class DailyStoreCheck:
                 title,
                 content,
             )
-            self.feishu.send_robot_markdown_message(recipient, title, content)
+            if compact:
+                self.feishu.send_robot_markdown_message(recipient, title, content, compact=True)
+            else:
+                self.feishu.send_robot_markdown_message(recipient, title, content)
         except Exception:
             LOGGER.exception("飞书 Markdown 消息推送失败 recipient=%s", recipient)
 

@@ -26,6 +26,11 @@ LOGGER = logging.getLogger(__name__)
 # 拆分后按顺序发送，避免整个 interactive 请求因内容过长返回 HTTP 400。
 MARKDOWN_CARD_MAX_CHARS = 4000
 
+# 汇总卡片按实际请求体计算容量，在飞书的 30KB 限制内保留余量。
+SUMMARY_CARD_MAX_BYTES = 28 * 1024
+# 单个 Markdown 组件采用三张表格的保守预算，避免多表格渲染触发平台限制。
+SUMMARY_CARD_MAX_TABLES = 3
+
 # 连续发送多张分片卡片时保留短暂间隔，降低触发飞书消息频率限制的概率。
 MARKDOWN_CARD_SEND_INTERVAL_SECONDS = 0.5
 
@@ -455,7 +460,9 @@ class FeishuClient:
             raise RuntimeError(f"飞书机器人推送失败: {result}")
         LOGGER.info("[飞书][Webhook机器人成功] response=%s", self._json_for_log(result))
 
-    def send_robot_markdown_message(self, recipient: str, title: str, markdown_content: str) -> None:
+    def send_robot_markdown_message(
+        self, recipient: str, title: str, markdown_content: str, *, compact: bool = False,
+    ) -> None:
         """使用飞书 interactive 卡片把 Markdown 内容推送给指定接收人。
 
         应用机器人接口要求把 Card 2.0 JSON 序列化到 ``content`` 字符串中；
@@ -470,13 +477,25 @@ class FeishuClient:
             return
 
         title_text = str(title or "消息").strip()
-        markdown_parts = self._split_markdown_text(markdown_text, MARKDOWN_CARD_MAX_CHARS)
+        if compact:
+            # 应用机器人与 Webhook 的请求结构不同，容量检查必须使用实际发送方式。
+            app_message = bool(recipients and self.config.get("app_id") and self.config.get("app_secret"))
+            longest_recipient = max(recipients, key=lambda item: len(json.dumps(item))) if app_message else None
+            markdown_parts = self._pack_summary_markdown(
+                markdown_text,
+                title_text,
+                recipient=longest_recipient,
+                webhook_signed=bool(self.config.get("robot", {}).get("sign_secret")),
+            )
+        else:
+            markdown_parts = self._split_markdown_text(markdown_text, MARKDOWN_CARD_MAX_CHARS)
         total_parts = len(markdown_parts)
         LOGGER.info(
-            "[飞书][Markdown分片] recipient=%s，原文字符数=%s，单片上限=%s，分片数=%s",
+            "[飞书][Markdown分片] recipient=%s，原文字符数=%s，容量模式=%s，单片上限=%s，分片数=%s",
             recipient or "<空接收人>",
             len(markdown_text),
-            MARKDOWN_CARD_MAX_CHARS,
+            "请求体字节" if compact else "字符",
+            SUMMARY_CARD_MAX_BYTES if compact else MARKDOWN_CARD_MAX_CHARS,
             total_parts,
         )
 
@@ -571,6 +590,169 @@ class FeishuClient:
                 ]
             },
         }
+
+    @staticmethod
+    def _markdown_request_size(
+        title: str, markdown_text: str, *, recipient: str | None, webhook_signed: bool = False,
+    ) -> int:
+        """按 requests 的默认 JSON 序列化方式计算发送体字节数，包括中文转义。"""
+        card = FeishuClient._build_markdown_card(title, markdown_text)
+        if recipient is not None:
+            body = {
+                "receive_id": recipient,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            }
+        else:
+            body = {"msg_type": "interactive", "card": card}
+            if webhook_signed:
+                # 预留时间戳及 Base64 签名的完整长度，不读取或记录真实密钥。
+                body.update(timestamp="9999999999", sign="x" * 44)
+        return len(json.dumps(body, allow_nan=False).encode("utf-8"))
+
+    @staticmethod
+    def _pack_summary_markdown(
+        markdown_text: str,
+        title: str,
+        *,
+        recipient: str | None,
+        webhook_signed: bool = False,
+        max_bytes: int = SUMMARY_CARD_MAX_BYTES,
+        max_tables: int = SUMMARY_CARD_MAX_TABLES,
+    ) -> list[str]:
+        """顺序合并文字和表格，仅在请求体或表格预算不足时另开卡片。"""
+        text = str(markdown_text or "").strip()
+        if not text:
+            return []
+        if max_bytes <= 0 or max_tables <= 0:
+            raise ValueError("汇总卡片的字节预算和表格预算必须大于零")
+
+        # 分片编号也占容量；以原文字符数作为分片数上界预留编号宽度。
+        digits = "9" * len(str(len(text)))
+        budget_title = f"{title}（{digits}/{digits}）"
+
+        def fits(content: str, table_count: int) -> bool:
+            return table_count <= max_tables and FeishuClient._markdown_request_size(
+                budget_title, content, recipient=recipient, webhook_signed=webhook_signed,
+            ) <= max_bytes
+
+        if not fits("", 0):
+            raise ValueError("汇总卡片标题或接收人信息已超过消息容量预算")
+
+        lines = text.splitlines()
+        blocks: list[tuple[bool, str]] = []
+        index = 0
+        fence: str | None = None
+        plain_lines: list[str] = []
+        while index < len(lines):
+            line = lines[index]
+            fence_match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if fence_match:
+                marker = fence_match.group(1)
+                if fence is None:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence):
+                    fence = None
+            if (
+                fence is None and index + 1 < len(lines)
+                and line.lstrip().startswith("|")
+                and FeishuClient._is_markdown_table_separator(lines[index + 1])
+            ):
+                if plain_lines:
+                    blocks.append((False, "\n".join(plain_lines).strip()))
+                    plain_lines = []
+                table_lines = [line, lines[index + 1]]
+                index += 2
+                while index < len(lines) and lines[index].lstrip().startswith("|"):
+                    table_lines.append(lines[index])
+                    index += 1
+                blocks.append((True, "\n".join(table_lines)))
+            else:
+                plain_lines.append(line)
+                index += 1
+        if plain_lines:
+            blocks.append((False, "\n".join(plain_lines).strip()))
+
+        # 完整内容能容纳时直接保留原文，包括原有空行和缩进。
+        if fits(text, sum(is_table for is_table, _ in blocks)):
+            return [text]
+
+        parts: list[str] = []
+        current = ""
+        current_tables = 0
+
+        def join(block: str) -> str:
+            return f"{current}\n\n{block}" if current else block
+
+        def flush() -> None:
+            nonlocal current, current_tables
+            if current.strip():
+                parts.append(current.strip())
+            current = ""
+            current_tables = 0
+
+        for is_table, block in blocks:
+            if not block:
+                continue
+            extra_table = int(is_table)
+            if fits(join(block), current_tables + extra_table):
+                current = join(block)
+                current_tables += extra_table
+                continue
+
+            if is_table:
+                # 完整表格能单独容纳时保持完整，不为填满上一张卡片拆开表格。
+                if fits(block, 1):
+                    flush()
+                    current, current_tables = block, 1
+                    continue
+                table_lines = block.splitlines()
+                header = table_lines[:2]
+                rows: list[str] = []
+                for row in table_lines[2:]:
+                    candidate = "\n".join(header + rows + [row])
+                    if not fits(join(candidate), current_tables + 1):
+                        if rows:
+                            current = join("\n".join(header + rows))
+                            current_tables += 1
+                        flush()
+                        rows = []
+                        candidate = "\n".join(header + [row])
+                        if not fits(candidate, 1):
+                            raise ValueError("汇总表格的单行或表头超过消息容量，无法完整保留该行")
+                    rows.append(row)
+                if not rows:
+                    raise ValueError("汇总表格的表头超过消息容量")
+                current = join("\n".join(header + rows))
+                current_tables += 1
+                continue
+
+            # 文字按原行顺序填满剩余空间；极长单行使用二分查找，避免丢字或截断字符编码。
+            separator = "\n\n" if current else ""
+            for line in block.splitlines():
+                remaining = line
+                while True:
+                    candidate = current + separator + remaining
+                    if fits(candidate, current_tables):
+                        current = candidate
+                        break
+                    low, high = 0, len(remaining)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        if fits(current + separator + remaining[:middle], current_tables):
+                            low = middle
+                        else:
+                            high = middle - 1
+                    if low:
+                        current += separator + remaining[:low]
+                        remaining = remaining[low:]
+                    elif not current:
+                        raise ValueError("汇总卡片容量不足以容纳一个字符")
+                    flush()
+                    separator = ""
+                separator = "\n"
+        flush()
+        return parts
 
     @staticmethod
     def _split_markdown_text(markdown_text: str, max_chars: int) -> list[str]:
