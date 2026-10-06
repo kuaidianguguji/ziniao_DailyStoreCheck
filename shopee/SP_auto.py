@@ -42,13 +42,10 @@ SHOPEE_LOGIN_BUTTON_XPATH = "//form/button"
 # 已确认登录后直接打开广告页，不再点击首页的营销中心或 Shopee 广告菜单。
 SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
 
-# 商业分析四个页面入口。页面中的 API 和 DOM 可能随 Shopee 前端版本变化，
+# 当前只采集商业分析概述。页面中的 API 和 DOM 可能随 Shopee 前端版本变化，
 # 这里只固定路由，指标由页面当前渲染的业务标题和表格列动态读取。
 SHOPEE_DATA_CENTER_URLS: dict[str, str] = {
     "商业分析概述": "https://seller.shopee.com.br/datacenter/overview",
-    "商品概述": "https://seller.shopee.com.br/datacenter/product/overview",
-    "商品流量": "https://seller.shopee.com.br/datacenter/product/traffic",
-    "流量概述": "https://seller.shopee.com.br/datacenter/traffic/overview",
 }
 EXTRA_PERIODS: tuple[str, ...] = ("昨天", "7天", "今天")
 EXTRA_PERIOD_LABELS: dict[str, str] = {"昨天": "昨天", "7天": "过去7 天", "今天": "今日实时"}
@@ -221,7 +218,7 @@ class ShopeeAuto:
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
 
-        # 首页先通过 URL 判断登录状态。若 URL 中含 login，点击登录页的 Entrar 按钮，
+        # 首页先通过 URL 判断登录状态。若域名或路径中含 login，点击登录页的 Entrar 按钮，
         # 等待回到卖家中心首页后再进入广告页；已登录状态则直接继续。
         self._confirm_login_state_by_url(tab, store_name)
         template_url = self._open_ad_page(tab, store_name)
@@ -305,7 +302,7 @@ class ShopeeAuto:
                 }
                 rows.append(row)
 
-        # 广告数据完成后依次进入商业分析页面，三种周期均读取当前 DOM。
+        # 广告数据完成后只进入商业分析概述，按已开启的周期读取当前 DOM。
         rows.extend(self._collect_data_center_pages(tab, store_name, collected_at))
 
         valid_count = sum(row["数值"] != "" for row in rows)
@@ -314,7 +311,7 @@ class ShopeeAuto:
         return rows
 
     def _collect_data_center_pages(self, tab: Any, store_name: str, collected_at: str) -> list[dict[str, Any]]:
-        """读取商业分析页面的卡片和表格，返回可并入现有结果的 JSON 字段。"""
+        """只读取商业分析概述，返回可并入现有结果的 JSON 字段。"""
         rows: list[dict[str, Any]] = []
         for page_name, page_url in SHOPEE_DATA_CENTER_URLS.items():
             try:

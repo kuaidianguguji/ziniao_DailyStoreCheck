@@ -241,7 +241,8 @@ SHOPEE_MESSAGE_GROUPS += (
 
 # 商业分析页面的数据以 JSON 文本保存，机器人消息按页面合并三种周期展示。
 # 这些临时字段不加入固定飞书表字段，因此本阶段只推送，不写入已有多维表和二维表。
-SHOPEE_ANALYTICS_PAGE_NAMES: tuple[str, ...] = ("商业分析概述", "商品概述", "商品流量", "流量概述")
+# 当前采集范围仅包含概述，消息发送同步限定页面，避免为未采集页面记录缺失警告。
+SHOPEE_ANALYTICS_PAGE_NAMES: tuple[str, ...] = ("商业分析概述",)
 
 # 当爬虫没有提供“显示值”时，机器人根据字段类别补充货币符号或合适的小数位。
 SHOPEE_CURRENCY_FIELDS: frozenset[str] = frozenset(
@@ -986,7 +987,14 @@ class DailyStoreCheck:
                 if metric_name not in metric_order:
                     metric_order.append(metric_name)
 
-        lines = [f"## {page_name}", "", "| 指标 | 今天 | 昨天 | 近7天 |", "|---|---:|---:|---:|"]
+        period_labels = {"今天": "今天", "昨天": "昨天", "7天": "近7天"}
+        header_cells = ["指标", *(period_labels[period] for period in period_order)]
+        lines = [
+            f"## {page_name}",
+            "",
+            f"| {' | '.join(header_cells)} |",
+            "|---|" + "---:|" * len(period_order),
+        ]
         for metric_name in metric_order:
             cells = [DailyStoreCheck._escape_markdown_table_cell(metric_name)]
             cells.extend(
