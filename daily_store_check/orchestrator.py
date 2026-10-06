@@ -517,6 +517,7 @@ class DailyStoreCheck:
         """维持固定数量的店铺任务，并在每店关闭后立即异步提交 DeepSeek。"""
         pending: dict[Future[tuple[dict[str, Any], float]], tuple[int, StoreTask]] = {}
         results_by_index: dict[int, dict[str, Any]] = {}
+        timing_keys_by_index: dict[int, str] = {}
         next_task_index = 0
         close_failed = False
         single_store_enabled = bool(getattr(getattr(self, "deepseek", None), "single_store_enabled", True))
@@ -564,6 +565,7 @@ class DailyStoreCheck:
 
                 results_by_index[task_index] = store_info
                 timing_key = self._build_store_timing_key(store_processing_times, task.store_name)
+                timing_keys_by_index[task_index] = timing_key
                 store_processing_times[timing_key] = {
                     "平台": task.platform,
                     "耗时秒": round(elapsed_seconds, 2),
@@ -586,34 +588,74 @@ class DailyStoreCheck:
                         "店铺 %s 未确认关闭，停止提交尚未启动的店铺；当前已运行店铺继续完成并关闭",
                         task.store_name,
                     )
-                elif store_info.get("状态") == "成功" and task.platform in {"tiktok", "shopee", "mercado"}:
-                    if single_store_enabled:
-                        deepseek_executor.submit(self._send_store_deepseek_analysis, task.recipient, store_info)
-                        LOGGER.info(
-                            "[并发][DeepSeek提交] 店铺=%s，平台=%s；采集线程已释放，可启动下一店铺",
-                            task.store_name,
-                            task.platform,
-                        )
-                    else:
-                        LOGGER.info(
-                            "[并发][DeepSeek单店跳过] 店铺=%s，平台=%s，配置开关已关闭",
-                            task.store_name,
-                            task.platform,
-                        )
+                elif store_info.get("状态") == "成功":
+                    self._submit_store_analysis(task, store_info, deepseek_executor, single_store_enabled)
 
             submit_available_tasks()
 
+        # 首轮的全部采集线程退出后，失败店铺按控制表顺序单个补跑一次，不重新进入并发队列。
+        failed_indices = [index for index in sorted(results_by_index) if results_by_index[index].get("状态") == "失败"]
+        LOGGER.info("[补跑][首轮结束] 已执行=%s，失败=%s，补跑并发数=1，补跑次数=1", len(results_by_index), len(failed_indices))
+        for retry_number, task_index in enumerate(failed_indices, start=1):
+            task = tasks[task_index]
+            first_result = results_by_index[task_index]
+            if self._stop_opening_stores.is_set():
+                # 未确认关闭的浏览器不能再开店；在首轮结束后统一发送最终失败说明。
+                first_result["错误"] = f"{first_result.get('错误', '')}\n有店铺未确认关闭，已停止补跑。"
+                self._notify_store_failure(task, first_result)
+                continue
+            LOGGER.info("[补跑][开始] 序号=%s/%s，店铺=%s，平台=%s，首轮错误=%s", retry_number, len(failed_indices), task.store_name, task.platform, first_result.get("错误", ""))
+            retry_started_at = time.perf_counter()
+            try:
+                store_info, retry_elapsed = self._run_store_timed(
+                    task,
+                    final_attempt=True,
+                    completed_writes=first_result.get("_已完成写入", {}),
+                )
+            except Exception as exc:
+                LOGGER.exception("[补跑][店铺线程异常] 店铺=%s，平台=%s", task.store_name, task.platform)
+                store_info = {"店铺名": task.store_name, "平台": task.platform, "状态": "失败", "采集时间": "", "数据": {}, "错误": str(exc)}
+                retry_elapsed = time.perf_counter() - retry_started_at
+                self._notify_store_failure(task, store_info)
+            store_info["执行次数"] = 2
+            results_by_index[task_index] = store_info
+            timing = store_processing_times[timing_keys_by_index[task_index]]
+            total_elapsed = float(timing["耗时秒"]) + retry_elapsed
+            timing.update({"耗时秒": round(total_elapsed, 2), "耗时": self._format_elapsed_time(total_elapsed), "补跑耗时秒": round(retry_elapsed, 2)})
+            LOGGER.info("[补跑][完成] 店铺=%s，状态=%s，补跑耗时=%s，两次总耗时=%s", task.store_name, store_info.get("状态"), self._format_elapsed_time(retry_elapsed), timing["耗时"])
+            if store_info.get("中止后续店铺"):
+                close_failed = True
+                self._stop_opening_stores.set()
+            elif store_info.get("状态") == "成功":
+                self._submit_store_analysis(task, store_info, deepseek_executor, single_store_enabled)
+
         # ALL_info 仍按飞书控制表顺序排列，避免并发完成顺序影响最终经理汇总。
+        for store_info in results_by_index.values():
+            store_info.pop("_已完成写入", None)
         all_info.extend(results_by_index[index] for index in sorted(results_by_index))
         skipped_count = len(tasks) - len(results_by_index)
         if skipped_count:
             LOGGER.warning("[并发][未启动店铺] 因关闭失败跳过=%s", skipped_count)
         return close_failed
 
-    def _run_store_timed(self, task: StoreTask) -> tuple[dict[str, Any], float]:
+    def _submit_store_analysis(
+        self, task: StoreTask, store_info: dict[str, Any], executor: ThreadPoolExecutor, enabled: bool,
+    ) -> None:
+        """仅为最终成功结果提交单店分析，失败的首轮或补跑均不提交。"""
+        if task.platform not in {"tiktok", "shopee", "mercado"}:
+            return
+        if enabled:
+            executor.submit(self._send_store_deepseek_analysis, task.recipient, store_info)
+            LOGGER.info("[并发][DeepSeek提交] 店铺=%s，平台=%s；采集线程已释放，可启动下一店铺", task.store_name, task.platform)
+        else:
+            LOGGER.info("[并发][DeepSeek单店跳过] 店铺=%s，平台=%s，配置开关已关闭", task.store_name, task.platform)
+
+    def _run_store_timed(
+        self, task: StoreTask, *, final_attempt: bool = False, completed_writes: dict[str, bool] | None = None,
+    ) -> tuple[dict[str, Any], float]:
         """执行单店采集并返回不包含 DeepSeek 等待时间的耗时。"""
         started_at = time.perf_counter()
-        store_info = self._run_store(task)
+        store_info = self._run_store(task, final_attempt=final_attempt, completed_writes=completed_writes)
         return store_info, time.perf_counter() - started_at
 
     @staticmethod
@@ -690,7 +732,9 @@ class DailyStoreCheck:
         self.ziniao.update_core()
         self.browser_list = self.ziniao.list_browsers()
 
-    def _run_store(self, task: StoreTask) -> dict[str, Any]:
+    def _run_store(
+        self, task: StoreTask, *, final_attempt: bool = False, completed_writes: dict[str, bool] | None = None,
+    ) -> dict[str, Any]:
         """处理一间店铺并返回 ALL_info 项；context manager 确保该店正确关闭。"""
         store_info: dict[str, Any] = {
             "店铺名": task.store_name,
@@ -699,54 +743,65 @@ class DailyStoreCheck:
             "采集时间": "",
             "数据": {},
         }
-        identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name, task.platform)
-        if not identifier:
-            LOGGER.error("找不到店铺 %s 对应的紫鸟 browserOauth/browserId，跳过", task.store_name)
-            error_message = "没有找到紫鸟店铺标识，请检查店铺名是否与紫鸟一致。"
-            store_info["状态"] = "失败"
-            store_info["错误"] = error_message
-            self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", error_message)
-            return store_info
-
+        write_progress = dict(completed_writes or {})
         try:
+            identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name, task.platform)
+            if not identifier:
+                raise RuntimeError("没有找到紫鸟店铺标识，请检查店铺名是否与紫鸟一致。")
             with ZiniaoStoreSession(self.ziniao, identifier, task.store_name) as session:
                 crawler = self._load_crawler(task.platform)
                 rows = crawler.collect(task.store_name, session.download_path, session.opened.get("debuggingPort"))
                 collected_at, metric_values = self._extract_all_info_values(rows)
                 store_info["采集时间"] = collected_at
                 store_info["数据"] = metric_values
-                # 先落本机，再写飞书。飞书失败时不必重新打开紫鸟店铺；落盘失败也不丢弃已采集结果。
+                # 平台显式返回失败行时，首轮同样进入补跑，不能把不完整页面当作整店成功。
+                row_errors = [f"{row.get('指标')}: {row.get('显示值') or '采集失败'}" for row in rows if str(row.get("指标") or "").endswith("_失败")]
+                if row_errors:
+                    raise RuntimeError("；".join(row_errors))
+                # 本机原始结果可以保存，但飞书写入和通知必须等浏览器确认关闭。
                 try:
                     self._save_store_capture(task, rows, store_info)
                 except Exception:
-                    LOGGER.exception("[采集][本机保存失败] 店铺=%s，继续写入飞书", task.store_name)
-                self._write_feishu(task, rows)
-                platform_config = self.config.get("platforms", {}).get(task.platform, {})
-                if task.platform == "tiktok":
-                    message_title, message_body = self._format_tiktok_notification(task.store_name, rows, platform_config)
-                    self._safe_notify_markdown(task.recipient, message_title, message_body)
-                elif task.platform == "shopee":
-                    message_title, message_body = self._format_shopee_notification(task.store_name, rows, platform_config)
-                    self._safe_notify_markdown(task.recipient, message_title, message_body)
-                    self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows, platform_config)
-                elif task.platform == "mercado":
-                    message_title, message_body = self._format_mercado_notification(task.store_name, rows, platform_config)
-                    self._safe_notify_markdown(task.recipient, message_title, message_body)
-                else:
-                    self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
-                store_info["状态"] = "成功"
+                    LOGGER.exception("[采集][本机保存失败] 店铺=%s，继续处理已采集数据", task.store_name)
+            self._write_feishu(task, rows, completed_writes=write_progress)
+            platform_config = self.config.get("platforms", {}).get(task.platform, {})
+            if task.platform == "tiktok":
+                message_title, message_body = self._format_tiktok_notification(task.store_name, rows, platform_config)
+                self._safe_notify_markdown(task.recipient, message_title, message_body)
+            elif task.platform == "shopee":
+                message_title, message_body = self._format_shopee_notification(task.store_name, rows, platform_config)
+                self._safe_notify_markdown(task.recipient, message_title, message_body)
+                self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows, platform_config)
+            elif task.platform == "mercado":
+                message_title, message_body = self._format_mercado_notification(task.store_name, rows, platform_config)
+                self._safe_notify_markdown(task.recipient, message_title, message_body)
+            else:
+                self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
+            store_info["状态"] = "成功"
         except ZiniaoStoreCloseError as exc:
             LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
             store_info["状态"] = "失败"
             store_info["错误"] = str(exc)
             store_info["中止后续店铺"] = True
-            self._safe_notify(task.recipient, f"{task.store_name} 关闭失败", f"{exc}\n为避免同时打开多个店铺，已中止本轮后续店铺。")
         except Exception as exc:
             LOGGER.exception("店铺 %s 处理失败", task.store_name)
             store_info["状态"] = "失败"
             store_info["错误"] = str(exc)
-            self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", str(exc))
+        if store_info["状态"] == "失败":
+            store_info["_已完成写入"] = write_progress
+            if final_attempt:
+                self._notify_store_failure(task, store_info)
+            else:
+                LOGGER.warning("[补跑][首轮失败暂存] 店铺=%s，不发送失败消息，等待首轮结束后补跑", task.store_name)
         return store_info
+
+    def _notify_store_failure(self, task: StoreTask, store_info: dict[str, Any]) -> None:
+        """仅在补跑结束或无法安全补跑时发送最终失败状态。"""
+        title = f"{task.store_name} 关闭失败" if store_info.get("中止后续店铺") else f"{task.store_name} 数据任务失败"
+        error_message = str(store_info.get("错误") or "店铺执行失败")
+        if store_info.get("中止后续店铺"):
+            error_message += "\n店铺未确认关闭，已停止打开新店铺。"
+        self._safe_notify(task.recipient, title, error_message)
 
     def _save_store_capture(
         self,
@@ -1173,7 +1228,9 @@ class DailyStoreCheck:
         platform_config["human_interaction"] = dict(self.config.get("human_interaction", {}) or {})
         return crawler_class(platform_config)
 
-    def _write_feishu(self, task: StoreTask, rows: list[dict[str, Any]]) -> None:
+    def _write_feishu(
+        self, task: StoreTask, rows: list[dict[str, Any]], *, completed_writes: dict[str, bool] | None = None,
+    ) -> None:
         """把标准行写入对应多维表，并追加到对应历史电子表。"""
         feishu_cfg = self.config.get("feishu", {})
         app_token, table_id = self.feishu.get_bitable_ref("data", task.platform)
@@ -1194,31 +1251,40 @@ class DailyStoreCheck:
             len(spreadsheet_rows),
         )
         write_errors: list[str] = []
+        write_progress = completed_writes if completed_writes is not None else {}
 
         # 多维表和历史电子表是两个独立目标；一个失败时仍然尝试另一个，避免采集数据全部丢失。
-        try:
-            bitable_rows = record_rows
-            if task.platform == "shopee":
-                bitable_rows = self._align_shopee_bitable_fields(record_rows, app_token, table_id)
-            self.feishu.batch_create_records(table_id, bitable_rows, app_token=app_token)
-        except Exception as exc:
-            LOGGER.exception("[飞书][多维表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
-            write_errors.append(f"多维表写入失败: {exc}")
+        if not write_progress.get("多维表"):
+            try:
+                bitable_rows = record_rows
+                if task.platform == "shopee":
+                    bitable_rows = self._align_shopee_bitable_fields(record_rows, app_token, table_id)
+                self.feishu.batch_create_records(table_id, bitable_rows, app_token=app_token)
+                write_progress["多维表"] = True
+            except Exception as exc:
+                LOGGER.exception("[飞书][多维表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
+                write_errors.append(f"多维表写入失败: {exc}")
+        else:
+            LOGGER.info("[飞书][补跑写入跳过] 店铺=%s，多维表首轮已成功写入，不重复追加", task.store_name)
 
-        try:
-            spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
-            if isinstance(spreadsheet_cfg, dict):
-                token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
-                sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-                range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AM"}
-                range_end = range_end_by_platform.get(task.platform, "Z")
-                range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
-                self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
-            else:
-                self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
-        except Exception as exc:
-            LOGGER.exception("[飞书][电子表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
-            write_errors.append(f"电子表写入失败: {exc}")
+        if not write_progress.get("电子表"):
+            try:
+                spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
+                if isinstance(spreadsheet_cfg, dict):
+                    token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
+                    sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
+                    range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AM"}
+                    range_end = range_end_by_platform.get(task.platform, "Z")
+                    range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
+                    self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
+                else:
+                    self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
+                write_progress["电子表"] = True
+            except Exception as exc:
+                LOGGER.exception("[飞书][电子表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
+                write_errors.append(f"电子表写入失败: {exc}")
+        else:
+            LOGGER.info("[飞书][补跑写入跳过] 店铺=%s，电子表首轮已成功写入，不重复追加", task.store_name)
 
         if write_errors:
             raise RuntimeError("；".join(write_errors))

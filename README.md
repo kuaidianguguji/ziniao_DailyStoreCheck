@@ -78,7 +78,13 @@ python run_daily_store_check.py --run-now
 python run_daily_store_check.py --run-now --once
 ```
 
-每家店铺采集成功后，原始结果先写入 `data/captures`，再写入飞书。飞书写入失败时可以直接用对应 JSON 补写，不必重新打开紫鸟店铺。`data/daily_store_check.log` 只保留警告和错误；点击、XPath 和原始值写在 `data/daily_store_check.debug.log`。
+每家店铺采集成功后，原始结果先写入 `data/captures`；确认紫鸟店铺浏览器关闭后，再写入飞书并发送原始消息。
+
+首轮采集、登录或关店失败时，暂不写入飞书、不发送失败消息。首轮所有已启动店铺结束后，失败店铺按控制表顺序串行补跑一次：成功则正常写表、推送并按原开关进行 DeepSeek 分析；仍失败则发送最终失败消息，不写入失败数据。经理汇总只保留每个任务的最终结果，单店计时包含首轮和补跑耗时。若有浏览器未确认关闭，沿用停止开店的保护，跳过补跑并统一通知最终失败。
+
+飞书多维表和电子表不支持跨接口事务：若写表本身发生部分失败，已经明确成功的目标不能撤回，补跑时不会重复追加该目标，只重试失败的目标。本机 JSON 仍可用于人工核对和补写。
+
+`data/daily_store_check.log` 只保留警告和错误；点击、XPath 和原始值写在 `data/daily_store_check.debug.log`。
 
 ## 扩展脚本
 ### 一、增加亚马逊店铺任务

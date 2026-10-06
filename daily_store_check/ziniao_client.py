@@ -538,12 +538,16 @@ class ZiniaoStoreSession:
             self.client.open_launcher_page(self.driver, str(self.opened.get("launcherPage") or ""))
             self._start_ipc_heartbeat()
             return self
-        except Exception:
+        except Exception as initialization_error:
             # __enter__ 内抛错时 Python 不会调用 __exit__，这里必须主动关闭店铺。
             try:
                 self.client.close_store(self.browser_oauth, self.opened.get("debuggingPort"))
-            except Exception:
+            except Exception as close_error:
                 LOGGER.error("初始化 driver 失败后关闭店铺 %s 也失败: %s", self.store_name, traceback.format_exc())
+                # 向编排器明确传递关店失败，禁止把仍存活的浏览器当作普通失败继续补跑。
+                raise ZiniaoStoreCloseError(
+                    f"店铺 {self.store_name} 初始化失败：{initialization_error}；随后关闭失败：{close_error}"
+                ) from close_error
             raise
 
     @property
