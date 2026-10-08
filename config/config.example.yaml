@@ -188,6 +188,9 @@ platforms:
       captcha_success_submit_button_xpath: '//button[@type="submit"]'
       # 身份识别页面账号输入框的稳定 XPath；不要使用动态 id。
       account_input_xpath: '//form[contains(@class,"identification-form")]//input[@data-andes-textfield-input="true" and @data-andes-textfield-input-type="input"]'
+      # 验证码出现前先核验实时账号，再提交身份表单；等待与次数复用登录步骤配置。
+      pre_captcha_submit_button_xpath: '//form[contains(@class,"identification-form")]//button[@type="submit"]'
+      pre_captcha_entry_iframe_xpath: '//iframe[@title="reCAPTCHA"]'
       # 按当前任务店铺名称填写账号；请在本机配置文件中自行补充账号。
       account_by_store: {}
       login_type_button_xpath: '//button[@aria-labelledby="password_validation-content"]'

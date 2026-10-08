@@ -17,7 +17,7 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from DrissionPage import Chromium
@@ -52,6 +52,8 @@ ACCOUNT_INPUT_XPATH = (
     '//input[@data-andes-textfield-input="true" '
     'and @data-andes-textfield-input-type="input"]'
 )
+IDENTITY_SUBMIT_BUTTON_XPATH = '//form[contains(@class,"identification-form")]//button[@type="submit"]'
+IDENTITY_CAPTCHA_IFRAME_XPATH = '//iframe[@title="reCAPTCHA"]'
 POST_CAPTCHA_WAIT_SECONDS = 1.0
 LOGIN_STEP_WAIT_TIMEOUT_SECONDS = 10.0
 LOGIN_STEP_MAX_ATTEMPTS = 3
@@ -337,6 +339,12 @@ class MercadoAuto:
 
         LOGGER.warning("[美客多][确认未登录] 店铺=%s，url=%s，准备执行登录流程", store_name, current_url or "<空>")
 
+        identity_target = self._prepare_login_identity(tab, login_config, store_name)
+        if identity_target != "captcha":
+            LOGGER.info("[美客多][身份提交完成] 店铺=%s，目标=%s，无需等待验证码", store_name, identity_target)
+            self._complete_post_captcha_login(tab, login_config, store_name, captcha_completed=False)
+            return True
+
         captcha_config = login_config.get("captcha", {})
         if not isinstance(captcha_config, dict):
             captcha_config = {}
@@ -354,11 +362,172 @@ class MercadoAuto:
         self._complete_post_captcha_login(tab, login_config, store_name)
         return True
 
+    def _prepare_login_identity(self, tab: Any, login_config: dict[str, Any], store_name: str) -> str:
+        """身份表单先检查实时账号，只有验证码实际出现才进入原验证码流程。"""
+        account_xpath = str(login_config.get("account_input_xpath") or ACCOUNT_INPUT_XPATH).strip()
+        submit_xpath = str(
+            login_config.get("pre_captcha_submit_button_xpath") or IDENTITY_SUBMIT_BUTTON_XPATH
+        ).strip()
+        captcha_xpath = str(
+            login_config.get("pre_captcha_entry_iframe_xpath") or IDENTITY_CAPTCHA_IFRAME_XPATH
+        ).strip()
+        next_xpath = str(login_config.get("login_type_button_xpath") or LOGIN_TYPE_BUTTON_XPATH).strip()
+        wait_timeout = max(
+            0.1, float(login_config.get("login_step_wait_timeout_seconds", LOGIN_STEP_WAIT_TIMEOUT_SECONDS)
+                       or LOGIN_STEP_WAIT_TIMEOUT_SECONDS),
+        )
+        max_attempts = max(
+            1, int(login_config.get("login_step_max_attempts", LOGIN_STEP_MAX_ATTEMPTS)
+                   or LOGIN_STEP_MAX_ATTEMPTS),
+        )
+        accounts = login_config.get("account_by_store", {})
+        if not isinstance(accounts, dict):
+            accounts = {}
+        if self._has_left_login_page(tab):
+            return "homepage"
+        if self._find_visible_element(tab, next_xpath, timeout=0.2):
+            return "next"
+        if self._find_visible_element(tab, captcha_xpath, timeout=0.2):
+            return "captcha"
+        # 页面重绘时入口可能暂时都不存在；有界等待，不能把“没找到账号框”当作验证码已出现。
+        entry_deadline = time.monotonic() + wait_timeout
+        while not self._find_visible_element(tab, account_xpath, timeout=0.2):
+            if self._has_left_login_page(tab):
+                return "homepage"
+            if self._find_visible_element(tab, next_xpath, timeout=0.2):
+                return "next"
+            if self._find_visible_element(tab, captcha_xpath, timeout=0.2):
+                # 原来的独立验证码页面不含账号框，确认其入口出现后继续原流程。
+                return "captcha"
+            if time.monotonic() >= entry_deadline:
+                raise RuntimeError(
+                    f"美客多店铺 {store_name} 在 {wait_timeout:.1f} 秒内未发现账号表单、"
+                    "验证码入口或登录类型按钮，未进入验证码识别"
+                )
+            time.sleep(0.25)
+
+        last_target = "timeout"
+        for attempt in range(1, max_attempts + 1):
+            LOGGER.info("[美客多][验证码前账号提交] 店铺=%s，第%s/%s次", store_name, attempt, max_attempts)
+            if self._has_left_login_page(tab):
+                return "homepage"
+            if self._find_visible_element(tab, next_xpath, timeout=0.2):
+                return "next"
+            if self._find_visible_element(tab, captcha_xpath, timeout=0.2):
+                return "captcha"
+            # 空账号可能令提交按钮禁用，必须先补录，再等待按钮可点击。
+            self._ensure_identity_account(tab, account_xpath, accounts, store_name, wait_timeout)
+            button = self._wait_for_clickable_element(tab, submit_xpath, wait_timeout)
+            if not button:
+                last_target = "submit_missing"
+                continue
+            self._wait_before_login_button_click("验证码前提交账号")
+            # 翻译或前端重绘可能发生在随机等待期间，必须重新定位并读取实时值。
+            if self._has_left_login_page(tab):
+                return "homepage"
+            if self._find_visible_element(tab, next_xpath, timeout=0.2):
+                return "next"
+            if self._find_visible_element(tab, captcha_xpath, timeout=0.2):
+                return "captcha"
+            self._ensure_identity_account(tab, account_xpath, accounts, store_name, wait_timeout)
+            button = self._wait_for_clickable_element(tab, submit_xpath, wait_timeout)
+            if not button:
+                last_target = "submit_missing"
+                continue
+            # 补录后、重新查找按钮时也可能换掉输入框，提交前再查一遍。
+            self._ensure_identity_account(tab, account_xpath, accounts, store_name, wait_timeout)
+            try:
+                self._click_login_button(
+                    tab, button, "验证码前提交账号",
+                    before_click=lambda: self._ensure_identity_account(
+                        tab, account_xpath, accounts, store_name, wait_timeout
+                    ),
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "[美客多][验证码前提交失败] 店铺=%s，第%s/%s次，异常类型=%s",
+                    store_name, attempt, max_attempts, type(exc).__name__,
+                )
+                last_target = "click_failed"
+                continue
+            last_target = self._wait_identity_transition(tab, account_xpath, captcha_xpath, next_xpath, wait_timeout)
+            if last_target in {"captcha", "next", "homepage"}:
+                return last_target
+            LOGGER.warning(
+                "[美客多][验证码前提交重试] 店铺=%s，第%s/%s次，状态=%s；重新检查账号，不进入验证码等待",
+                store_name, attempt, max_attempts, last_target,
+            )
+        raise RuntimeError(
+            f"美客多店铺 {store_name} 验证码前身份提交连续 {max_attempts} 次失败，"
+            f"最后状态={last_target}，未进入验证码识别"
+        )
+
+    def _ensure_identity_account(
+        self, tab: Any, account_input_xpath: str, account_by_store: dict[str, Any],
+        store_name: str, wait_timeout: float,
+    ) -> str:
+        """保留已有账号；空框从映射补录，回读失败禁止继续提交，不记录账号正文。"""
+        element = self._wait_for_clickable_element(tab, account_input_xpath, wait_timeout)
+        if not element:
+            raise RuntimeError(f"美客多店铺 {store_name} 未找到可用账号输入框，停止提交")
+        value = self._read_input_value(element, strict=True).strip()
+        if value:
+            return value
+        account = self._resolve_store_account(account_by_store, store_name)
+        if not account:
+            raise RuntimeError(
+                f"美客多店铺 {store_name} 账号输入框为空，但 login.account_by_store 未配置账号；"
+                "停止提交及验证码等待"
+            )
+        LOGGER.info("[美客多][账号补录] 店铺=%s，实时账号为空，按店铺映射补录", store_name)
+        try:
+            if self._human_interaction.enabled:
+                self._human_interaction.move_to_element(tab, element)
+            element.click()
+            try:
+                element.input(account, clear=True)
+            except TypeError:
+                element.clear()
+                element.input(account)
+            fresh = self._find_visible_element(tab, account_input_xpath, timeout=min(1.0, wait_timeout))
+            if fresh is None or self._read_input_value(fresh, strict=True).strip() != account:
+                raise RuntimeError("账号输入后的实时回读不一致，可能再次被页面重置")
+        except Exception as exc:
+            raise RuntimeError(
+                f"美客多店铺 {store_name} 账号补录未通过实时回读校验，停止提交（{type(exc).__name__}）"
+            ) from None
+        LOGGER.info("[美客多][账号补录成功] 店铺=%s，最新输入框实时值已核验", store_name)
+        return account
+
+    def _wait_identity_transition(
+        self, tab: Any, account_xpath: str, captcha_xpath: str,
+        next_xpath: str, wait_timeout: float,
+    ) -> str:
+        """有限等待账号提交结果；账号再次清空时立即回到补录，不空等验证码。"""
+        deadline = time.monotonic() + wait_timeout
+        while time.monotonic() < deadline:
+            if self._has_left_login_page(tab):
+                return "homepage"
+            if self._find_visible_element(tab, next_xpath, timeout=0.2):
+                return "next"
+            if self._find_visible_element(tab, captcha_xpath, timeout=0.2):
+                return "captcha"
+            account = self._find_visible_element(tab, account_xpath, timeout=0.2)
+            if account:
+                if not self._read_input_value(account, strict=True).strip():
+                    return "account_empty"
+                if str(account.attr("aria-invalid") or "").casefold() == "true":
+                    return "account_invalid"
+            time.sleep(0.25)
+        return "timeout"
+
     def _complete_post_captcha_login(
         self,
         tab: Any,
         login_config: dict[str, Any],
         store_name: str,
+        *,
+        captcha_completed: bool = True,
     ) -> None:
         """验证码成功后依次提交、选择登录类型、确认登录并等待进入首页。"""
         after_captcha_wait = max(
@@ -432,8 +601,18 @@ class MercadoAuto:
             login_config.get("confirm_login_button_xpath") or CONFIRM_LOGIN_BUTTON_XPATH
         ).strip()
 
+        if self._has_left_login_page(tab):
+            self._wait_for_login_homepage_ready(
+                tab, store_name, homepage_ready_timeout,
+                homepage_marker_xpath, homepage_marker_timeout,
+                homepage_settle_seconds,
+            )
+            return
+        if not captcha_completed:
+            after_captcha_wait = 0.0
+
         LOGGER.info(
-            "[美客多][登录后续] 店铺=%s，验证码通过后等待 %.1f 秒再提交",
+            "[美客多][登录后续] 店铺=%s，身份验证后等待 %.1f 秒再提交",
             store_name,
             after_captcha_wait,
         )
@@ -563,14 +742,21 @@ class MercadoAuto:
                     raise RuntimeError(
                         f"美客多店铺 {store_name} 账号输入框为空，但 login.account_by_store 未配置账号"
                     )
-                self._fill_account_and_resubmit(
-                    tab=tab,
-                    account_input_xpath=account_input_xpath,
-                    submit_xpath=click_xpath,
-                    account=account,
-                    store_name=store_name,
-                    wait_timeout=wait_timeout,
-                )
+                try:
+                    self._fill_account_and_resubmit(
+                        tab=tab,
+                        account_input_xpath=account_input_xpath,
+                        submit_xpath=click_xpath,
+                        account=account,
+                        store_name=store_name,
+                        wait_timeout=wait_timeout,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[美客多][账号补录提交重试] 店铺=%s，第%s/%s次，异常类型=%s",
+                        store_name, attempt, max_attempts, type(exc).__name__,
+                    )
+                    continue
                 account_filled = True
                 target = self._wait_for_login_target_or_account_error(
                     tab=tab,
@@ -613,53 +799,23 @@ class MercadoAuto:
         wait_timeout: float,
     ) -> None:
         """输入店铺账号并重新提交身份识别表单。"""
-        input_element = self._wait_for_clickable_element(
-            tab,
-            account_input_xpath,
-            wait_timeout,
-        )
-        if not input_element:
-            raise RuntimeError(
-                f"美客多店铺 {store_name} 检测到账号为空，但未找到账号输入框"
-            )
-
-        LOGGER.info(
-            "[美客多][账号补录] 店铺=%s，已找到账号输入框，账号长度=%s",
-            store_name,
-            len(account),
-        )
-        try:
-            if self._human_interaction.enabled:
-                self._human_interaction.move_to_element(tab, input_element)
-            input_element.click()
-            try:
-                input_element.input(account, clear=True)
-            except TypeError:
-                input_element.clear()
-                input_element.input(account)
-            current_value = self._read_input_value(input_element)
-            if current_value != account:
-                LOGGER.warning(
-                    "[美客多][账号补录] 店铺=%s，输入后回读长度=%s，期望长度=%s，继续提交",
-                    store_name,
-                    len(current_value),
-                    len(account),
-                )
-            else:
-                LOGGER.info("[美客多][账号补录成功] 店铺=%s，输入值已回读一致", store_name)
-        except Exception as exc:
-            raise RuntimeError(f"美客多店铺 {store_name} 账号输入失败：{exc}") from exc
-
-        submit_button = self._wait_for_clickable_element(
-            tab,
-            submit_xpath,
-            wait_timeout,
-        )
-        if not submit_button:
+        accounts = {store_name: account}
+        self._ensure_identity_account(tab, account_input_xpath, accounts, store_name, wait_timeout)
+        if not self._wait_for_clickable_element(tab, submit_xpath, wait_timeout):
             raise RuntimeError(f"美客多店铺 {store_name} 补录账号后未找到提交按钮")
         self._wait_before_login_button_click("补录账号后提交")
+        # 随机等待期间输入框可能被清空，重新定位账号和按钮，不复用过期对象。
+        self._ensure_identity_account(tab, account_input_xpath, accounts, store_name, wait_timeout)
+        submit_button = self._wait_for_clickable_element(tab, submit_xpath, wait_timeout)
+        if not submit_button:
+            raise RuntimeError(f"美客多店铺 {store_name} 补录账号后未找到提交按钮")
         self._log_login_element(submit_button, "补录账号后提交", "点击前")
-        self._click_login_button(tab, submit_button, "补录账号后提交")
+        self._click_login_button(
+            tab, submit_button, "补录账号后提交",
+            before_click=lambda: self._ensure_identity_account(
+                tab, account_input_xpath, accounts, store_name, wait_timeout
+            ),
+        )
         self._log_login_debug_state(tab, "补录账号后提交点击后")
 
     def _wait_for_login_target_or_account_error(
@@ -716,12 +872,14 @@ class MercadoAuto:
             return False
 
     @staticmethod
-    def _read_input_value(element: Any) -> str:
-        """读取输入框当前 value 属性，不把账号内容写入日志。"""
+    def _read_input_value(element: Any, *, strict: bool = False) -> str:
+        """读取实时值；严格模式禁止回退静态 HTML 属性，不记录账号正文。"""
         try:
             value = element.run_js("return this.value;")
             return str(value or "")
         except Exception:
+            if strict:
+                raise RuntimeError("无法读取账号输入框实时值，停止提交") from None
             try:
                 return str(element.attr("value") or "")
             except Exception:
@@ -877,37 +1035,11 @@ class MercadoAuto:
                 max_attempts,
             )
             if self._wait_until_login_page_left(tab, wait_timeout):
-                if not self._wait_for_page_ready(
-                    tab,
-                    homepage_ready_timeout,
-                    "登录后首页",
-                ):
-                    raise TimeoutError(
-                        f"美客多店铺 {store_name} 登录后首页在 "
-                        f"{homepage_ready_timeout:.1f} 秒内未达到 document.readyState=complete"
-                    )
-                LOGGER.info(
-                    "[美客多][首页标志等待] 店铺=%s，最长等待 %.1f 秒，xpath=%s",
-                    store_name,
-                    homepage_marker_timeout,
-                    homepage_marker_xpath,
-                )
-                if not self._wait_for_visible_element(
-                    tab,
-                    homepage_marker_xpath,
-                    homepage_marker_timeout,
-                ):
-                    raise TimeoutError(
-                        f"美客多店铺 {store_name} 首页在 {homepage_marker_timeout:.1f} 秒内"
-                        f"未出现标志元素：{homepage_marker_xpath}"
-                    )
-                LOGGER.info(
-                    "[美客多][首页标志出现] 店铺=%s，固定等待 %.1f 秒使首页业务内容稳定",
-                    store_name,
+                self._wait_for_login_homepage_ready(
+                    tab, store_name, homepage_ready_timeout,
+                    homepage_marker_xpath, homepage_marker_timeout,
                     homepage_settle_seconds,
                 )
-                if homepage_settle_seconds > 0:
-                    time.sleep(homepage_settle_seconds)
                 return
             self._log_login_debug_state(tab, f"确认登录第{attempt}次后仍在登录页")
             LOGGER.warning(
@@ -919,6 +1051,37 @@ class MercadoAuto:
             )
 
         raise RuntimeError(f"美客多店铺 {store_name} 连续 {max_attempts} 次未能确认进入首页")
+
+    def _wait_for_login_homepage_ready(
+        self,
+        tab: Any,
+        store_name: str,
+        homepage_ready_timeout: float,
+        homepage_marker_xpath: str,
+        homepage_marker_timeout: float,
+        homepage_settle_seconds: float,
+    ) -> None:
+        """统一等待登录后首页，直接进入首页时也不能跳过文档及业务标志校验。"""
+        if not self._wait_for_page_ready(tab, homepage_ready_timeout, "登录后首页"):
+            raise TimeoutError(
+                f"美客多店铺 {store_name} 登录后首页在 "
+                f"{homepage_ready_timeout:.1f} 秒内未达到 document.readyState=complete"
+            )
+        LOGGER.info(
+            "[美客多][首页标志等待] 店铺=%s，最长等待 %.1f 秒，xpath=%s",
+            store_name, homepage_marker_timeout, homepage_marker_xpath,
+        )
+        if not self._wait_for_visible_element(tab, homepage_marker_xpath, homepage_marker_timeout):
+            raise TimeoutError(
+                f"美客多店铺 {store_name} 首页在 {homepage_marker_timeout:.1f} 秒内"
+                f"未出现标志元素：{homepage_marker_xpath}"
+            )
+        LOGGER.info(
+            "[美客多][首页标志出现] 店铺=%s，固定等待 %.1f 秒使首页业务内容稳定",
+            store_name, homepage_settle_seconds,
+        )
+        if homepage_settle_seconds > 0:
+            time.sleep(homepage_settle_seconds)
 
     @staticmethod
     def _wait_before_login_button_click(step_name: str) -> None:
@@ -988,15 +1151,24 @@ class MercadoAuto:
         except Exception:
             return True
 
-    def _click_login_button(self, tab: Any, button: Any, step_name: str) -> None:
+    def _click_login_button(
+        self, tab: Any, button: Any, step_name: str,
+        *, before_click: Callable[[], Any] | None = None,
+    ) -> None:
         """先执行真人鼠标移动，再用元素原生点击确保登录表单事件被触发。"""
         if self._human_interaction.enabled:
             self._human_interaction.move_to_element(tab, button)
+        # 身份表单在鼠标移动期间也可能重绘；临点击前校验账号，失败时禁止点击。
+        if before_click is not None:
+            before_click()
         try:
             # 登录表单按钮优先使用 DrissionPage 原生点击，避免 CDP 坐标在页面过渡期间命中错误层。
             button.click()
             LOGGER.info("[美客多][登录按钮点击派发] 步骤=%s，已调用元素原生 click", step_name)
         except Exception as native_error:
+            if before_click is not None:
+                # 真人回退会再次移动和暂停，可能令刚校验的账号失效；身份提交改由外层有界重试。
+                raise RuntimeError(f"美客多身份表单原生点击失败，停止本次提交：{step_name}") from None
             LOGGER.warning(
                 "[美客多][登录按钮原生点击失败] 步骤=%s，异常=%s，改用真人 CDP 点击",
                 step_name,
