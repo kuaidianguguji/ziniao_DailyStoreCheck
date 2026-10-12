@@ -14,9 +14,10 @@ import logging
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from DrissionPage import Chromium
 from daily_store_check.config import is_period_enabled
@@ -74,10 +75,18 @@ AD_PAGE_LOAD_RETRY_TIMES = 4
 AD_PAGE_READY_METRIC_XPATH = '//div[@class="line-metrics"]/div[1]//div[@class="content"]//span'
 
 # 广告入口文档加载完成后，每隔2秒读取一次当前网址，最多读取40次。
-# 只有 URL 的 group 参数变成已知时间范围后，才使用该完整 URL 生成昨日和最近7天地址。
+# URL 的 group 参数可以是标准周期，也可以是待转换的 custom 模板。
 AD_GROUP_URL_CHECK_TIMES = 40
 AD_GROUP_URL_CHECK_INTERVAL_SECONDS = 2
 AD_KNOWN_GROUP_VALUES: frozenset[str] = frozenset({"today", "yesterday", "last_week", "last_month"})
+# 广告入口可能先返回自定义日期范围；它只作为模板，后续会按目标周期重建日期参数。
+AD_TEMPLATE_GROUP_VALUES: frozenset[str] = AD_KNOWN_GROUP_VALUES | {"custom"}
+
+try:
+    BRAZIL_TIMEZONE = ZoneInfo("America/Sao_Paulo")
+except ZoneInfoNotFoundError:
+    # Windows 未安装 tzdata 时使用巴西当前通用的 UTC-3，保证日期计算仍可用。
+    BRAZIL_TIMEZONE = timezone(timedelta(hours=-3), "BRT")
 
 # 昨日/最近7天页面首次加载失败后允许刷新的次数。值为5表示首次打开1次加刷新5次，
 # 每个时间范围最多进行6轮“文档完成 + 首个指标文本验证”。
@@ -224,12 +233,18 @@ class ShopeeAuto:
         template_url = self._open_ad_page(tab, store_name)
 
         rows: list[dict[str, Any]] = []
+        period_reference_time = datetime.now(BRAZIL_TIMEZONE)
         for period in ("昨天", "7天", "今天"):
             if not is_period_enabled(self.config, period):
                 LOGGER.info("[Shopee][广告] 时间范围=%s 已按配置关闭，跳过", period)
                 continue
             group_value = PERIOD_GROUP_VALUES[period]
-            period_url = self._replace_group_in_url(template_url, group_value)
+            period_url = self._replace_group_in_url(
+                template_url,
+                group_value,
+                period=period,
+                reference_time=period_reference_time,
+            )
             LOGGER.info(
                 "[Shopee][周期URL] 时间范围=%s，group=%s，模板url=%s，目标url=%s",
                 period,
@@ -1132,7 +1147,7 @@ class ShopeeAuto:
 
             last_failure_reason = (
                 f"每隔 {AD_GROUP_URL_CHECK_INTERVAL_SECONDS} 秒查询 {AD_GROUP_URL_CHECK_TIMES} 次后，"
-                "URL仍没有已知group参数"
+                "URL仍没有可转换的group参数"
             )
 
         raise TimeoutError(
@@ -1173,7 +1188,7 @@ class ShopeeAuto:
                     group_value or "<未出现>",
                     current_url or "<空>",
                 )
-                if group_value in AD_KNOWN_GROUP_VALUES:
+                if group_value in AD_TEMPLATE_GROUP_VALUES:
                     return current_url
 
             if check_index < AD_GROUP_URL_CHECK_TIMES - 1:
@@ -1392,22 +1407,76 @@ class ShopeeAuto:
         return ""
 
     @staticmethod
-    def _replace_group_in_url(source_url: str, group_value: str) -> str:
-        """只替换完整 URL 的 group 参数，保留 Shopee 生成的 from、to、type 等参数。"""
+    def _replace_group_in_url(
+        source_url: str,
+        group_value: str,
+        *,
+        period: str | None = None,
+        reference_time: datetime | None = None,
+    ) -> str:
+        """替换 group，并按巴西日期重建指定周期的 from/to 参数。"""
         parsed = urlsplit(str(source_url or "").strip())
         query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        period_range: tuple[int, int] | None = None
+        if period is not None:
+            period_range = ShopeeAuto._brazil_period_epoch_range(period, reference_time)
+
         replaced = False
+        replaced_from = False
+        replaced_to = False
         updated_pairs: list[tuple[str, str]] = []
         for key, value in query_pairs:
-            if key.casefold() == "group":
+            key_lower = key.casefold()
+            if key_lower == "group":
                 if not replaced:
                     updated_pairs.append((key, group_value))
                     replaced = True
                 continue
+            if period_range is not None and key_lower == "from":
+                updated_pairs.append((key, str(period_range[0])))
+                replaced_from = True
+                continue
+            if period_range is not None and key_lower == "to":
+                updated_pairs.append((key, str(period_range[1])))
+                replaced_to = True
+                continue
             updated_pairs.append((key, value))
         if not replaced:
             updated_pairs.append(("group", group_value))
+        if period_range is not None:
+            if not replaced_from:
+                updated_pairs.append(("from", str(period_range[0])))
+            if not replaced_to:
+                updated_pairs.append(("to", str(period_range[1])))
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(updated_pairs), parsed.fragment))
+
+    @staticmethod
+    def _brazil_period_epoch_range(
+        period: str,
+        reference_time: datetime | None = None,
+    ) -> tuple[int, int]:
+        """按巴西当地日期返回周期开始和结束的 Unix 秒时间戳。"""
+        current_time = reference_time or datetime.now(BRAZIL_TIMEZONE)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=BRAZIL_TIMEZONE)
+        else:
+            current_time = current_time.astimezone(BRAZIL_TIMEZONE)
+        current_date = current_time.date()
+
+        if period == "今天":
+            start_date = end_date = current_date
+        elif period == "昨天":
+            start_date = end_date = current_date - timedelta(days=1)
+        elif period == "7天":
+            # 最近7天包含今天，因此从当地日期往前推6天。
+            start_date = current_date - timedelta(days=6)
+            end_date = current_date
+        else:
+            raise ValueError(f"不支持按日期构建 Shopee 周期 URL：{period}")
+
+        start_local = datetime.combine(start_date, datetime_time.min, tzinfo=BRAZIL_TIMEZONE)
+        end_local = datetime.combine(end_date, datetime_time(23, 59, 59), tzinfo=BRAZIL_TIMEZONE)
+        return int(start_local.timestamp()), int(end_local.timestamp())
 
     @staticmethod
     def _is_traffic_error_url(current_url: str) -> bool:
