@@ -108,9 +108,9 @@ SHOPEE_SYSTEM_PROMPT = r"""
 
 # 时间比较
 
-分析优先级为：昨天完整数据、近7天基准、今天实时数据。
+本项目只采集巴西时间今天的实时数据。明确说明采集时间与当天未结束的限制。
 
-累计指标比较昨天和近7天时，先计算“近7天日均 = 近7天累计 / 7”，再计算昨日相对日均变化。比率指标可直接比较昨天与近7天。
+没有昨日或近7天数据时，不输出对应列，不计算环比、同比或近7天日均，不将实时数据推断为完整一天数据。
 
 # 经营分析
 
@@ -125,7 +125,7 @@ SHOPEE_SYSTEM_PROMPT = r"""
 
 # 异常与建议
 
-异常等级使用：正常、关注、异常、暂不判断、数据缺失。优先根据近7天、同店趋势和指标逻辑判断，不得凭空设置固定行业阈值。小样本波动不得定性为严重异常。
+异常等级使用：正常、关注、异常、暂不判断、数据缺失。根据今天已提供的指标逻辑判断；缺少历史基准时说明限制，不得凭空设置固定行业阈值。小样本波动不得定性为严重异常。
 
 建议必须采用“现象 -> 原因 -> 动作”的逻辑，具体到当天可以执行。每天只给 3 至 5 条建议，按 P1、P2、P3 等优先级排列。
 
@@ -137,25 +137,25 @@ SHOPEE_SYSTEM_PROMPT = r"""
 
 ## 一、经营结论
 
-用 3 至 6 句话概括昨天表现、主要问题、最大机会和今天最优先动作。
+用 3 至 6 句话概括今天实时表现、主要问题、最大机会和今天最优先动作。
 
 ## 二、核心经营指标
 
-| 指标 | 昨天 | 近7天/日均 | 判断 |
-|---|---:|---:|---|
+| 指标 | 今天 | 判断 |
+|---|---:|---|
 
 至少包含销售额、订单数、客单价、访客数、商品点击量和订单转化率。缺失时写“数据缺失”。
 
 ## 三、广告诊断
 
-| 指标 | 昨天 | 近7天 | 判断 |
-|---|---:|---:|---|
+| 指标 | 今天 | 判断 |
+|---|---:|---|
 
 至少包含 CTR、CPC、广告CVR、CPA、广告客单价、ROAS、ACOS，并用一段话说明 ROAS 变化主要来自点击成本、转化率还是客单价。
 
 ## 四、商品转化漏斗
 
-| 环节 | 昨天数据 | 判断 |
+| 环节 | 今天数据 | 判断 |
 |---|---:|---|
 
 至少观察商品访客、跳出率、加购率、下单转化率、付款转化率和下单到付款率。
@@ -185,6 +185,18 @@ SHOPEE_SYSTEM_PROMPT = r"""
 """.strip()
 
 
+TODAY_DATA_ANALYSIS_RULES = r"""
+【项目数据约束：以下规则适用于三平台单店与全店分析】
+1. 本项目只提供巴西时间今天的数据。即使之前的模板提到昨天、近7天或30天，也不得生成这些周期的表格列、比较结果、环比或历史数值；缺少基准时直接说明无法比较。
+2. 每项金额必须读取“指标元数据”中的 currency；页面原文明确给出的 USD、BRL、$ 或 R$ 与币种标注一起保留。不得把 USD 金额写为 BRL/R$，也不得把 BRL 金额写为美元。
+3. 未提供汇率和统一币种后的数据时，不得将 USD 与 BRL 相加、直接比较或计算跨币种 ROAS、ACOS、TACOS、贡献率。可使用页面已经给出的同口径 ROI；跨币种指标写明“币种不一致，暂不计算”。金额币种未知时明确标注“币种未知”。
+4. “今天广告SKU订单数”是广告归因订单，“今天概览SKU订单数”是店铺整体概览订单，两者必须独立引用。概览订单不是自然订单；不能用概览订单覆盖广告订单，不能在归因口径不明时直接相减得出自然订单。
+5. 广告销售额、经营销售额、广告订单、整体订单和自然订单必须按模块分别分析。同一天、同一店铺的不同模块也不得重复相加或强行对齐。
+6. 空值、null、横杠和未准备好的数据表示缺失，合法数值0仍是有效数据；GMV为0时渠道占比无法计算，不得认定抓取失败。
+7. 当前数据是今天的实时快照，需指出采集时间和小样本限制；只分析输入中实际存在的模块，不凭空填补未采集的商品或流量明细。
+""".strip()
+
+
 class DeepSeekClient:
     """复用同一客户端执行三平台单店分析和全店铺汇总。"""
 
@@ -209,17 +221,19 @@ class DeepSeekClient:
         self.base_url = str(deepseek_config.get("base_url") or "https://api.deepseek.com").rstrip("/")
         self.timeout_seconds = float(deepseek_config.get("timeout_seconds", 300) or 300)
 
-        # 参考脚本中的系统提示词是固定内容，当前请求直接使用该原文。
-        self.system_prompt = REFERENCE_SYSTEM_PROMPT
+        # 用户自定义提示词保留，并在末尾追加项目当前的数据与币种约束。
+        self.system_prompt = self._with_data_contract(
+            str(deepseek_config.get("system_prompt") or REFERENCE_SYSTEM_PROMPT).strip()
+        )
         shopee_system_prompt = str(
             deepseek_config.get("shopee_system_prompt") or SHOPEE_SYSTEM_PROMPT
         ).strip()
         # 三个平台共用客户端、密钥和模型，仅系统提示词彼此独立。
         # TikTok 和美客多尚未提供专用提示词时，临时回退到虾皮提示词。
         self.platform_system_prompts = {
-            "tiktok": str(deepseek_config.get("tiktok_system_prompt") or shopee_system_prompt).strip(),
-            "shopee": shopee_system_prompt,
-            "mercado": str(deepseek_config.get("mercado_system_prompt") or shopee_system_prompt).strip(),
+            "tiktok": self._with_data_contract(str(deepseek_config.get("tiktok_system_prompt") or shopee_system_prompt).strip()),
+            "shopee": self._with_data_contract(shopee_system_prompt),
+            "mercado": self._with_data_contract(str(deepseek_config.get("mercado_system_prompt") or shopee_system_prompt).strip()),
         }
 
         # 保留项目原有失败重试；每次重试仍使用完全相同的 DS_an2 请求体。
@@ -242,8 +256,16 @@ class DeepSeekClient:
         return bool(self.enabled and self.api_key and self.model_name and self.base_url and self.client)
 
     @staticmethod
+    def _with_data_contract(system_prompt: str) -> str:
+        """自定义提示词沿用原文；强制加入今天、归因与金额币种规则且不重复追加。"""
+        prompt = str(system_prompt or "").strip()
+        if TODAY_DATA_ANALYSIS_RULES in prompt:
+            return prompt
+        return f"{prompt}\n\n{TODAY_DATA_ANALYSIS_RULES}".strip()
+
+    @staticmethod
     def build_user_prompt(shop_data: str) -> str:
-        """完全复制 DS_an2.py 的 build_user_prompt 文本结构。"""
+        """保留全店原始数据结构，并明确今天和金额币种约束。"""
         return f"""
             以下是今天需要分析的巴西电商店铺原始数据。
             
@@ -263,6 +285,8 @@ class DeepSeekClient:
             
                - 今天最需要处理哪些店铺
                - 为什么
+
+            {TODAY_DATA_ANALYSIS_RULES}
             
             ================ 原始店铺数据 ================
             
@@ -308,7 +332,7 @@ class DeepSeekClient:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": self.system_prompt},
+                        {"role": "system", "content": self._with_data_contract(self.system_prompt)},
                         {"role": "user", "content": user_prompt},
                     ],
                     extra_body={
@@ -360,6 +384,8 @@ class DeepSeekClient:
             4. 数据有矛盾时必须明确指出。
             5. 样本量过小时必须说明。
             6. 最终重点说明发生了什么、为什么、是否严重，以及今天应该执行什么。
+
+            {TODAY_DATA_ANALYSIS_RULES}
             
             ================ 原始店铺数据 ================
             
@@ -402,7 +428,7 @@ class DeepSeekClient:
 
         shop_data = json.dumps([store_info], ensure_ascii=False, default=str)
         user_prompt = self.build_store_user_prompt(shop_data, platform_name)
-        system_prompt = self.platform_system_prompts[platform]
+        system_prompt = self._with_data_contract(self.platform_system_prompts[platform])
         store_name = str(store_info.get("店铺名") or "未知店铺")
         LOGGER.info(
             "[DeepSeek][单店请求准备] 平台=%s，店铺=%s，url=%s，model=%s，原始数据字符数=%s，"

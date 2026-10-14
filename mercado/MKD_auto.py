@@ -190,7 +190,9 @@ class MercadoAuto:
         """保存美客多独立配置；指标 XPath 直接维护在本文件的 METRIC_SPECS。"""
         self.config = config or {}
         self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
-        self._ad_capture = MercadoAdCapture(self.config.get("ad_capture", {}))
+        self._ad_capture = MercadoAdCapture(
+            self.config.get("ad_capture", {}), human_config=self.config.get("human_interaction", {}),
+        )
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，读取今天、7 天和 30 天经营指标。"""
@@ -216,8 +218,8 @@ class MercadoAuto:
         # 使用当前已登录的紫鸟标签页直接进入经营指标页；新页面必须再次加载完成后才允许操作。
         self._open_metrics_page(tab)
 
-        # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
-        for period in ("7天", "30天", "今天"):
+        # 当前只切换巴西今天，不再读取其他历史周期。
+        for period in ("今天",):
             if not is_period_enabled(self.config, period):
                 LOGGER.info("[美客多][指标] 时间范围=%s 已按配置关闭，跳过", period)
                 continue
@@ -278,7 +280,7 @@ class MercadoAuto:
             "店铺名": store_name,
             "平台": "mercado",
             "采集时间": collected_at,
-            "指标": "美客多7天/30天经营指标",
+            "指标": "美客多今天经营及广告指标",
             "数值": "",
             "原始数据": json.dumps(raw_values, ensure_ascii=False),
             "飞书字段": feishu_fields,

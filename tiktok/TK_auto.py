@@ -71,6 +71,8 @@ LOGIN_SUCCESS_URL_TIMEOUT_SECONDS = 60
 # 每次点击时间按钮或日期按钮后，最多等待多少秒确认状态；超时才进入重试。
 # 用户要求所有按钮点击后的状态等待统一使用这个变量。
 TK_STEP_WAIT_SECONDS = 2
+# 日期面板的出现、消失验证使用较长窗口，避免正常前端动画被误报为失败。
+TK_DATE_STEP_WAIT_SECONDS = 5
 # 调用 tab.get() 跳转广告页或概览页后，等待 URL 进入目标路径的最长时间。
 BUSINESS_PAGE_URL_TIMEOUT_SECONDS = 120
 # 已进入广告页或概览页目标路径后，等待该页面时间按钮出现的最长时间。
@@ -188,7 +190,11 @@ AD_METRIC_SPECS: list[dict[str, str]] = [
     {"period": "7天", "field": "7天ROI", "xpath": '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[5]//span[starts-with(@class,"overview-item-value-")]', "kind": "decimal"},
 ]
 AD_METRIC_SPECS.extend(
-    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    {
+        **spec,
+        "period": "今天",
+        "field": "今天广告SKU订单数" if spec["field"] == "7天SKU订单数" else spec["field"].replace("7天", "今天"),
+    }
     for spec in tuple(AD_METRIC_SPECS)
     if spec["period"] == "7天"
 )
@@ -306,7 +312,11 @@ OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
 
 # 今天沿用与最近 7 天相同的指标 XPath，只更换字段前缀，便于消息中单独展示。
 OVERVIEW_METRIC_SPECS.extend(
-    {**spec, "period": "今天", "field": spec["field"].replace("7天", "今天")}
+    {
+        **spec,
+        "period": "今天",
+        "field": "今天概览SKU订单数" if spec["field"] == "7天SKU订单数" else spec["field"].replace("7天", "今天"),
+    }
     for spec in tuple(OVERVIEW_METRIC_SPECS)
     if spec["period"] == "7天"
 )
@@ -363,6 +373,9 @@ class TiktokAuto:
         """保存 TikTok 独立配置；按钮和指标 XPath 直接维护在本文件顶部。"""
         self.config = config or {}
         self._human_interaction = HumanInteraction(self.config.get("human_interaction", {}))
+        self.date_step_wait_seconds = max(
+            0.1, float(self.config.get("date_step_wait_seconds", TK_DATE_STEP_WAIT_SECONDS))
+        )
         # 记录最近一次真实点击的时间；后续每次点击都会据此补足随机的人类操作间隔。
         self._last_button_click_at: float | None = None
 
@@ -394,17 +407,17 @@ class TiktokAuto:
         ad_fields: dict[str, Any] = {}
         ad_raw_values: dict[str, str] = {}
         enabled_ad_periods = tuple(
-            period for period in ("昨天", "7天", "今天") if is_period_enabled(self.config, period)
+            period for period in ("今天",) if is_period_enabled(self.config, period)
         )
         ad_page_ready = bool(enabled_ad_periods) and self._open_business_page(
             tab, AD_PAGE_URL, AD_TIME_BUTTON_XPATH, "TikTok广告页时间面板按钮"
         )
         if not ad_page_ready:
-            LOGGER.error("[TikTok][广告页面失败] 直接打开广告页后未确认时间面板按钮出现，本店铺两个广告周期均按空值处理")
+            LOGGER.error("[TikTok][广告页面失败] 直接打开广告页后未确认时间面板按钮出现，今天广告按空值处理")
         else:
             LOGGER.info("[TikTok][广告页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
-        for period in ("昨天", "7天", "今天"):
+        for period in ("今天",):
             if not is_period_enabled(self.config, period):
                 LOGGER.info("[TikTok][广告] 时间范围=%s 已按配置关闭，跳过", period)
                 continue
@@ -440,6 +453,7 @@ class TiktokAuto:
             "数值": "",
             "原始数据": json.dumps(ad_raw_values, ensure_ascii=False),
             "飞书字段": ad_fields,
+            "指标元数据": self._build_metric_metadata(AD_METRIC_SPECS, ad_fields, ad_raw_values, "广告"),
         }
 
         # 2. 直接进入数据概览页，不再点击“数据分析 -> 概览”。
@@ -447,17 +461,17 @@ class TiktokAuto:
         overview_fields: dict[str, Any] = {}
         overview_raw_values: dict[str, str] = {}
         enabled_overview_periods = tuple(
-            period for period in ("昨天", "7天", "今天") if is_period_enabled(self.config, period)
+            period for period in ("今天",) if is_period_enabled(self.config, period)
         )
         overview_page_ready = bool(enabled_overview_periods) and self._open_business_page(
             tab, OVERVIEW_PAGE_URL, OVERVIEW_TIME_BUTTON_XPATH, "TikTok数据概览页时间面板按钮"
         )
         if not overview_page_ready:
-            LOGGER.error("[TikTok][概览页面失败] 直接打开数据概览页后未确认时间面板按钮出现，本店铺两个概览周期均按空值处理")
+            LOGGER.error("[TikTok][概览页面失败] 直接打开数据概览页后未确认时间面板按钮出现，今天概览按空值处理")
         else:
             LOGGER.info("[TikTok][概览页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
-        for period in ("昨天", "7天", "今天"):
+        for period in ("今天",):
             if not is_period_enabled(self.config, period):
                 LOGGER.info("[TikTok][概览] 时间范围=%s 已按配置关闭，跳过", period)
                 continue
@@ -513,6 +527,7 @@ class TiktokAuto:
             "数值": "",
             "原始数据": json.dumps(overview_raw_values, ensure_ascii=False),
             "飞书字段": overview_fields,
+            "指标元数据": self._build_metric_metadata(OVERVIEW_METRIC_SPECS, overview_fields, overview_raw_values, "概览"),
         }
 
         # 两个模块分别返回一条记录，避免同名字段（如 SKU订单数）相互覆盖。
@@ -580,6 +595,7 @@ class TiktokAuto:
                 xpath or "<空 XPath>",
             )
             raw_text = batch_raw_values.get(field_name, "")
+            currency_code = self._resolve_metric_currency(raw_text, currency_code) if value_kind == "currency" else ""
             converted_value = self._format_value(raw_text, value_kind, currency_code)
             raw_values[field_name] = raw_text
             field_values[field_name] = converted_value
@@ -595,6 +611,10 @@ class TiktokAuto:
             )
             if raw_text == "":
                 LOGGER.warning("[TikTok][指标失败] 字段=%s，XPath 未抓到有效文本，最终按空值处理", field_name)
+            elif converted_value == "" and re.fullmatch(
+                r"[-—–]+%?|N/?A", re.sub(r"\s+", "", str(raw_text)), re.IGNORECASE
+            ):
+                LOGGER.info("[TikTok][指标无数据] 字段=%s，页面占位值=%r，按业务规则保留空值", field_name, raw_text)
             elif converted_value == "":
                 LOGGER.warning(
                     "[TikTok][转换失败] 字段=%s，已抓到原始值=%r，但无法按配置类型=%s 转换，最终按空值处理",
@@ -602,6 +622,43 @@ class TiktokAuto:
                     raw_text,
                     value_kind,
                 )
+
+    @staticmethod
+    def _resolve_metric_currency(raw_text: str, configured_currency: str = "") -> str:
+        """优先识别页面明确币种；没有明确标识时才回退到指标配置。"""
+        text = str(raw_text or "").strip()
+        if re.search(r"R\s*\$|\bBRL\b|\breais\b|\breal\b|雷亚尔", text, re.IGNORECASE):
+            return "BRL"
+        if re.search(r"\bUSD\b|US\s*\$|美元", text, re.IGNORECASE):
+            return "USD"
+        if "$" in text:
+            return "USD"
+        return str(configured_currency or "").upper()
+
+    @classmethod
+    def _build_metric_metadata(
+        cls,
+        specs: list[dict[str, str]],
+        fields: dict[str, Any],
+        raw_values: dict[str, str],
+        module: str,
+    ) -> dict[str, dict[str, Any]]:
+        """让每个数值携带模块、周期和币种，供汇总、消息与分析统一使用。"""
+        spec_by_field = {spec["field"]: spec for spec in specs if spec["period"] == "今天"}
+        metadata: dict[str, dict[str, Any]] = {}
+        for field_name in fields:
+            spec = spec_by_field.get(field_name, {})
+            kind = str(spec.get("kind") or ("percent" if field_name.endswith("比") else "decimal"))
+            currency = cls._resolve_metric_currency(
+                raw_values.get(field_name, ""), spec.get("currency_code", "")
+            ) if kind == "currency" else None
+            metadata[field_name] = {
+                "currency": currency or None,
+                "module": module,
+                "period": "今天",
+                "unit": {"currency": "currency", "integer": "count", "decimal": "ratio", "percent": "percent"}.get(kind, kind),
+            }
+        return metadata
 
     def _read_metric_batch(
         self,
@@ -751,8 +808,8 @@ class TiktokAuto:
                 )
             else:
                 field_values[ratio_field] = ""
-                LOGGER.warning(
-                    "[TikTok][GMV占比计算失败] 时间范围=%s，字段=%s，渠道金额=%r，总GMV=%r；金额缺失或总GMV不大于0，返回空值",
+                LOGGER.info(
+                    "[TikTok][GMV占比暂不计算] 时间范围=%s，字段=%s，渠道金额=%r，总GMV=%r；金额缺失或总GMV不大于0，按业务规则保留空值",
                     period,
                     ratio_field,
                     amount_value,
@@ -1546,11 +1603,11 @@ class TiktokAuto:
             success_xpath=option_xpath,
             success_state="visible",
             success_name=str(open_step.get("success_name") or "日期选项已经出现"),
-            success_timeout_seconds=TK_STEP_WAIT_SECONDS,
+            success_timeout_seconds=self.date_step_wait_seconds,
         )
         if not panel_opened:
             # 不在这里终止：下一步会再次检查日期选项；不可见时由 recovery_xpath 重做本步骤。
-            LOGGER.warning("[TikTok][日期流程恢复] 上一步=%s 未确认成功，下一步将按页面实际可见性决定是否重开面板", open_name)
+            LOGGER.info("[TikTok][日期流程恢复] 上一步=%s 未确认成功，下一步将按页面实际可见性决定是否重开面板", open_name)
 
         option_clicked = self._click_with_retry(
             tab,
@@ -1562,7 +1619,7 @@ class TiktokAuto:
             recovery_xpath=open_xpath,
             recovery_step_name=f"{open_name}（日期选项不可见，重新执行上一步）",
             recovery_success_name=str(open_step.get("success_name") or "日期选项已经重新出现"),
-            success_timeout_seconds=TK_STEP_WAIT_SECONDS,
+            success_timeout_seconds=self.date_step_wait_seconds,
         )
         if not option_clicked:
             LOGGER.error("[TikTok][日期流程失败] 日期选项=%s 点击及恢复均失败", option_name)
@@ -1571,7 +1628,7 @@ class TiktokAuto:
         LOGGER.info(
             "[TikTok][日期流程成功] 日期选项=%s 点击后已在 %.1f 秒内消失，确认日期切换成功",
             option_name,
-            TK_STEP_WAIT_SECONDS,
+            self.date_step_wait_seconds,
         )
         return True
 
@@ -1607,7 +1664,7 @@ class TiktokAuto:
             if attempt > 0:
                 # 在固定 2 秒基础上增加少量随机等待，避免点击节奏完全一致。
                 interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
-                LOGGER.warning(
+                LOGGER.info(
                     "[TikTok][按钮重试] 步骤=%s，第 %s/%s 次尝试前等待 %.2f 秒，xpath=%s",
                     step_name,
                     attempt + 1,
@@ -1626,7 +1683,7 @@ class TiktokAuto:
                 )
                 element = self._find_visible_element(tab, xpath, timeout=TK_STEP_WAIT_SECONDS)
                 if not element and recovery_xpath:
-                    LOGGER.warning(
+                    LOGGER.info(
                         "[TikTok][按钮恢复上一步] 步骤=%s，第 %s/%s 次尝试发现目标不可见；不直接重试目标，先执行=%s，xpath=%s",
                         step_name,
                         attempt + 1,
@@ -1677,7 +1734,7 @@ class TiktokAuto:
                         success_name,
                     )
                     if not verified:
-                        LOGGER.warning(
+                        LOGGER.info(
                             "[TikTok][按钮验证失败] 步骤=%s，第 %s/%s 次点击后未满足=%s，准备重试",
                             step_name,
                             attempt + 1,
@@ -1744,7 +1801,7 @@ class TiktokAuto:
                         return True
             self._human_wait(tab, 0.5)
 
-        LOGGER.error(
+        LOGGER.info(
             "[TikTok][状态等待超时] 目标=%s，等待 %.1f 秒仍未达到=%s，xpath=%s",
             target_name,
             timeout_seconds,

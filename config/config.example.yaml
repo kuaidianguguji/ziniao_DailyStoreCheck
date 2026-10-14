@@ -224,6 +224,10 @@ platforms:
       page_url: "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
       request_timeout_seconds: 60
       fallback_request_timeout_seconds: 60
+      # 广告概览日期按钮、菜单、日历和单日标签的最长等待时间。
+      ui_timeout_seconds: 20
+      # 单日 chart 仍不可用时，页面五项指标完成加载并稳定的最长等待时间。
+      dom_timeout_seconds: 60
       # 点击今天日期按钮时两次点击之间的随机间隔，单位为毫秒。
       fallback_double_click_min_interval_ms: 80
       fallback_double_click_max_interval_ms: 180

@@ -65,6 +65,8 @@ python ziniao_webdriver_demo.py
 
 三个平台的抓取周期可以在 `config/config.yaml` 中分别开关：TikTok、Shopee 使用 `today`、`yesterday`、`7d`；美客多使用 `today`、`7d`、`30d`。将某个值设为 `false` 后，该周期不会执行页面切换和指标读取，其余周期照常运行。
 
+美客多广告概览优先读取浏览器触发的 `chart` 响应。当天指标不完整或监听超时时，点击“周期 → 自定义”，以巴西 UTC-3 的完整日期选择今天，并在日期双击前重新准备监听；只接受起止均为今天的 `chart`。单日响应中的空日期数组可以使用同一响应的 `summary` 补齐，数值 `0` 属于有效数据。若单日响应仍不可用，确认页面为今天且指标加载稳定后，仅读取投资额、收入、销量（中文页面显示“销售额”）、新增粉丝和访问量；不生成缺失的曝光数或点击量。旧广告活动管理页保留独立的 `campaigns/search` 流程。整个广告采集只使用浏览器监听及页面操作，不发送主动接口请求。等待与双击间隔参数见 `config/config.example.yaml` 的 `platforms.mercado.ad_capture`。
+
 ```powershell
 pip install -r requirements-daily.txt
 Copy-Item config/config.example.yaml config/config.yaml

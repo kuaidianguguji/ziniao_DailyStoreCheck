@@ -15,10 +15,12 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
+from urllib.parse import quote
 
 import requests
 
 from .config import StoreTask, is_enabled_switch, normalise_platform
+from .storage_schema import METADATA_FIELD_ORDER, today_field_names, today_field_specs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,10 @@ class FeishuClient:
         # requests.Session、tenant token 和字段缓存由所有店铺线程共享；
         # 仅串行化短暂的飞书 HTTP 请求，不影响多个浏览器并行采集。
         self._request_lock = threading.RLock()
+        # 建表头、查重和写入组成同一操作，避免并发店铺同时追加字段或重复记录。
+        self._storage_lock = threading.RLock()
+        self._daily_bitable_fields: dict[tuple[str, str], dict[str, int]] = {}
+        self._daily_sheet_headers: dict[tuple[str, str], list[str]] = {}
 
     @property
     def configured(self) -> bool:
@@ -416,6 +422,314 @@ class FeishuClient:
             headers=self._headers(),
             json=request_body,
         )
+
+    def _list_daily_bitable_fields(self, app_token: str, table_id: str) -> dict[str, int]:
+        """读取字段类型，既有字段及公式保持原样。"""
+        fields: dict[str, int] = {}
+        page_token = ""
+        while True:
+            params: dict[str, Any] = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            payload = self._request(
+                "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+                headers=self._headers(), params=params,
+            )
+            data = payload.get("data", {})
+            for item in data.get("items", []):
+                if item.get("field_name"):
+                    fields[str(item["field_name"])] = int(item.get("type", 1))
+            if not data.get("has_more"):
+                return fields
+            page_token = str(data.get("page_token") or "")
+            if not page_token:
+                raise RuntimeError("飞书字段分页缺少下一页令牌，不能安全准备今日字段")
+
+    @staticmethod
+    def _storage_retryable(error: Exception) -> bool:
+        """只重试网络中断、服务端暂时故障和不可解析的返回内容。"""
+        if isinstance(error, requests.RequestException):
+            response = getattr(error, "response", None)
+            return response is None or response.status_code == 429 or response.status_code >= 500
+        if isinstance(error, ValueError):
+            return True
+        return bool(re.search(r"code=(95201|95210|99991400)\b|status=(429|5\d\d)\b|server error", str(error), re.I))
+
+    def _verified_storage_write(self, write: Any, verify: Any, label: str) -> None:
+        """写入返回不确定时先回读，已落地就确认成功，不再次追加。"""
+        for attempt in range(1, 4):
+            if verify():
+                LOGGER.info("[飞书][补写回读确认] 操作=%s，数据已存在，跳过重复写入", label)
+                return
+            try:
+                write()
+                return
+            except Exception as error:
+                if not self._storage_retryable(error):
+                    raise
+                LOGGER.warning("[飞书][写入待确认] 操作=%s，第%s/3次，异常类型=%s", label, attempt, type(error).__name__)
+                # 回读失败时无法确认上一次是否已经成功，保留待补写记录，禁止盲目追加。
+                for delay in (0.5, 1.0, 2.0):
+                    time.sleep(delay)
+                    if verify():
+                        LOGGER.info("[飞书][写入回读成功] 操作=%s，已确认数据实际写入", label)
+                        return
+                if attempt == 3:
+                    raise
+                time.sleep(float(attempt))
+
+    def _ensure_daily_bitable_schema(self, platform: str, app_token: str, table_id: str) -> dict[str, int]:
+        """只补充今日所需字段，不删除或改动已有历史字段。"""
+        key = (app_token, table_id)
+        cached = self._daily_bitable_fields.get(key)
+        if cached is not None:
+            return cached
+        fields = self._list_daily_bitable_fields(app_token, table_id)
+        for spec in today_field_specs(platform):
+            if spec.name in fields:
+                continue
+
+            def verify(name: str = spec.name) -> bool:
+                fields.update(self._list_daily_bitable_fields(app_token, table_id))
+                return name in fields
+
+            self._verified_storage_write(
+                lambda spec=spec: self._request(
+                    "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+                    headers=self._headers(), json={"field_name": spec.name, "type": spec.field_type},
+                ),
+                verify, f"准备{platform}今日字段:{spec.name}",
+            )
+            fields.setdefault(spec.name, spec.field_type)
+        self._daily_bitable_fields[key] = dict(fields)
+        self._table_field_names_cache[key] = set(fields)
+        return fields
+
+    @staticmethod
+    def _today_storage_fields(platform: str, fields: dict[str, Any], batch_id: str) -> dict[str, Any]:
+        """存储层再次过滤旧周期，保证旧记录补写也不会上传昨天或七天数据。"""
+        valid_names = set(today_field_names(platform))
+        result = {name: value for name, value in fields.items() if name in valid_names and value not in (None, "")}
+        result["平台"] = platform
+        result["采集批次"] = str(batch_id).strip()
+        if not result.get("店铺名") or not result.get("业务日期") or not result["采集批次"]:
+            raise ValueError("今日写入必须具有店铺名、巴西业务日期和采集批次")
+        datetime.strptime(str(result["业务日期"]), "%Y-%m-%d")
+        return result
+
+    @staticmethod
+    def _storage_cell_equal(left: Any, right: Any) -> bool:
+        """飞书回读数字可能变为字符串，仍按业务数值校验。"""
+        left = FeishuClient._field_value(left)
+        right = FeishuClient._field_value(right)
+        if left == right:
+            return True
+        if isinstance(left, bool) or isinstance(right, bool):
+            return False
+        try:
+            return float(left) == float(right)
+        except (TypeError, ValueError):
+            return str(left) == str(right)
+
+    @staticmethod
+    def _storage_date_ms(value: Any) -> int:
+        """将日期或 ISO 采集时间转换为多维表毫秒时间戳。"""
+        if isinstance(value, (int, float)):
+            return int(value)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=-3)))
+        return int(parsed.timestamp() * 1000)
+
+    def write_today_bitable(self, platform: str, fields: dict[str, Any], *, batch_id: str) -> None:
+        """按店铺、平台、巴西日期和批次幂等写入今日宽行。"""
+        if not self.configured:
+            LOGGER.warning("[飞书][今日多维表跳过] 应用凭据未配置，平台=%s", platform)
+            return
+        app_token, table_id = self.get_bitable_ref("data", platform)
+        if not app_token or not table_id:
+            raise RuntimeError(f"{platform} 今日多维表 app_token/table_id 未配置")
+        source = self._today_storage_fields(platform, fields, batch_id)
+        with self._storage_lock:
+            types = self._ensure_daily_bitable_schema(platform, app_token, table_id)
+            writable: dict[str, Any] = {}
+            for name, value in source.items():
+                field_type = types.get(name, 1)
+                if field_type in {19, 20}:
+                    LOGGER.warning("[飞书][今日只读字段跳过] 平台=%s，字段=%s", platform, name)
+                    continue
+                if field_type == 5:
+                    value = self._storage_date_ms(value)
+                elif field_type == 1:
+                    value = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+                writable[name] = value
+            identity = {name: writable[name] for name in ("店铺名", "平台", "业务日期", "采集批次")}
+            current: dict[str, Any] | None = None
+
+            def verify() -> bool:
+                nonlocal current
+                # 字段为本模块建立的文本字段，使用服务端过滤避免逐店下载全部历史记录。
+                terms = [f"CurrentValue.[{name}]={json.dumps(value, ensure_ascii=False)}" for name, value in identity.items()]
+                payload = self._request(
+                    "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                    headers=self._headers(), params={"page_size": 100, "filter": "AND(" + ",".join(terms) + ")"},
+                )
+                matches = [item for item in payload.get("data", {}).get("items", []) if all(
+                    self._storage_cell_equal(item.get("fields", {}).get(name), value)
+                    for name, value in identity.items()
+                )]
+                current = matches[0] if matches else None
+                return current is not None and all(
+                    self._storage_cell_equal(current.get("fields", {}).get(name), value)
+                    for name, value in writable.items()
+                )
+
+            def write() -> None:
+                if current is not None:
+                    record_id = current.get("record_id")
+                    if not record_id:
+                        raise RuntimeError("飞书今日记录缺少 record_id，无法安全更新")
+                    self._request(
+                        "PUT", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+                        headers=self._headers(), json={"fields": writable},
+                    )
+                else:
+                    self._request(
+                        "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                        headers=self._headers(), json={"fields": writable},
+                    )
+
+            self._verified_storage_write(write, verify, f"{platform}今日多维表:{source['店铺名']}")
+
+    @staticmethod
+    def _spreadsheet_column(index: int) -> str:
+        """把从 1 开始的列号转为 A、Z、AA 等列名。"""
+        result = ""
+        while index:
+            index, remainder = divmod(index - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    def _read_sheet_values(self, token: str, range_name: str) -> list[list[Any]]:
+        """读取指定单元格范围，回读失败必须抛出，不能误当作没有数据。"""
+        payload = self._request(
+            "GET", f"/open-apis/sheets/v2/spreadsheets/{token}/values/{quote(range_name, safe='')}",
+            headers=self._headers(), params={"valueRenderOption": "UnformattedValue", "dateTimeRenderOption": "FormattedString"},
+        )
+        data = payload.get("data", {})
+        values = data.get("valueRange", {}).get("values", [])
+        if not isinstance(values, list):
+            raise RuntimeError("飞书电子表回读的 values 结构无效")
+        return values
+
+    def _daily_sheet_ref(self, platform: str) -> tuple[str, str, int, int]:
+        """解析平台电子表配置，并读取当前行列容量。"""
+        value = self.config.get("spreadsheets", {}).get(platform, {})
+        if isinstance(value, dict):
+            token = str(value.get("token") or value.get("spreadsheet_token") or "")
+            wanted_sheet = str(value.get("sheet_id") or str(value.get("range") or "").split("!")[0])
+        else:
+            token, wanted_sheet = str(value or ""), ""
+        if not token:
+            raise RuntimeError(f"{platform} 今日电子表 token 未配置")
+        payload = self._request("GET", f"/open-apis/sheets/v3/spreadsheets/{token}/sheets/query", headers=self._headers())
+        sheets = payload.get("data", {}).get("sheets", [])
+        candidates = [sheet for sheet in sheets if not wanted_sheet or wanted_sheet in {str(sheet.get("sheet_id")), str(sheet.get("title"))}]
+        if not candidates:
+            raise RuntimeError(f"{platform} 电子表没有找到配置的工作表")
+        sheet = candidates[0]
+        grid = sheet.get("grid_properties", {})
+        return token, str(sheet["sheet_id"]), int(grid.get("row_count", 1000)), int(grid.get("column_count", 26))
+
+    def _ensure_daily_sheet_headers(self, platform: str, token: str, sheet_id: str, column_count: int) -> list[str]:
+        """在既有表头末尾补今日列，保留旧列位置和所有历史数据。"""
+        key = (token, sheet_id)
+        if key in self._daily_sheet_headers:
+            return self._daily_sheet_headers[key]
+        values = self._read_sheet_values(token, f"{sheet_id}!A1:{self._spreadsheet_column(column_count)}1")
+        headers = [str(self._field_value(value) or "").strip() for value in (values[0] if values else [])]
+        while headers and not headers[-1]:
+            headers.pop()
+        expected = headers + [name for name in today_field_names(platform) if name not in headers]
+        if len(expected) > column_count:
+            initial_capacity = column_count
+
+            def enough_columns() -> bool:
+                _, _, _, actual_columns = self._daily_sheet_ref(platform)
+                return actual_columns >= len(expected)
+
+            self._verified_storage_write(
+                lambda: self._request(
+                    "POST", f"/open-apis/sheets/v2/spreadsheets/{token}/dimension_range",
+                    headers=self._headers(), json={"dimension": {"sheetId": sheet_id, "majorDimension": "COLUMNS", "length": len(expected) - initial_capacity}},
+                ), enough_columns, f"{platform}今日电子表增加列",
+            )
+        if expected != headers:
+            # 只写新增加的表头单元格，不覆盖旧表头的内容及格式。
+            first_column = len(headers) + 1
+            range_name = f"{sheet_id}!{self._spreadsheet_column(first_column)}1:{self._spreadsheet_column(len(expected))}1"
+            new_headers = expected[len(headers):]
+            self._verified_storage_write(
+                lambda: self._request(
+                    "PUT", f"/open-apis/sheets/v2/spreadsheets/{token}/values", headers=self._headers(),
+                    json={"valueRange": {"range": range_name, "values": [new_headers]}},
+                ),
+                lambda: self._read_sheet_values(token, range_name) == [new_headers],
+                f"{platform}今日电子表补表头",
+            )
+        self._daily_sheet_headers[key] = expected
+        return expected
+
+    def write_today_spreadsheet(self, platform: str, fields: dict[str, Any], *, batch_id: str) -> None:
+        """今日行按真实表头写入，失败回读批次，补写不会重复追加。"""
+        if not self.configured:
+            LOGGER.warning("[飞书][今日电子表跳过] 应用凭据未配置，平台=%s", platform)
+            return
+        source = self._today_storage_fields(platform, fields, batch_id)
+        with self._storage_lock:
+            token, sheet_id, row_count, column_count = self._daily_sheet_ref(platform)
+            headers = self._ensure_daily_sheet_headers(platform, token, sheet_id, column_count)
+            row = [source.get(name, "") for name in headers]
+            row = [json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value for value in row]
+            last_column = self._spreadsheet_column(len(headers))
+            batch_column = self._spreadsheet_column(headers.index("采集批次") + 1)
+            target_row: int | None = None
+
+            def verify() -> bool:
+                nonlocal target_row
+                target_row = None
+                # 只扫描采集批次这一列，再回读命中行，避免下载整张历史电子表。
+                for start in range(2, row_count + 1, 1000):
+                    end = min(start + 999, row_count)
+                    batches = self._read_sheet_values(token, f"{sheet_id}!{batch_column}{start}:{batch_column}{end}")
+                    for offset, values in enumerate(batches):
+                        if not values or str(self._field_value(values[0])) != source["采集批次"]:
+                            continue
+                        row_number = start + offset
+                        actual_values = self._read_sheet_values(token, f"{sheet_id}!A{row_number}:{last_column}{row_number}")
+                        actual = actual_values[0] if actual_values else []
+                        if not all(
+                            self._storage_cell_equal(actual[headers.index(name)] if headers.index(name) < len(actual) else "", source[name])
+                            for name in ("店铺名", "平台", "业务日期", "采集批次")
+                        ):
+                            continue
+                        target_row = row_number
+                        return all(
+                            self._storage_cell_equal(actual[index] if index < len(actual) else "", value)
+                            for index, value in enumerate(row)
+                        )
+                return False
+
+            def write() -> None:
+                if target_row is not None:
+                    self._request(
+                        "PUT", f"/open-apis/sheets/v2/spreadsheets/{token}/values", headers=self._headers(),
+                        json={"valueRange": {"range": f"{sheet_id}!A{target_row}:{last_column}{target_row}", "values": [row]}},
+                    )
+                else:
+                    self.append_spreadsheet_rows(token, [row], f"{sheet_id}!A:{last_column}")
+
+            self._verified_storage_write(write, verify, f"{platform}今日电子表:{source['店铺名']}")
 
     def send_robot_message(self, recipient: str, title: str, content: str) -> None:
         """优先按 robot.receive_id_type 使用应用机器人定向推送，否则使用 webhook。"""

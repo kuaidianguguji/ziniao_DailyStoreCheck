@@ -8,10 +8,10 @@ import math
 import re
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
-from zoneinfo import ZoneInfo
+from mercado.ad_page import MercadoAdPage
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ FALLBACK_PATH_RE = re.compile(r"^/pa/api/admin-pads/ajax/campaigns/search$")
 PERIOD_BUTTON_XPATH = '//div[@class="andes-floating-menu"]//button[@aria-label="Período" or @aria-label="周期"]'
 CUSTOM_PERIOD_XPATH = '//div[@data-tippy-root]//ul/li[@data-key="custom"]'
 TODAY_CALENDAR_XPATH = '//div[@class="campaigns-period-picker"]//tbody//td[@data-today="true"]'
+BRAZIL_TIMEZONE = timezone(timedelta(hours=-3), "BRT")
+CHART_LISTENER_PATTERN = r"/advertiser-hub/api/general-metrics/[^/]+/chart\?"
 
 # 接口中的数组名称与飞书业务字段一一对应；每个数组只取巴西今天对应的最后一条记录。
 AD_METRIC_FIELDS: tuple[tuple[str, str], ...] = (
@@ -42,7 +44,12 @@ AD_METRIC_FIELDS: tuple[tuple[str, str], ...] = (
 class MercadoAdCapture:
     """在当前已登录的 DrissionPage 标签页中监听美客多广告接口。"""
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        human_config: dict[str, Any] | None = None,
+    ):
         config = config if isinstance(config, dict) else {}
         self.enabled = bool(config.get("enabled", True))
         self.page_url = str(config.get("page_url") or DEFAULT_AD_PAGE_URL).strip()
@@ -81,6 +88,8 @@ class MercadoAdCapture:
                 self.fallback_double_click_max_interval_ms,
                 self.fallback_double_click_min_interval_ms,
             )
+        self._ad_page = MercadoAdPage(config, human_config=human_config)
+        self._active_listener: Any = None
 
     def collect_today(self, tab: Any, store_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """跳转广告页并返回飞书字段、原始响应摘要。"""
@@ -92,49 +101,107 @@ class MercadoAdCapture:
         if listener is None:
             raise RuntimeError("当前 DrissionPage 标签页不支持网络监听")
 
-        # 只订阅 GET 的 XHR/Fetch，并用正则先缩小范围；后面还会按完整路径和 query 再次校验。
-        target_pattern = r"/advertiser-hub/api/general-metrics/[^/]+/chart\?"
+        # 一次采集冻结巴西今天，防止等待期间跨午夜后混用两个日期。
+        today = datetime.now(BRAZIL_TIMEZONE).date().isoformat()
         LOGGER.info(
             "[美客多][广告监听] 店铺=%s，先启动监听再跳转广告页，页面=%s，目标正则=%s",
             store_name,
             self.page_url,
-            target_pattern,
+            CHART_LISTENER_PATTERN,
         )
-        listener.start(
-            targets=target_pattern,
-            is_regex=True,
-            method="GET",
-            res_type=("XHR", "Fetch"),
-        )
+        self._start_chart_listener(listener)
         try:
             tab.get(self.page_url)
             LOGGER.info("[美客多][广告监听] 店铺=%s，已跳转广告页，等待精准 chart 响应，最长 %.1f 秒", store_name, self.request_timeout_seconds)
-            packet = self._wait_for_target_packet(listener, store_name)
-            payload = self._packet_json(packet, store_name)
-            fields, summary = self._extract_today(payload, store_name)
-            LOGGER.info(
-                "[美客多][广告完成] 店铺=%s，广告字段=%s，响应 advertiser_id=%s，响应日期=%s",
-                store_name,
-                fields,
-                payload.get("advertiser_id", ""),
-                payload.get("date_to", ""),
-            )
-            return fields, summary
-        except TimeoutError as exc:
-            LOGGER.warning("[美客多][广告主接口超时] 店铺=%s，%s，进入周期选择备用监听流程", store_name, exc)
             try:
-                listener.stop()
-            except Exception as stop_exc:
-                LOGGER.warning("[美客多][广告监听] 店铺=%s，主监听停止失败，仍尝试备用流程：%s", store_name, stop_exc)
-            return self._collect_fallback(tab, store_name)
-        finally:
-            try:
-                listener.stop()
-            except Exception as exc:
-                LOGGER.warning("[美客多][广告监听] 店铺=%s，停止监听失败：%s", store_name, exc)
+                packet = self._wait_for_target_packet(listener, store_name)
+                payload = self._packet_json(packet, store_name)
+                fields, summary = self._extract_today(
+                    payload, store_name, today=today,
+                    require_single_day=self._matches_target_url(str(packet.url), expected_date=today),
+                )
+                if not summary["missing_metrics"]:
+                    LOGGER.info("[美客多][广告完成] 店铺=%s，来源=chart，日期=%s，广告字段=%s", store_name, today, fields)
+                    return fields, summary
+                LOGGER.warning(
+                    "[美客多][广告数据不完整] 店铺=%s，日期=%s，缺失指标=%s；准备切换今天重新监听",
+                    store_name, today, summary["missing_metrics"],
+                )
+            except (TimeoutError, RuntimeError) as exc:
+                LOGGER.warning("[美客多][广告主接口不可用] 店铺=%s，原因=%s；准备日期选择流程", store_name, exc)
 
-    def _collect_fallback(self, tab: Any, store_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+            if self._ad_page.is_overview_page(tab):
+                return self._collect_overview_today(tab, listener, store_name, today)
+            # 旧广告管理页使用 campaigns-period-picker，不能混用概览页的 Andes 日期控件。
+            if self._is_campaigns_page(tab):
+                return self._collect_fallback(tab, store_name, today=today)
+            raise RuntimeError("美客多广告页面未找到概览日期控件，也未进入旧广告活动管理页")
+        finally:
+            self._stop_listener(listener, store_name)
+
+    def _start_chart_listener(self, listener: Any) -> None:
+        """重新开始监听会清空旧数据包，必须在触发今天日期点击之前调用。"""
+        self._start_listener(listener, CHART_LISTENER_PATTERN)
+
+    def _start_listener(self, listener: Any, pattern: str) -> None:
+        """统一登记实际启动的监听器；重新设定目标时保留同一个浏览器连接。"""
+        listener.start(targets=pattern, is_regex=True, method="GET", res_type=("XHR", "Fetch"))
+        self._active_listener = listener
+
+    def _stop_listener(self, listener: Any, store_name: str) -> None:
+        """同一轮启动只停止一次，即使监听器未提供 listening 属性也不会重复停止。"""
+        if self._active_listener is not listener:
+            return
+        self._active_listener = None
+        if getattr(listener, "listening", True) is False:
+            return
+        try:
+            listener.stop()
+        except Exception as exc:
+            LOGGER.warning("[美客多][广告监听停止失败] 店铺=%s，异常类型=%s", store_name, type(exc).__name__)
+
+    @staticmethod
+    def _is_campaigns_page(tab: Any) -> bool:
+        """只有真实旧广告管理页面才允许使用 campaigns/search 备用流程。"""
+        try:
+            if urlsplit(str(tab.url or "")).hostname == "pa.mercadolivre.com.br":
+                return True
+            element = tab.ele(f"xpath:{PERIOD_BUTTON_XPATH}", timeout=0.2)
+            return bool(element and element.states.is_displayed)
+        except Exception:
+            return False
+
+    def _collect_overview_today(
+        self, tab: Any, listener: Any, store_name: str, today: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """概览切至巴西今天后重抓 chart；仍不可用时才读取五项页面指标。"""
+        self._ad_page.select_today(
+            tab, store_name, today,
+            before_date_click=lambda: self._start_chart_listener(listener),
+        )
+        try:
+            packet = self._wait_for_target_packet(listener, store_name, expected_date=today)
+            payload = self._packet_json(packet, store_name)
+            fields, summary = self._extract_today(payload, store_name, today=today, require_single_day=True)
+            if not summary["missing_metrics"]:
+                LOGGER.info("[美客多][广告今日重监听成功] 店铺=%s，日期=%s，广告字段=%s", store_name, today, fields)
+                return fields, summary
+            LOGGER.warning(
+                "[美客多][广告今日仍缺失] 店铺=%s，指标=%s；读取今日页面五项指标",
+                store_name, summary["missing_metrics"],
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            LOGGER.warning("[美客多][广告今日响应不可用] 店铺=%s，原因=%s；读取今日页面五项指标", store_name, exc)
+        self._stop_listener(listener, store_name)
+        fields, summary = self._ad_page.read_today_metrics(tab, store_name, today)
+        LOGGER.info("[美客多][广告页面采集完成] 店铺=%s，日期=%s，字段=%s", store_name, today, fields)
+        return fields, summary
+
+    def _collect_fallback(
+        self, tab: Any, store_name: str, *, today: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """主 chart 接口没有返回时，通过页面周期选择触发 campaigns/search 请求。"""
+        today = today or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
         period_button = self._wait_element(tab, PERIOD_BUTTON_XPATH, self.fallback_request_timeout_seconds)
         if period_button is None:
             raise TimeoutError("美客多广告备用流程未找到周期选择按钮")
@@ -147,27 +214,25 @@ class MercadoAdCapture:
         if listener is None:
             raise RuntimeError("当前 DrissionPage 标签页不支持网络监听")
         target_pattern = r"/pa/api/admin-pads/ajax/campaigns/search\?"
-        listener.start(targets=target_pattern, is_regex=True, method="GET", res_type=("XHR", "Fetch"))
+        self._start_listener(listener, target_pattern)
         try:
             self._click_element(period_button, tab, "打开广告周期菜单")
             custom = self._wait_element(tab, CUSTOM_PERIOD_XPATH, 10.0)
             if custom is None:
                 raise TimeoutError("美客多广告备用流程未找到自定义时间按钮")
             self._click_element(custom, tab, "选择自定义时间")
-            today = self._wait_element(tab, TODAY_CALENDAR_XPATH, 20.0)
-            if today is None:
+            today_element = self._wait_element(tab, TODAY_CALENDAR_XPATH, 20.0)
+            if today_element is None:
                 raise TimeoutError("美客多广告备用流程未找到今天日期按钮")
-            self._double_click_element(today, tab, "选择今天日期")
-            packet = self._wait_for_fallback_packet(listener, store_name)
+            self._double_click_element(today_element, tab, "选择今天日期")
+            packet = self._wait_for_fallback_packet(listener, store_name, expected_date=today)
             payload = self._packet_json(packet, store_name)
             fields, summary = self._extract_fallback(payload, store_name)
+            summary.update({"date": today, "date_from": today, "date_to": today, "currency": "BRL"})
             LOGGER.info("[美客多][广告备用完成] 店铺=%s，活动字段=%s", store_name, fields)
             return fields, summary
         finally:
-            try:
-                listener.stop()
-            except Exception as exc:
-                LOGGER.warning("[美客多][广告备用监听] 店铺=%s，停止监听失败：%s", store_name, exc)
+            self._stop_listener(listener, store_name)
 
     @staticmethod
     def _wait_element(tab: Any, xpath: str, timeout_seconds: float) -> Any:
@@ -226,29 +291,46 @@ class MercadoAdCapture:
             action_name,
         )
 
-    def _wait_for_fallback_packet(self, listener: Any, store_name: str) -> Any:
+    def _wait_for_fallback_packet(
+        self, listener: Any, store_name: str, *, expected_date: str | None = None,
+    ) -> Any:
+        expected_date = expected_date or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
         deadline = time.monotonic() + self.fallback_request_timeout_seconds
+        invalid_count = 0
+        matched_count = 0
         while time.monotonic() < deadline:
             packet = listener.wait(timeout=min(2.0, max(0.2, deadline - time.monotonic())), raise_err=False)
             if not packet:
                 continue
             url = str(getattr(packet, "url", "") or "")
-            if self._matches_fallback_url(url):
-                LOGGER.info("[美客多][广告备用命中] 店铺=%s，已命中当天 campaigns/search 响应", store_name)
+            if self._matches_fallback_url(url, expected_date=expected_date):
+                matched_count += 1
+                try:
+                    payload = self._packet_json(packet, store_name)
+                    if not isinstance(payload.get("results"), list):
+                        raise RuntimeError("campaigns_structure：美客多广告备用响应缺少 results 数组")
+                except RuntimeError as exc:
+                    invalid_count += 1
+                    LOGGER.warning("[美客多][广告备用无效包] 店铺=%s，原因=%s；继续等待有效响应", store_name, exc)
+                    continue
+                LOGGER.info("[美客多][广告备用命中] 店铺=%s，当天 campaigns/search 的状态、响应 JSON 和结构已校验，日期=%s", store_name, expected_date)
                 return packet
             LOGGER.debug("[美客多][广告备用忽略] 店铺=%s，非当天目标请求：%s", store_name, self._safe_url(url))
-        raise TimeoutError(f"美客多广告备用接口在 {self.fallback_request_timeout_seconds:.1f} 秒内未返回")
+        raise TimeoutError(
+            f"美客多广告备用接口在 {self.fallback_request_timeout_seconds:.1f} 秒内未返回有效响应，"
+            f"目标匹配包数={matched_count}，无效包数={invalid_count}"
+        )
 
     @classmethod
-    def _matches_fallback_url(cls, url: str) -> bool:
+    def _matches_fallback_url(cls, url: str, *, expected_date: str | None = None) -> bool:
         parsed = urlsplit(url)
         if parsed.scheme != "https" or parsed.netloc.casefold() != "pa.mercadolivre.com.br" or not FALLBACK_PATH_RE.match(parsed.path):
             return False
         query = parse_qs(parsed.query, keep_blank_values=True)
-        today = datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
+        today = expected_date or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
         return (
-            query.get("dateFrom", [""])[0] == today
-            and query.get("dateTo", [""])[0] == today
+            query.get("dateFrom") == [today]
+            and query.get("dateTo") == [today]
             and not query.get("campaignIds")
         )
 
@@ -281,22 +363,41 @@ class MercadoAdCapture:
         summary = {"source": "campaigns/search", "active_campaign_count": len(active), "metrics": totals}
         return fields, summary
 
-    def _wait_for_target_packet(self, listener: Any, store_name: str) -> Any:
+    def _wait_for_target_packet(self, listener: Any, store_name: str, *, expected_date: str | None = None) -> Any:
         deadline = time.monotonic() + self.request_timeout_seconds
+        matched_count = 0
+        invalid_count = 0
         while time.monotonic() < deadline:
             remaining = max(0.2, deadline - time.monotonic())
             packet = listener.wait(timeout=min(2.0, remaining), raise_err=False)
             if not packet:
                 continue
             url = str(getattr(packet, "url", "") or "")
-            if self._matches_target_url(url):
-                LOGGER.info("[美客多][广告命中] 店铺=%s，已命中目标 chart 接口，host/path/query 已校验", store_name)
+            if self._matches_target_url(url, expected_date=expected_date):
+                matched_count += 1
+                try:
+                    payload = self._packet_json(packet, store_name)
+                    data = payload.get("data")
+                    if not isinstance(data, dict) or not isinstance(data.get("summary_by_date"), dict):
+                        raise RuntimeError("chart_structure：美客多广告响应缺少 data.summary_by_date")
+                    if expected_date is not None and (
+                        payload.get("date_from") != expected_date or payload.get("date_to") != expected_date
+                    ):
+                        raise RuntimeError("chart_date_mismatch：美客多广告响应日期不匹配")
+                except RuntimeError as exc:
+                    invalid_count += 1
+                    LOGGER.warning("[美客多][广告无效包] 店铺=%s，原因=%s；继续等待有效响应", store_name, exc)
+                    continue
+                LOGGER.info("[美客多][广告命中] 店铺=%s，目标 chart URL、状态、响应 JSON 和结构已校验，目标日期=%s", store_name, expected_date or "页面当前周期")
                 return packet
             LOGGER.debug("[美客多][广告忽略] 店铺=%s，监听到非目标请求：%s", store_name, self._safe_url(url))
-        raise TimeoutError(f"美客多广告目标 chart 接口在 {self.request_timeout_seconds:.1f} 秒内未返回")
+        raise TimeoutError(
+            f"美客多广告目标 chart 接口在 {self.request_timeout_seconds:.1f} 秒内未返回有效响应，"
+            f"目标匹配包数={matched_count}，无效包数={invalid_count}"
+        )
 
     @staticmethod
-    def _matches_target_url(url: str) -> bool:
+    def _matches_target_url(url: str, *, expected_date: str | None = None) -> bool:
         parsed = urlsplit(url)
         if parsed.scheme != "https" or parsed.netloc.casefold() != "vendedores.mercadolivre.com.br":
             return False
@@ -307,69 +408,192 @@ class MercadoAdCapture:
         query = parse_qs(parsed.query, keep_blank_values=True)
         if not query.get("dateFrom") or not query.get("dateTo") or query.get("siteId", [""])[0] != "MLB":
             return False
+        if expected_date is not None and (
+            query.get("dateFrom") != [expected_date] or query.get("dateTo") != [expected_date]
+        ):
+            return False
         products = query.get("products", [""])[0].replace("%2C", ",").upper()
         return {part.strip() for part in products.split(",")} == {"PADS", "DADS"}
 
     @staticmethod
     def _packet_json(packet: Any, store_name: str) -> dict[str, Any]:
-        response = getattr(packet, "response", None)
-        if response is None:
-            raise RuntimeError(f"美客多广告目标请求没有响应体：{store_name}")
-        status = getattr(response, "status", None)
-        if status is not None:
+        """先记录安全元数据再校验响应；成功正文只解析一次，绝不输出正文和敏感头。"""
+        cached = getattr(packet, "_mercado_ad_valid_json", None)
+        if isinstance(cached, dict):
+            return cached
+
+        def read_attribute(owner: Any, name: str) -> tuple[Any, str]:
             try:
-                if not 200 <= int(status) < 300:
-                    raise RuntimeError(f"美客多广告目标请求返回 HTTP {status}")
-            except (TypeError, ValueError):
-                LOGGER.warning("[美客多][广告响应] 无法解析 HTTP 状态码=%r，继续尝试读取 JSON", status)
-        body = getattr(response, "body", None)
-        if isinstance(body, dict):
-            return body
-        if isinstance(body, (bytes, bytearray)):
-            body = body.decode("utf-8", errors="replace")
-        if not isinstance(body, str) or not body.strip():
-            raw_body = getattr(response, "raw_body", b"")
-            if isinstance(raw_body, (bytes, bytearray)):
-                body = raw_body.decode("utf-8", errors="replace")
-            else:
-                body = str(raw_body or "")
+                return getattr(owner, name, None), ""
+            except Exception as exc:
+                # 异常消息可能含有 URL、Cookie 或正文，只保留异常类型。
+                return None, type(exc).__name__
+
+        def byte_length(value: Any) -> int | None:
+            if value is None:
+                return 0
+            if isinstance(value, (bytes, bytearray)):
+                return len(value)
+            if isinstance(value, str):
+                return len(value.encode("utf-8"))
+            if isinstance(value, (dict, list)):
+                try:
+                    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        failed, failed_read_error = read_attribute(packet, "is_failed")
+        failed = bool(failed)
+        response, response_read_error = read_attribute(packet, "response")
+        status_value, status_read_error = read_attribute(response, "status")
         try:
-            payload = json.loads(body)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"美客多广告目标响应不是有效 JSON：{exc}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("美客多广告目标响应 JSON 根节点不是对象")
+            status = int(status_value) if status_value is not None and not isinstance(status_value, bool) else None
+        except (TypeError, ValueError, OverflowError):
+            status = None
+        headers, headers_read_error = read_attribute(response, "headers")
+        content_type = "<未提供>"
+        try:
+            mime = str((headers or {}).get("Content-Type") or (headers or {}).get("content-type") or "")
+            # 只记录标准 MIME 部分，丢弃任意扩展参数与未经校验的值。
+            match = re.match(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?=\s*(?:;|$))", mime)
+            if match:
+                content_type = match.group(0).lower()
+        except Exception as exc:
+            headers_read_error = type(exc).__name__
+        body, body_read_error = read_attribute(response, "body")
+        raw_body, raw_read_error = read_attribute(response, "raw_body")
+        error_code = "<未提供>"
+        canceled = False
+        if failed:
+            fail_info, _ = read_attribute(packet, "fail_info")
+            reason, _ = read_attribute(fail_info, "errorText")
+            if isinstance(reason, str):
+                match = re.match(r"^net::ERR_[A-Z0-9_]+\b", reason)
+                if match:
+                    error_code = match.group(0)
+            cancel_value, _ = read_attribute(fail_info, "canceled")
+            canceled = cancel_value is True
+
+        source = "body"
+
+        def diagnose(code: str, message: str | None = None) -> None:
+            LOGGER.log(
+                logging.INFO if message is None else logging.WARNING,
+                "[美客多][广告响应诊断] 店铺=%s，分类=%s，failed=%s，status=%s，Content-Type=%s，"
+                "body类型=%s，body长度字节=%s，raw_body长度字节=%s，正文来源=%s，"
+                "浏览器错误码=%s，canceled=%s，元数据读取异常=%s，body读取异常=%s，raw_body读取异常=%s",
+                store_name, code, failed, status if status is not None else "<缺失或无效>", content_type,
+                type(body).__name__, byte_length(body), byte_length(raw_body), source,
+                error_code, canceled,
+                "/".join(value for value in (failed_read_error, response_read_error, status_read_error, headers_read_error) if value) or "无",
+                body_read_error or "无", raw_read_error or "无",
+            )
+            if message is not None:
+                raise RuntimeError(f"{code}：{message}") from None
+
+        if failed:
+            diagnose("request_failed", "美客多广告目标请求在浏览器中加载失败")
+        if response is None:
+            diagnose("response_unavailable", "美客多广告目标请求没有可读取响应")
+        if status is None:
+            diagnose("invalid_status", "美客多广告目标请求缺少有效 HTTP 响应状态")
+        if not 200 <= status < 300:
+            diagnose("http_error", f"美客多广告目标请求返回 HTTP {status}")
+        if isinstance(body, dict):
+            payload = body
+        else:
+            candidate = body
+            if candidate is None or (isinstance(candidate, (str, bytes, bytearray)) and not candidate.strip()):
+                candidate = raw_body
+                source = "raw_body"
+            if candidate is None or candidate == "" or candidate == b"":
+                if body_read_error or raw_read_error:
+                    diagnose("body_read_error", "美客多广告响应正文读取失败")
+                diagnose("empty_body", "美客多广告目标响应正文为空")
+            if isinstance(candidate, (bytes, bytearray)):
+                try:
+                    candidate = candidate.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    diagnose("invalid_encoding", "美客多广告响应正文不是有效 UTF-8")
+            if not isinstance(candidate, str):
+                diagnose("nonobject_json", "美客多广告目标响应 JSON 根节点不是对象")
+            if not candidate.strip():
+                diagnose("empty_body", "美客多广告目标响应正文为空")
+            try:
+                payload = json.loads(candidate.lstrip("\ufeff"))
+            except (TypeError, ValueError):
+                diagnose("invalid_json", "美客多广告目标响应不是有效 JSON")
+            if not isinstance(payload, dict):
+                diagnose("nonobject_json", "美客多广告目标响应 JSON 根节点不是对象")
+        diagnose("json_valid")
+        try:
+            setattr(packet, "_mercado_ad_valid_json", payload)
+        except (AttributeError, TypeError):
+            pass
         return payload
 
     @classmethod
-    def _extract_today(cls, payload: dict[str, Any], store_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        today = datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
+    def _extract_today(
+        cls, payload: dict[str, Any], store_name: str, *, today: str | None = None, require_single_day: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        today = today or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
+        is_single_day = payload.get("date_from") == today and payload.get("date_to") == today
+        if require_single_day and not is_single_day:
+            raise RuntimeError("美客多广告今日请求的响应日期不匹配，拒绝使用其他周期数据")
         data = payload.get("data")
         summary_by_date = data.get("summary_by_date") if isinstance(data, dict) else None
         if not isinstance(summary_by_date, dict):
             raise RuntimeError("美客多广告响应缺少 data.summary_by_date")
 
         fields: dict[str, Any] = {}
-        summary: dict[str, Any] = {"advertiser_id": payload.get("advertiser_id", ""), "date": today}
+        summary: dict[str, Any] = {
+            "source": "chart", "advertiser_id": payload.get("advertiser_id", ""), "date": today,
+            "currency": data.get("currency", "BRL"), "missing_metrics": [],
+        }
+        daily_summary = data.get("summary") if require_single_day and is_single_day else None
         for response_key, field_name in AD_METRIC_FIELDS:
             entries = summary_by_date.get(response_key)
-            if not isinstance(entries, list) or not entries:
-                LOGGER.warning("[美客多][广告字段缺失] 店铺=%s，接口字段=%s，无日期数组", store_name, response_key)
+            selected = next(
+                (entry for entry in reversed(entries) if isinstance(entry, dict) and entry.get("date") == today),
+                {},
+            ) if isinstance(entries, list) else {}
+            value = selected.get("total")
+            source = "summary_by_date"
+            if not cls._is_metric_number(value) and isinstance(daily_summary, dict):
+                # 只有请求和响应均为巴西今天单日时，汇总值才等同于今天值；合法零值必须保留。
+                value = daily_summary.get(response_key)
+                source = "summary"
+            if not cls._is_metric_number(value):
+                summary["missing_metrics"].append(response_key)
+                LOGGER.warning("[美客多][广告字段缺失] 店铺=%s，接口字段=%s，没有巴西今天的有效数值", store_name, response_key)
                 continue
-            # 接口按日期升序返回；取最后一条，并记录日期，符合当前接口 dateTo=巴西今天的约定。
-            selected = entries[-1] if isinstance(entries[-1], dict) else {}
-            selected_date = str(selected.get("date") or "")
-            if selected_date != today:
-                LOGGER.warning("[美客多][广告日期] 店铺=%s，字段=%s，最后日期=%s，巴西今天=%s，仍按接口最后一条读取", store_name, response_key, selected_date, today)
-            value = selected.get("total", "")
             fields[field_name] = value
-            summary[response_key] = {"date": selected_date, "total": value}
+            summary[response_key] = {"date": today, "total": value, "source": source}
         return fields, summary
 
     @staticmethod
+    def _is_metric_number(value: Any) -> bool:
+        """缺失、布尔值和无穷值不能冒充业务数值；数值零属于有效数据。"""
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    @staticmethod
     def _safe_url(url: str) -> str:
-        parsed = urlsplit(url)
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else "<空网址>"
+        """忽略包也只显示已知接口路径，避免 URL 用户信息、查询参数或未知路径泄露。"""
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or parsed.username or parsed.password:
+                return "<非目标网址>"
+            if parsed.hostname == "vendedores.mercadolivre.com.br" and re.match(
+                r"^/advertiser-hub/api/general-metrics/[^/]+/chart(?:/comparison)?$", parsed.path,
+            ):
+                suffix = "/comparison" if parsed.path.endswith("/comparison") else ""
+                return f"https://{parsed.hostname}/advertiser-hub/api/general-metrics/<广告主>/chart{suffix}"
+            if parsed.hostname == "pa.mercadolivre.com.br" and FALLBACK_PATH_RE.fullmatch(parsed.path):
+                return f"https://{parsed.hostname}{parsed.path}"
+        except ValueError:
+            pass
+        return "<非目标网址>"
 
     @staticmethod
     def _read_non_negative_float(value: Any, default: float) -> float:
