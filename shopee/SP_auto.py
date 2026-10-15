@@ -48,7 +48,7 @@ SHOPEE_AD_PAGE_URL = "https://seller.shopee.com.br/portal/marketing/pas/index"
 SHOPEE_DATA_CENTER_URLS: dict[str, str] = {
     "商业分析概述": "https://seller.shopee.com.br/datacenter/overview",
 }
-EXTRA_PERIODS: tuple[str, ...] = ("昨天", "7天", "今天")
+EXTRA_PERIODS: tuple[str, ...] = ("今天",)
 EXTRA_PERIOD_LABELS: dict[str, str] = {"昨天": "昨天", "7天": "过去7 天", "今天": "今日实时"}
 EXTRA_PAGE_WAIT_SECONDS = 5
 # 商业分析是单页应用，document.readyState 完成后仍会异步请求和渲染数据。
@@ -234,7 +234,7 @@ class ShopeeAuto:
 
         rows: list[dict[str, Any]] = []
         period_reference_time = datetime.now(BRAZIL_TIMEZONE)
-        for period in ("昨天", "7天", "今天"):
+        for period in ("今天",):
             if not is_period_enabled(self.config, period):
                 LOGGER.info("[Shopee][广告] 时间范围=%s 已按配置关闭，跳过", period)
                 continue

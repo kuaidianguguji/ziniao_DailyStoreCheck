@@ -84,19 +84,15 @@ def is_enabled_switch(value: Any) -> bool:
 
 
 def is_period_enabled(platform_config: dict[str, Any] | None, period: str) -> bool:
-    """读取平台时间范围开关；未配置时默认开启，兼容中文和英文配置键。"""
+    """当前仅允许今天；旧配置即使开启昨天、7天或30天，也不会采集或上传。"""
+    if period not in {"今天", "today"}:
+        return False
     config = platform_config if isinstance(platform_config, dict) else {}
     periods = config.get("periods", {})
     if not isinstance(periods, dict):
         return True
 
-    aliases: dict[str, tuple[str, ...]] = {
-        "今天": ("今天", "today"),
-        "昨天": ("昨天", "yesterday"),
-        "7天": ("7天", "7d", "last_7_days", "last7days"),
-        "30天": ("30天", "30d", "last_30_days", "last30days"),
-    }
-    candidate_keys = aliases.get(period, (period,))
+    candidate_keys = ("今天", "today")
     selected_key = next((key for key in candidate_keys if key in periods), None)
     if selected_key is None:
         return True

@@ -152,11 +152,10 @@ data:
 platforms:
   tiktok:
     crawler: "tiktok.TK_auto:TiktokAuto"
-    # 三个时间范围独立开关；false 表示不切换、不读取该时间范围。
+    # 当前只采今天；历史周期不再执行或上传。
     periods:
       today: true
-      yesterday: true
-      7d: true
+    date_step_wait_seconds: 5
     captcha:
       # 登录后出现物体匹配验证码时，是否启用验证码识别接口。
       enabled: true
@@ -173,8 +172,6 @@ platforms:
     crawler: "shopee.SP_auto:ShopeeAuto"
     periods:
       today: true
-      yesterday: true
-      7d: true
   mercado:
     crawler: "mercado.MKD_auto:MercadoAuto"
     # 美客多未登录时的登录与 reCAPTCHA 处理参数。
@@ -216,8 +213,6 @@ platforms:
     # 美客多实际使用今天、7天和30天三个时间范围。
     periods:
       today: true
-      7d: true
-      30d: true
     ad_capture:
       # 经营指标抓取完成后，是否监听广告概览接口。
       enabled: true

@@ -4,7 +4,8 @@
 程序只接管紫鸟已经打开的当前标签页，并在该标签页中访问固定的广告页和数据概览页，复用紫鸟店铺登录态。
 
 所有按钮和指标 XPath 都集中维护在本文件顶部，方便单独调整 TikTok 流程；
-以后新增 XPath 时，如果 XPath 为空、元素不存在或读取失败，仍默认返回空值，不会中断其他步骤和指标。
+以后新增 XPath 时，空 XPath 预留仍返回空值；已配置指标读取失败会标记模块失败，
+保留其他步骤和指标的采集结果，由编排器在首轮结束后补采。
 """
 
 from __future__ import annotations
@@ -406,15 +407,16 @@ class TiktokAuto:
         LOGGER.info("[TikTok][广告] 已确认登录，直接打开广告页=%s", AD_PAGE_URL)
         ad_fields: dict[str, Any] = {}
         ad_raw_values: dict[str, str] = {}
+        ad_failures: list[str] = []
         enabled_ad_periods = tuple(
             period for period in ("今天",) if is_period_enabled(self.config, period)
         )
         ad_page_ready = bool(enabled_ad_periods) and self._open_business_page(
             tab, AD_PAGE_URL, AD_TIME_BUTTON_XPATH, "TikTok广告页时间面板按钮"
         )
-        if not ad_page_ready:
+        if enabled_ad_periods and not ad_page_ready:
             LOGGER.error("[TikTok][广告页面失败] 直接打开广告页后未确认时间面板按钮出现，今天广告按空值处理")
-        else:
+        elif ad_page_ready:
             LOGGER.info("[TikTok][广告页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("今天",):
@@ -423,13 +425,17 @@ class TiktokAuto:
                 continue
             LOGGER.info("[TikTok][广告] 开始切换并采集时间范围=%s", period)
             if not ad_page_ready:
-                self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "未进入店铺广告页面")
+                ad_failures.append(self._record_empty_period_metrics(
+                    period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "未进入店铺广告页面"
+                ))
                 continue
 
             period_steps = AD_PERIOD_CLICK_STEPS.get(period, [])
             period_clicked = self._run_period_click_steps(tab, period_steps)
             if not period_clicked:
-                self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "日期按钮点击或状态验证失败")
+                ad_failures.append(self._record_empty_period_metrics(
+                    period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "日期按钮点击或状态验证失败"
+                ))
                 continue
 
             self._wait_for_document_complete_after_period(tab, f"广告-{period}")
@@ -441,16 +447,19 @@ class TiktokAuto:
                 f"广告-{period}",
             )
             if not data_loaded:
-                self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "广告数据未确认加载完成")
+                ad_failures.append(self._record_empty_period_metrics(
+                    period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "广告数据未确认加载完成"
+                ))
                 continue
-            self._collect_period_metrics(tab, period, AD_METRIC_SPECS, ad_fields, ad_raw_values)
+            ad_failures.extend(self._collect_period_metrics(tab, period, AD_METRIC_SPECS, ad_fields, ad_raw_values))
 
         ad_row = {
             "店铺名": store_name,
             "平台": "tiktok",
             "采集时间": collected_at,
-            "指标": "TikTok店铺广告",
+            "指标": "TikTok店铺广告_失败" if ad_failures else "TikTok店铺广告",
             "数值": "",
+            "显示值": "；".join(ad_failures),
             "原始数据": json.dumps(ad_raw_values, ensure_ascii=False),
             "飞书字段": ad_fields,
             "指标元数据": self._build_metric_metadata(AD_METRIC_SPECS, ad_fields, ad_raw_values, "广告"),
@@ -460,15 +469,16 @@ class TiktokAuto:
         LOGGER.info("[TikTok][概览] 直接打开数据概览页=%s", OVERVIEW_PAGE_URL)
         overview_fields: dict[str, Any] = {}
         overview_raw_values: dict[str, str] = {}
+        overview_failures: list[str] = []
         enabled_overview_periods = tuple(
             period for period in ("今天",) if is_period_enabled(self.config, period)
         )
         overview_page_ready = bool(enabled_overview_periods) and self._open_business_page(
             tab, OVERVIEW_PAGE_URL, OVERVIEW_TIME_BUTTON_XPATH, "TikTok数据概览页时间面板按钮"
         )
-        if not overview_page_ready:
+        if enabled_overview_periods and not overview_page_ready:
             LOGGER.error("[TikTok][概览页面失败] 直接打开数据概览页后未确认时间面板按钮出现，今天概览按空值处理")
-        else:
+        elif overview_page_ready:
             LOGGER.info("[TikTok][概览页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("今天",):
@@ -477,25 +487,25 @@ class TiktokAuto:
                 continue
             LOGGER.info("[TikTok][概览] 开始切换并采集时间范围=%s", period)
             if not overview_page_ready:
-                self._record_empty_period_metrics(
+                overview_failures.append(self._record_empty_period_metrics(
                     period,
                     OVERVIEW_METRIC_SPECS,
                     overview_fields,
                     overview_raw_values,
                     "未进入数据分析概览页面",
-                )
+                ))
                 continue
 
             period_steps = OVERVIEW_PERIOD_CLICK_STEPS.get(period, [])
             period_clicked = self._run_period_click_steps(tab, period_steps)
             if not period_clicked:
-                self._record_empty_period_metrics(
+                overview_failures.append(self._record_empty_period_metrics(
                     period,
                     OVERVIEW_METRIC_SPECS,
                     overview_fields,
                     overview_raw_values,
                     "概览日期按钮点击或状态验证失败",
-                )
+                ))
                 continue
 
             self._wait_for_document_complete_after_period(tab, f"概览-{period}")
@@ -507,39 +517,43 @@ class TiktokAuto:
                 f"概览-{period}",
             )
             if not data_loaded:
-                self._record_empty_period_metrics(
+                overview_failures.append(self._record_empty_period_metrics(
                     period,
                     OVERVIEW_METRIC_SPECS,
                     overview_fields,
                     overview_raw_values,
                     "概览数据加载完成标志未出现",
-                )
+                ))
                 continue
 
-            self._collect_period_metrics(tab, period, OVERVIEW_METRIC_SPECS, overview_fields, overview_raw_values)
+            overview_failures.extend(self._collect_period_metrics(
+                tab, period, OVERVIEW_METRIC_SPECS, overview_fields, overview_raw_values
+            ))
             self._calculate_gmv_ratios(period, overview_fields, overview_raw_values)
 
         overview_row = {
             "店铺名": store_name,
             "平台": "tiktok",
             "采集时间": collected_at,
-            "指标": "TikTok数据分析概览",
+            "指标": "TikTok数据分析概览_失败" if overview_failures else "TikTok数据分析概览",
             "数值": "",
+            "显示值": "；".join(overview_failures),
             "原始数据": json.dumps(overview_raw_values, ensure_ascii=False),
             "飞书字段": overview_fields,
             "指标元数据": self._build_metric_metadata(OVERVIEW_METRIC_SPECS, overview_fields, overview_raw_values, "概览"),
         }
 
-        # 两个模块分别返回一条记录，避免同名字段（如 SKU订单数）相互覆盖。
+        # 明确失败通过行名告知编排器补采，但不丢弃其他模块或本模块已读取的有效指标。
         ad_valid_count = sum(value != "" for value in ad_fields.values())
         overview_valid_count = sum(value != "" for value in overview_fields.values())
         LOGGER.info(
-            "[TikTok][完成] 店铺=%s，广告有效指标=%s/%s，概览有效指标=%s/%s",
+            "[TikTok][采集结束] 店铺=%s，广告有效指标=%s/%s，概览有效指标=%s/%s，失败模块=%s",
             store_name,
             ad_valid_count,
             len(ad_fields),
             overview_valid_count,
             len(overview_fields),
+            "、".join(name for name, failures in (("广告", ad_failures), ("概览", overview_failures)) if failures) or "无",
         )
         return [ad_row, overview_row]
 
@@ -577,10 +591,11 @@ class TiktokAuto:
         specs: list[dict[str, str]],
         field_values: dict[str, Any],
         raw_values: dict[str, str],
-    ) -> None:
-        """通过一次浏览器脚本读取某模块、某时间范围的全部指标，再逐字段转换和记录日志。"""
+    ) -> list[str]:
+        """批量读取并保留有效指标，返回真实读取或转换失败原因，不把正常占位值判为失败。"""
         period_specs = [spec for spec in specs if spec["period"] == period]
         batch_raw_values = self._read_metric_batch(tab, period, period_specs)
+        failures: list[str] = []
         for spec in period_specs:
             field_name = spec["field"]
             xpath = spec["xpath"]
@@ -611,17 +626,22 @@ class TiktokAuto:
             )
             if raw_text == "":
                 LOGGER.warning("[TikTok][指标失败] 字段=%s，XPath 未抓到有效文本，最终按空值处理", field_name)
+                # 空 XPath 是预留配置，不阻断采集；已配置 XPath 丢失则必须进入店铺补采。
+                if xpath.strip():
+                    failures.append(f"{period}：{field_name} 未抓到有效文本")
             elif converted_value == "" and re.fullmatch(
                 r"[-—–]+%?|N/?A", re.sub(r"\s+", "", str(raw_text)), re.IGNORECASE
             ):
                 LOGGER.info("[TikTok][指标无数据] 字段=%s，页面占位值=%r，按业务规则保留空值", field_name, raw_text)
             elif converted_value == "":
+                failures.append(f"{period}：{field_name} 无法转换为 {value_kind}")
                 LOGGER.warning(
                     "[TikTok][转换失败] 字段=%s，已抓到原始值=%r，但无法按配置类型=%s 转换，最终按空值处理",
                     field_name,
                     raw_text,
                     value_kind,
                 )
+        return failures
 
     @staticmethod
     def _resolve_metric_currency(raw_text: str, configured_currency: str = "") -> str:
@@ -656,7 +676,7 @@ class TiktokAuto:
                 "currency": currency or None,
                 "module": module,
                 "period": "今天",
-                "unit": {"currency": "currency", "integer": "count", "decimal": "ratio", "percent": "percent"}.get(kind, kind),
+                "unit": {"currency": "currency", "integer": "count", "decimal": "multiple", "percent": "percent"}.get(kind, kind),
             }
         return metadata
 
@@ -757,8 +777,8 @@ class TiktokAuto:
         field_values: dict[str, Any],
         raw_values: dict[str, str],
         reason: str,
-    ) -> None:
-        """流程未通过加载验证时写入空值，防止误用上一个日期范围的旧数据。"""
+    ) -> str:
+        """流程验证失败时清空旧周期值，并返回原因供编排器识别失败和安排补采。"""
         empty_fields: list[str] = []
         for spec in specs:
             if spec["period"] != period:
@@ -768,6 +788,7 @@ class TiktokAuto:
             raw_values[field_name] = ""
             empty_fields.append(field_name)
         LOGGER.error("[TikTok][周期数据置空] 时间范围=%s，原因=%s，字段=%s", period, reason, empty_fields)
+        return f"{period}：{reason}"
 
     @staticmethod
     def _calculate_gmv_ratios(

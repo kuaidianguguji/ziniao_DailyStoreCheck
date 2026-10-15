@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import quote
@@ -35,6 +36,17 @@ SUMMARY_CARD_MAX_TABLES = 3
 
 # 连续发送多张分片卡片时保留短暂间隔，降低触发飞书消息频率限制的概率。
 MARKDOWN_CARD_SEND_INTERVAL_SECONDS = 0.5
+
+# 关联引用、公式和系统生成字段不可直接写入，保留原字段并另建采集值列。
+BITABLE_READONLY_FIELD_TYPES = frozenset({19, 20, 1001, 1002, 1003, 1004, 1005})
+
+
+class FeishuWriteUncertainError(RuntimeError):
+    """请求可能已经落表，但回读暂未确认，必须保留原批次等待补写核验。"""
+
+    def __init__(self, message: str, *, record_write_uncertain: bool = True) -> None:
+        super().__init__(message)
+        self.record_write_uncertain = record_write_uncertain
 
 
 class FeishuClient:
@@ -436,7 +448,9 @@ class FeishuClient:
                 headers=self._headers(), params=params,
             )
             data = payload.get("data", {})
-            for item in data.get("items", []):
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise RuntimeError("飞书字段回读结构无效，不能确认是否需要创建字段")
+            for item in data["items"]:
                 if item.get("field_name"):
                     fields[str(item["field_name"])] = int(item.get("type", 1))
             if not data.get("has_more"):
@@ -455,7 +469,7 @@ class FeishuClient:
             return True
         return bool(re.search(r"code=(95201|95210|99991400)\b|status=(429|5\d\d)\b|server error", str(error), re.I))
 
-    def _verified_storage_write(self, write: Any, verify: Any, label: str) -> None:
+    def _verified_storage_write(self, write: Any, verify: Any, label: str, *, idempotent: bool = False) -> None:
         """写入返回不确定时先回读，已落地就确认成功，不再次追加。"""
         for attempt in range(1, 4):
             if verify():
@@ -471,9 +485,18 @@ class FeishuClient:
                 # 回读失败时无法确认上一次是否已经成功，保留待补写记录，禁止盲目追加。
                 for delay in (0.5, 1.0, 2.0):
                     time.sleep(delay)
-                    if verify():
+                    try:
+                        confirmed = verify()
+                    except Exception as read_error:
+                        raise FeishuWriteUncertainError(f"{label} 写入后的回读失败，保留原采集批次等待核验") from read_error
+                    if confirmed:
                         LOGGER.info("[飞书][写入回读成功] 操作=%s，已确认数据实际写入", label)
                         return
+                # 超时、代理断连及返回内容损坏都不能证明请求未写入。
+                # 无服务端幂等保护的追加请求只发送一次，交给持久化补写队列稍后核验。
+                explicitly_rejected = bool(re.search(r"code=(95201|95210|99991400)\b|status=429\b", str(error)))
+                if not idempotent and not explicitly_rejected:
+                    raise FeishuWriteUncertainError(f"{label} 请求结果暂未确认，保留原采集批次稍后核验，禁止再次追加") from error
                 if attempt == 3:
                     raise
                 time.sleep(float(attempt))
@@ -486,24 +509,39 @@ class FeishuClient:
             return cached
         fields = self._list_daily_bitable_fields(app_token, table_id)
         for spec in today_field_specs(platform):
-            if spec.name in fields:
+            name = self._daily_bitable_write_name(spec.name, fields)
+            if name in fields:
+                if name != spec.name and fields[name] != spec.field_type:
+                    raise RuntimeError(f"{platform} 今日采集值字段 {name} 类型不兼容，请保留原字段并修正采集值列类型")
                 continue
 
-            def verify(name: str = spec.name) -> bool:
+            def verify(name: str = name) -> bool:
                 fields.update(self._list_daily_bitable_fields(app_token, table_id))
                 return name in fields
 
             self._verified_storage_write(
-                lambda spec=spec: self._request(
+                lambda spec=spec, name=name: self._request(
                     "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
-                    headers=self._headers(), json={"field_name": spec.name, "type": spec.field_type},
+                    headers=self._headers(), json={"field_name": name, "type": spec.field_type},
                 ),
-                verify, f"准备{platform}今日字段:{spec.name}",
+                verify, f"准备{platform}今日字段:{name}",
             )
-            fields.setdefault(spec.name, spec.field_type)
+            fields.setdefault(name, spec.field_type)
         self._daily_bitable_fields[key] = dict(fields)
         self._table_field_names_cache[key] = set(fields)
         return fields
+
+    @staticmethod
+    def _daily_bitable_write_name(name: str, field_types: dict[str, int]) -> str:
+        """只读业务字段写入独立采集值列，身份元数据只读时明确失败。"""
+        if field_types.get(name) not in BITABLE_READONLY_FIELD_TYPES:
+            return name
+        if name in METADATA_FIELD_ORDER:
+            raise RuntimeError(f"今日元数据字段 {name} 为只读类型，无法安全写入及核验采集批次")
+        alias = f"{name}（采集值）"
+        if field_types.get(alias) in BITABLE_READONLY_FIELD_TYPES:
+            raise RuntimeError(f"今日采集值字段 {alias} 也为只读类型，无法写入")
+        return alias
 
     @staticmethod
     def _today_storage_fields(platform: str, fields: dict[str, Any], batch_id: str) -> dict[str, Any]:
@@ -554,15 +592,13 @@ class FeishuClient:
             types = self._ensure_daily_bitable_schema(platform, app_token, table_id)
             writable: dict[str, Any] = {}
             for name, value in source.items():
-                field_type = types.get(name, 1)
-                if field_type in {19, 20}:
-                    LOGGER.warning("[飞书][今日只读字段跳过] 平台=%s，字段=%s", platform, name)
-                    continue
+                target_name = self._daily_bitable_write_name(name, types)
+                field_type = types.get(target_name, 1)
                 if field_type == 5:
                     value = self._storage_date_ms(value)
                 elif field_type == 1:
                     value = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-                writable[name] = value
+                writable[target_name] = value
             identity = {name: writable[name] for name in ("店铺名", "平台", "业务日期", "采集批次")}
             current: dict[str, Any] | None = None
 
@@ -574,7 +610,10 @@ class FeishuClient:
                     "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
                     headers=self._headers(), params={"page_size": 100, "filter": "AND(" + ",".join(terms) + ")"},
                 )
-                matches = [item for item in payload.get("data", {}).get("items", []) if all(
+                data = payload.get("data", {})
+                if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                    raise RuntimeError("飞书记录回读结构无效，禁止未经确认重复创建")
+                matches = [item for item in data["items"] if all(
                     self._storage_cell_equal(item.get("fields", {}).get(name), value)
                     for name, value in identity.items()
                 )]
@@ -594,12 +633,16 @@ class FeishuClient:
                         headers=self._headers(), json={"fields": writable},
                     )
                 else:
+                    # 多维表支持客户端幂等令牌，服务端回读短暂延迟时也不会重复建同批记录。
+                    client_token = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL, json.dumps({"table_id": table_id, **identity}, ensure_ascii=False, sort_keys=True),
+                    ))
                     self._request(
                         "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
-                        headers=self._headers(), json={"fields": writable},
+                        headers=self._headers(), params={"client_token": client_token}, json={"fields": writable},
                     )
 
-            self._verified_storage_write(write, verify, f"{platform}今日多维表:{source['店铺名']}")
+            self._verified_storage_write(write, verify, f"{platform}今日多维表:{source['店铺名']}", idempotent=True)
 
     @staticmethod
     def _spreadsheet_column(index: int) -> str:
@@ -617,7 +660,9 @@ class FeishuClient:
             headers=self._headers(), params={"valueRenderOption": "UnformattedValue", "dateTimeRenderOption": "FormattedString"},
         )
         data = payload.get("data", {})
-        values = data.get("valueRange", {}).get("values", [])
+        if not isinstance(data, dict) or not isinstance(data.get("valueRange"), dict):
+            raise RuntimeError("飞书电子表回读缺少 valueRange，禁止未经确认重复追加")
+        values = data["valueRange"].get("values", [])
         if not isinstance(values, list):
             raise RuntimeError("飞书电子表回读的 values 结构无效")
         return values
@@ -675,20 +720,27 @@ class FeishuClient:
                     json={"valueRange": {"range": range_name, "values": [new_headers]}},
                 ),
                 lambda: self._read_sheet_values(token, range_name) == [new_headers],
-                f"{platform}今日电子表补表头",
+                f"{platform}今日电子表补表头", idempotent=True,
             )
         self._daily_sheet_headers[key] = expected
         return expected
 
-    def write_today_spreadsheet(self, platform: str, fields: dict[str, Any], *, batch_id: str) -> None:
+    def write_today_spreadsheet(
+        self, platform: str, fields: dict[str, Any], *, batch_id: str,
+        verify_only: bool = False, on_append_attempt: Any = None,
+    ) -> None:
         """今日行按真实表头写入，失败回读批次，补写不会重复追加。"""
         if not self.configured:
             LOGGER.warning("[飞书][今日电子表跳过] 应用凭据未配置，平台=%s", platform)
             return
         source = self._today_storage_fields(platform, fields, batch_id)
         with self._storage_lock:
-            token, sheet_id, row_count, column_count = self._daily_sheet_ref(platform)
-            headers = self._ensure_daily_sheet_headers(platform, token, sheet_id, column_count)
+            try:
+                token, sheet_id, row_count, column_count = self._daily_sheet_ref(platform)
+                headers = self._ensure_daily_sheet_headers(platform, token, sheet_id, column_count)
+            except FeishuWriteUncertainError as error:
+                # 建列/表头结果不确定不代表业务行已追加，后续仍可安全准备字段。
+                raise FeishuWriteUncertainError(str(error), record_write_uncertain=False) from error
             row = [source.get(name, "") for name in headers]
             row = [json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value for value in row]
             last_column = self._spreadsheet_column(len(headers))
@@ -727,8 +779,30 @@ class FeishuClient:
                         json={"valueRange": {"range": f"{sheet_id}!A{target_row}:{last_column}{target_row}", "values": [row]}},
                     )
                 else:
+                    # 先持久化在途状态再派发；进程中断后也只能回读，不盲目重复追加。
+                    if on_append_attempt is not None:
+                        on_append_attempt()
                     self.append_spreadsheet_rows(token, [row], f"{sheet_id}!A:{last_column}")
 
+            if verify_only:
+                if verify():
+                    LOGGER.info("[飞书][不确定追加核验成功] 平台=%s，店铺=%s", platform, source["店铺名"])
+                    return
+                if target_row is not None:
+                    # 原批次行已确认存在但部分值不一致，只允许定点更新，不允许追加新行。
+                    confirmed_row = target_row
+
+                    def update_confirmed_row() -> None:
+                        self._request(
+                            "PUT", f"/open-apis/sheets/v2/spreadsheets/{token}/values", headers=self._headers(),
+                            json={"valueRange": {"range": f"{sheet_id}!A{confirmed_row}:{last_column}{confirmed_row}", "values": [row]}},
+                        )
+
+                    self._verified_storage_write(
+                        update_confirmed_row, verify, f"{platform}不确定追加的原批次行补齐:{source['店铺名']}", idempotent=True,
+                    )
+                    return
+                raise FeishuWriteUncertainError("今日电子表上次追加结果仍未确认，仅核验不重发，保留原采集批次")
             self._verified_storage_write(write, verify, f"{platform}今日电子表:{source['店铺名']}")
 
     def send_robot_message(self, recipient: str, title: str, content: str) -> None:

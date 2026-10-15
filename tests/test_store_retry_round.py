@@ -30,6 +30,7 @@ class StoreRetryRoundTests(unittest.TestCase):
         checker.store_concurrency = 3
         checker._stop_opening_stores = threading.Event()
         checker._save_store_capture = Mock()
+        checker._outbox = Mock(return_value=SimpleNamespace(load=Mock(return_value=None), save=Mock()))
         checker._format_mercado_notification = lambda name, rows, config: (name, "数据")
         lock = threading.Lock()
         events: list[tuple[str, str, int]] = []
@@ -181,18 +182,18 @@ class StoreRetryRoundTests(unittest.TestCase):
         checker = object.__new__(DailyStoreCheck)
         checker.config = {}
         checker.feishu = SimpleNamespace(
-            get_bitable_ref=lambda *args: ("test-token", "test-table"),
-            batch_create_records=Mock(side_effect=[RuntimeError("多维表失败"), None]),
-            append_spreadsheet_rows=Mock(),
+            write_today_bitable=Mock(side_effect=[RuntimeError("多维表失败"), None]),
+            write_today_spreadsheet=Mock(),
         )
-        checker._build_mercado_feishu_rows = lambda *args: ([{"店铺名": "店铺A"}], [["店铺A"]])
+        checker._outbox = Mock(return_value=SimpleNamespace(save=Mock()))
+        rows = [{"采集时间": "2026-10-14T01:00:00+00:00", "飞书字段": {"今天总销售额": 100}}]
         progress = {}
         with self.assertRaisesRegex(RuntimeError, "多维表失败"):
-            checker._write_feishu(self.task("店铺A"), [], completed_writes=progress)
+            checker._write_feishu(self.task("店铺A"), rows, completed_writes=progress)
         self.assertEqual(progress, {"电子表": True})
-        checker._write_feishu(self.task("店铺A"), [], completed_writes=progress)
-        self.assertEqual(checker.feishu.batch_create_records.call_count, 2)
-        checker.feishu.append_spreadsheet_rows.assert_called_once()
+        checker._write_feishu(self.task("店铺A"), rows, completed_writes=progress)
+        self.assertEqual(checker.feishu.write_today_bitable.call_count, 2)
+        checker.feishu.write_today_spreadsheet.assert_called_once()
         self.assertEqual(progress, {"电子表": True, "多维表": True})
 
     def test_initialization_and_close_failure_propagates_close_guard(self):

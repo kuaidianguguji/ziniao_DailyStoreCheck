@@ -12,7 +12,7 @@ from datetime import datetime
 
 
 class WriteOutbox:
-    """每个采集批次对应一个状态文件，原子保存以支持进程退出后的补写。"""
+    """原子保存每批次进度及电子表追加不确定标记，支持重启后仅核验。"""
 
     def __init__(self, output_dir: Path):
         self.directory = output_dir / "write_outbox"
@@ -25,7 +25,7 @@ class WriteOutbox:
         payload = {
             "店铺名": task.store_name, "平台": task.platform, "业务日期": info["业务日期"],
             "采集批次": batch, "采集时间": info["采集时间"], "数据": info["数据"],
-            "指标元数据": info.get("指标元数据", {}), "原始结果": rows, "已完成写入": progress,
+            "指标元数据": info.get("指标元数据", {}), "原始结果": rows, "已完成写入": dict(progress),
             "浏览器已关闭": True, "状态": "完成" if progress.get("多维表") and progress.get("电子表") else "待补写",
         }
         path = self.directory / f"{batch}.json"
@@ -34,7 +34,7 @@ class WriteOutbox:
         temporary.replace(path)
 
     def load(self, task: StoreTask) -> dict[str, Any] | None:
-        """只恢复今天、本店铺且确认关闭浏览器的未完成批次。"""
+        """恢复今天已关闭浏览器的未完成批次，保留追加不确定状态。"""
         if not self.directory.exists():
             return None
         today = datetime.now(BRAZIL_TIMEZONE).date().isoformat()
