@@ -10,17 +10,22 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
 
 import requests
 
-from .config import StoreTask, is_enabled_switch, normalise_platform
+from .config import PROJECT_ROOT, StoreTask, is_enabled_switch, normalise_platform
 from .storage_schema import METADATA_FIELD_ORDER, today_field_names, today_field_specs
 
 LOGGER = logging.getLogger(__name__)
@@ -68,6 +73,8 @@ class FeishuClient:
         self._storage_lock = threading.RLock()
         self._daily_bitable_fields: dict[tuple[str, str], dict[str, int]] = {}
         self._daily_sheet_headers: dict[tuple[str, str], list[str]] = {}
+        output_dir = PROJECT_ROOT / str(config.get("data", {}).get("output_dir", "data") or "data")
+        self._bitable_token_directory = output_dir / "bitable_client_tokens"
 
     @property
     def configured(self) -> bool:
@@ -226,13 +233,19 @@ class FeishuClient:
             raise RuntimeError(f"飞书接口失败 code={payload.get('code')} msg={payload.get('msg')}")
         response_summary: dict[str, Any] = {"code": payload.get("code", 0), "msg": payload.get("msg", "")}
         data = payload.get("data")
+        response_summary["data_type"] = type(data).__name__
         if isinstance(data, dict):
+            # 只记录结构摘要，区分合法空查询与结构损坏，不输出记录内容或分页令牌。
+            response_summary["items_type"] = type(data["items"]).__name__ if "items" in data else "missing"
             if isinstance(data.get("items"), list):
                 response_summary["items_count"] = len(data["items"])
             if isinstance(data.get("records"), list):
                 response_summary["records_count"] = len(data["records"])
             if "has_more" in data:
                 response_summary["has_more"] = data.get("has_more")
+            if "total" in data:
+                response_summary["total"] = data["total"] if type(data["total"]) is int else type(data["total"]).__name__
+            response_summary["page_token_present"] = bool(data.get("page_token"))
         LOGGER.info("[飞书][HTTP成功] method=%s，path=%s，response=%s", method.upper(), safe_path, self._json_for_log(response_summary))
         return payload
 
@@ -439,6 +452,7 @@ class FeishuClient:
         """读取字段类型，既有字段及公式保持原样。"""
         fields: dict[str, int] = {}
         page_token = ""
+        seen_tokens: set[str] = set()
         while True:
             params: dict[str, Any] = {"page_size": 100}
             if page_token:
@@ -451,13 +465,26 @@ class FeishuClient:
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                 raise RuntimeError("飞书字段回读结构无效，不能确认是否需要创建字段")
             for item in data["items"]:
-                if item.get("field_name"):
-                    fields[str(item["field_name"])] = int(item.get("type", 1))
-            if not data.get("has_more"):
+                if (
+                    not isinstance(item, dict) or not isinstance(item.get("field_name"), str)
+                    or not item["field_name"].strip() or type(item.get("type")) is not int or item["type"] <= 0
+                ):
+                    raise RuntimeError("飞书字段回读包含无效名称或类型，不能安全准备今日字段")
+                name = item["field_name"]
+                if name in fields and fields[name] != item["type"]:
+                    raise RuntimeError("飞书字段回读同名字段类型矛盾，不能安全准备今日字段")
+                fields[name] = item["type"]
+            has_more = data.get("has_more", False)
+            if not isinstance(has_more, bool):
+                raise RuntimeError("飞书字段分页标记类型错误，不能安全准备今日字段")
+            if not has_more:
                 return fields
-            page_token = str(data.get("page_token") or "")
-            if not page_token:
+            page_token = data.get("page_token")
+            if not isinstance(page_token, str) or not page_token.strip():
                 raise RuntimeError("飞书字段分页缺少下一页令牌，不能安全准备今日字段")
+            if page_token in seen_tokens:
+                raise RuntimeError("飞书字段分页令牌重复，不能安全准备今日字段")
+            seen_tokens.add(page_token)
 
     @staticmethod
     def _storage_retryable(error: Exception) -> bool:
@@ -469,10 +496,13 @@ class FeishuClient:
             return True
         return bool(re.search(r"code=(95201|95210|99991400)\b|status=(429|5\d\d)\b|server error", str(error), re.I))
 
-    def _verified_storage_write(self, write: Any, verify: Any, label: str, *, idempotent: bool = False) -> None:
+    def _verified_storage_write(
+        self, write: Any, verify: Any, label: str, *, idempotent: bool = False,
+        verify_before_write: bool = True, verify_on_rejection: bool = False,
+    ) -> None:
         """写入返回不确定时先回读，已落地就确认成功，不再次追加。"""
         for attempt in range(1, 4):
-            if verify():
+            if (verify_before_write or attempt > 1) and verify():
                 LOGGER.info("[飞书][补写回读确认] 操作=%s，数据已存在，跳过重复写入", label)
                 return
             try:
@@ -480,6 +510,15 @@ class FeishuClient:
                 return
             except Exception as error:
                 if not self._storage_retryable(error):
+                    if verify_on_rejection:
+                        # 建字段可能与另一进程竞争；即使明确报错，也先确认同名字段是否已正确建立。
+                        try:
+                            confirmed = verify()
+                        except Exception as read_error:
+                            raise FeishuWriteUncertainError(f"{label} 失败后的回读无法确认字段是否存在及类型是否兼容，禁止重复创建") from read_error
+                        if confirmed:
+                            LOGGER.info("[飞书][字段创建回读确认] 操作=%s，同名字段已正确建立", label)
+                            return
                     raise
                 LOGGER.warning("[飞书][写入待确认] 操作=%s，第%s/3次，异常类型=%s", label, attempt, type(error).__name__)
                 # 回读失败时无法确认上一次是否已经成功，保留待补写记录，禁止盲目追加。
@@ -515,8 +554,10 @@ class FeishuClient:
                     raise RuntimeError(f"{platform} 今日采集值字段 {name} 类型不兼容，请保留原字段并修正采集值列类型")
                 continue
 
-            def verify(name: str = name) -> bool:
+            def verify(name: str = name, field_type: int = spec.field_type) -> bool:
                 fields.update(self._list_daily_bitable_fields(app_token, table_id))
+                if name in fields and fields[name] != field_type:
+                    raise RuntimeError(f"{platform} 新增今日字段 {name} 回读类型不兼容，禁止继续写入")
                 return name in fields
 
             self._verified_storage_write(
@@ -524,7 +565,8 @@ class FeishuClient:
                     "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
                     headers=self._headers(), json={"field_name": name, "type": spec.field_type},
                 ),
-                verify, f"准备{platform}今日字段:{name}",
+                # 前面的字段列表已确认缺失，首轮直接创建；只有异常或重试才重新回读。
+                verify, f"准备{platform}今日字段:{name}", verify_before_write=False, verify_on_rejection=True,
             )
             fields.setdefault(name, spec.field_type)
         self._daily_bitable_fields[key] = dict(fields)
@@ -565,8 +607,21 @@ class FeishuClient:
         if isinstance(left, bool) or isinstance(right, bool):
             return False
         try:
-            return float(left) == float(right)
-        except (TypeError, ValueError):
+            left_number, right_number = Decimal(str(left)), Decimal(str(right))
+            if not left_number.is_finite() or not right_number.is_finite():
+                return False
+            if left_number == right_number:
+                return True
+            # 计数和时间戳必须精确相等，不能因大整数转 float 损失精度而误判。
+            if left_number == left_number.to_integral_value() and right_number == right_number.to_integral_value():
+                return False
+            left_float, right_float = float(left_number), float(right_number)
+            if not math.isfinite(left_float) or not math.isfinite(right_float):
+                return False
+            # 飞书会移除二进制浮点尾差，只容忍几个最小浮点步长，不放宽业务精度。
+            tolerance = Decimal.from_float(max(math.ulp(left_float), math.ulp(right_float))) * 4
+            return abs(left_number - right_number) <= tolerance
+        except (TypeError, ValueError, InvalidOperation, OverflowError):
             return str(left) == str(right)
 
     @staticmethod
@@ -578,6 +633,96 @@ class FeishuClient:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone(timedelta(hours=-3)))
         return int(parsed.timestamp() * 1000)
+
+    @staticmethod
+    def _daily_bitable_record_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str]:
+        """兼容明确成功的空记录查询，损坏或矛盾响应仍禁止重复创建。"""
+        invalid_message = "飞书记录回读结构无效，禁止未经确认重复创建"
+        if not isinstance(payload, dict) or payload.get("code", 0) != 0:
+            raise RuntimeError(invalid_message)
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{invalid_message}：data不是对象")
+        has_more = data.get("has_more", False)
+        if not isinstance(has_more, bool):
+            raise RuntimeError(f"{invalid_message}：has_more类型错误")
+        page_token = data.get("page_token")
+        if page_token is not None and not isinstance(page_token, str):
+            raise RuntimeError(f"{invalid_message}：page_token类型错误")
+        page_token = page_token or ""
+        total = data.get("total")
+        if "total" in data and (type(total) is not int or total < 0):
+            raise RuntimeError(f"{invalid_message}：total类型或数值错误")
+        items = data.get("items")
+        if items is None:
+            # 飞书空查询可能省略items或返回null，但必须有明确的成功、末页及空结果标记。
+            if (
+                type(payload.get("code")) is int and payload["code"] == 0
+                and data.get("has_more") is False and total in (None, 0) and not page_token
+            ):
+                LOGGER.info("[飞书][今日空查询确认] items=%s，无匹配记录，可按原批次写入", "null" if "items" in data else "missing")
+                return [], False, ""
+            raise RuntimeError(f"{invalid_message}：缺少可信的空结果标记")
+        if not isinstance(items, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("fields"), dict)
+            or not isinstance(item.get("record_id"), str) or not item["record_id"].strip()
+            for item in items
+        ):
+            raise RuntimeError(f"{invalid_message}：items或记录字段类型错误")
+        if total is not None and (total < len(items) or (not items and total > 0 and not has_more)):
+            raise RuntimeError(f"{invalid_message}：total与记录数矛盾")
+        if has_more and not page_token:
+            raise RuntimeError(f"{invalid_message}：分页缺少下一页令牌")
+        if has_more and total == 0:
+            raise RuntimeError(f"{invalid_message}：空总数却标记有下一页")
+        return items, has_more, page_token
+
+    def _daily_bitable_client_token(self, app_token: str, table_id: str, identity: dict[str, Any]) -> str:
+        """持久复用飞书要求的 UUIDv4；重启或并发补写不能生成另一枚令牌。"""
+        identity_json = json.dumps(
+            {"app_token": app_token, "table_id": table_id, "identity": identity},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        key = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        self._bitable_token_directory.mkdir(parents=True, exist_ok=True)
+        path = self._bitable_token_directory / f"{key}.json"
+
+        def read_token() -> str:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                token = payload["client_token"]
+                parsed = uuid.UUID(token)
+                if parsed.version != 4 or parsed.variant != uuid.RFC_4122 or str(parsed) != token:
+                    raise ValueError("client_token 不是标准 UUIDv4")
+                return token
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                # 不能静默替换已保存令牌，否则前一次请求结果未知时可能重复创建记录。
+                raise RuntimeError(f"飞书幂等令牌文件无效，禁止更换令牌重复创建：{path.name}") from exc
+
+        try:
+            return read_token()
+        except FileNotFoundError:
+            pass
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._bitable_token_directory,
+                prefix=f".{key}.", suffix=".tmp", delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump({"client_token": str(uuid.uuid4())}, temporary)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                # 硬链接原子发布完整文件且不覆盖已有文件；多个进程竞争时读取胜出者的令牌。
+                os.link(temporary_path, path)
+            except FileExistsError:
+                pass
+            return read_token()
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def write_today_bitable(self, platform: str, fields: dict[str, Any], *, batch_id: str) -> None:
         """按店铺、平台、巴西日期和批次幂等写入今日宽行。"""
@@ -604,19 +749,28 @@ class FeishuClient:
 
             def verify() -> bool:
                 nonlocal current
+                current = None
                 # 字段为本模块建立的文本字段，使用服务端过滤避免逐店下载全部历史记录。
                 terms = [f"CurrentValue.[{name}]={json.dumps(value, ensure_ascii=False)}" for name, value in identity.items()]
-                payload = self._request(
-                    "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
-                    headers=self._headers(), params={"page_size": 100, "filter": "AND(" + ",".join(terms) + ")"},
-                )
-                data = payload.get("data", {})
-                if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                    raise RuntimeError("飞书记录回读结构无效，禁止未经确认重复创建")
-                matches = [item for item in data["items"] if all(
-                    self._storage_cell_equal(item.get("fields", {}).get(name), value)
-                    for name, value in identity.items()
-                )]
+                params: dict[str, Any] = {"page_size": 100, "filter": "AND(" + ",".join(terms) + ")"}
+                matches: list[dict[str, Any]] = []
+                seen_tokens: set[str] = set()
+                while True:
+                    payload = self._request(
+                        "GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                        headers=self._headers(), params=params,
+                    )
+                    items, has_more, page_token = self._daily_bitable_record_page(payload)
+                    matches.extend(item for item in items if all(
+                        self._storage_cell_equal(item["fields"].get(name), value)
+                        for name, value in identity.items()
+                    ))
+                    if not has_more:
+                        break
+                    if page_token in seen_tokens:
+                        raise RuntimeError("飞书记录回读分页令牌重复，禁止未经确认重复创建")
+                    seen_tokens.add(page_token)
+                    params["page_token"] = page_token
                 current = matches[0] if matches else None
                 return current is not None and all(
                     self._storage_cell_equal(current.get("fields", {}).get(name), value)
@@ -634,9 +788,7 @@ class FeishuClient:
                     )
                 else:
                     # 多维表支持客户端幂等令牌，服务端回读短暂延迟时也不会重复建同批记录。
-                    client_token = str(uuid.uuid5(
-                        uuid.NAMESPACE_URL, json.dumps({"table_id": table_id, **identity}, ensure_ascii=False, sort_keys=True),
-                    ))
+                    client_token = self._daily_bitable_client_token(app_token, table_id, identity)
                     self._request(
                         "POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
                         headers=self._headers(), params={"client_token": client_token}, json={"fields": writable},

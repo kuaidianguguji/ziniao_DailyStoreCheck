@@ -18,10 +18,31 @@ from daily_store_check.human_interaction import HumanInteraction
 
 LOGGER = logging.getLogger(__name__)
 
+
+class MercadoAdPopupError(RuntimeError):
+    """广告弹窗未能安全关闭，不能当成 chart 接口异常触发另一套日期流程。"""
+
 PERIOD_XPATH = "//button[@id='DateRange-trigger']"
 MENU_XPATH = "//ul[@id='DateRange-menu-list']"
 CUSTOM_XPATH = "//li[@id='DateRange-menu-list-option-custom' and @data-key='custom']"
 CALENDAR_XPATH = "//div[@id='DateRange-custom-datepicker']"
+
+# 预算推荐弹窗的动态 id 和按钮文字会随店铺、浏览器翻译改变。
+# 以预算选项和 mute 拒绝按钮限定目标，绝不点击 loud 的“调整预算”。
+AD_TEMPLATE_DIALOG_XPATH = (
+    "//div[@role='dialog' and @aria-modal='true' "
+    "and contains(concat(' ', normalize-space(@class), ' '), ' modal-template ')]"
+)
+BUDGET_POPUP_XPATH = (
+    AD_TEMPLATE_DIALOG_XPATH
+    + "[.//*[@data-testid='modal-template-content']//input[@type='radio' and @name='capability_selection']]"
+)
+BUDGET_POPUP_DISMISS_XPATH = (
+    BUDGET_POPUP_XPATH
+    + "//*[@data-testid='modal-template-content'][.//input[@type='radio' and @name='capability_selection']]"
+    "//button[@type='button' and @data-andes-button-hierarchy='mute' "
+    "and not(@disabled) and not(@aria-disabled='true')]"
+)
 
 # 金额对应收入和投资额；中文界面的“销售额”卡片实际对应接口中的销量。
 DOM_METRICS: tuple[tuple[str, str, str], ...] = (
@@ -47,6 +68,7 @@ class MercadoAdPage:
         self.parser = parser
         self.ui_timeout_seconds = self._number(values.get("ui_timeout_seconds"), 20.0, 0.1)
         self.dom_timeout_seconds = self._number(values.get("dom_timeout_seconds"), 60.0, 0.1)
+        self.popup_close_timeout_seconds = self._number(values.get("popup_close_timeout_seconds"), 5.0, 0.1)
         self.double_click_min_ms = self._number(values.get("fallback_double_click_min_interval_ms"), 80.0)
         self.double_click_max_ms = self._number(values.get("fallback_double_click_max_interval_ms"), 180.0)
         if self.double_click_min_ms > self.double_click_max_ms:
@@ -95,6 +117,79 @@ class MercadoAdPage:
         self._double_click_date(tab, date_xpath, store_name)
         self._wait_today_range(tab, store_name, today)
 
+    def close_budget_popup(self, tab: Any, store_name: str, *, wait_seconds: float = 0.0) -> bool:
+        """仅拒绝广告预算推荐，确认整个弹窗消失；不操作浏览器网络监听。"""
+        appearance_deadline = time.monotonic() + max(0.0, wait_seconds)
+        query_deadline = max(appearance_deadline, time.monotonic() + self.popup_close_timeout_seconds)
+        while True:
+            dialogs = self._popup_elements(tab, BUDGET_POPUP_XPATH)
+            if dialogs is None:
+                if time.monotonic() >= query_deadline:
+                    raise MercadoAdPopupError("美客多广告弹窗查询持续失败，无法确认页面是否被弹窗遮挡")
+                time.sleep(0.2)
+                continue
+            if dialogs:
+                if len(dialogs) != 1:
+                    raise MercadoAdPopupError(f"美客多预算推荐弹窗匹配到 {len(dialogs)} 个可见目标，停止点击")
+                break
+            if time.monotonic() >= appearance_deadline:
+                return False
+            time.sleep(min(0.2, max(0.0, appearance_deadline - time.monotonic())))
+
+        LOGGER.info("[美客多][广告弹窗] 店铺=%s，发现预算推荐弹窗，准备点击“错过这个机会”", store_name)
+        last_error = "弹窗未消失"
+        for attempt in range(1, 4):
+            buttons = self._popup_elements(tab, BUDGET_POPUP_DISMISS_XPATH)
+            if buttons is not None and len(buttons) > 1:
+                raise MercadoAdPopupError(f"美客多预算推荐弹窗拒绝按钮匹配到 {len(buttons)} 个可见目标，停止点击")
+            if buttons:
+                try:
+                    self.human.click_element(tab, buttons[0])
+                    LOGGER.info("[美客多][广告弹窗点击] 店铺=%s，第%d/3次，已派发拒绝按钮点击，等待整个弹窗关闭", store_name, attempt)
+                except Exception as exc:
+                    last_error = f"点击异常={type(exc).__name__}"
+                    LOGGER.warning("[美客多][广告弹窗点击重试] 店铺=%s，第%d/3次，%s", store_name, attempt, last_error)
+            else:
+                last_error = "拒绝按钮暂不可用，继续核对弹窗是否已关闭"
+
+            deadline = time.monotonic() + self.popup_close_timeout_seconds
+            absent_checks = 0
+            while time.monotonic() < deadline:
+                # 不能只等按钮消失：按钮可能先被替换，但模态框与遮罩仍挡住页面。
+                # 查询异常也不能当作关闭成功；只有连续两次确认无可见模态框才继续。
+                visible_dialogs = self._popup_elements(tab, AD_TEMPLATE_DIALOG_XPATH)
+                absent_checks = absent_checks + 1 if visible_dialogs == [] else 0
+                if absent_checks >= 2:
+                    LOGGER.info("[美客多][广告弹窗已关闭] 店铺=%s，第%d/3次，已确认弹窗消失", store_name, attempt)
+                    return True
+                time.sleep(0.2)
+            LOGGER.warning("[美客多][广告弹窗关闭重试] 店铺=%s，第%d/3次，%.1f秒内未确认关闭，%s", store_name, attempt, self.popup_close_timeout_seconds, last_error)
+        raise MercadoAdPopupError("美客多广告预算推荐弹窗连续3次未确认关闭，停止后续页面操作")
+
+    @staticmethod
+    def _popup_elements(tab: Any, xpath: str) -> list[Any] | None:
+        """None 表示页面重绘等查询异常，不能用来确认弹窗已消失。"""
+        try:
+            visible = []
+            for element in tab.eles(f"xpath:{xpath}", timeout=0):
+                if not element.states.is_displayed:
+                    continue
+                geometry_check = getattr(element, "run_js", None)
+                # DrissionPage 的 is_displayed 不检查 display:none 的祖先。
+                # 用真实布局确认，避免把保留在隐藏父容器内的弹窗当成仍可见。
+                if callable(geometry_check) and geometry_check("""
+                    const rect = this.getBoundingClientRect();
+                    const style = getComputedStyle(this);
+                    return rect.width > 0 && rect.height > 0 && this.getClientRects().length > 0
+                        && style.display !== 'none' && style.visibility !== 'hidden'
+                        && style.visibility !== 'collapse';
+                """) is False:
+                    continue
+                visible.append(element)
+            return visible
+        except Exception:
+            return None
+
     @staticmethod
     def _today_xpath(today: str) -> str:
         # 完整日期由调用者按巴西时区计算，不使用浏览器或本机的“今天”标记。
@@ -141,6 +236,7 @@ class MercadoAdPage:
         """点击前重新定位，避免日期菜单重绘造成旧节点失效。"""
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            self.close_budget_popup(tab, store_name)
             element = self._wait_unique(tab, xpath, step)
             try:
                 element.scroll.to_see(center=True)
@@ -157,6 +253,7 @@ class MercadoAdPage:
 
     def _double_click_date(self, tab: Any, xpath: str, store_name: str) -> None:
         """先完成仿真人移入，再以短间隔点击两次；第二次重新获取节点。"""
+        self.close_budget_popup(tab, store_name)
         first = self._wait_unique(tab, xpath, "广告概览今天日期")
         point = self._click_point(first)
         self.human.move_to_point(tab, *point)
@@ -265,6 +362,7 @@ class MercadoAdPage:
         raw_values: dict[str, str] = {}
         fields: dict[str, Any] = {}
         while time.monotonic() < deadline:
+            self.close_budget_popup(tab, store_name)
             snapshot = self._snapshot(tab)
             raw_values = snapshot.get("values", {}) if isinstance(snapshot, dict) else {}
             range_text = snapshot.get("range", "") if isinstance(snapshot, dict) else ""

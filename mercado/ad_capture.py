@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
-from mercado.ad_page import MercadoAdPage
+from mercado.ad_page import MercadoAdPage, MercadoAdPopupError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -112,21 +112,25 @@ class MercadoAdCapture:
         self._start_chart_listener(listener)
         try:
             tab.get(self.page_url)
+            self._ad_page.close_budget_popup(tab, store_name)
             LOGGER.info("[美客多][广告监听] 店铺=%s，已跳转广告页，等待精准 chart 响应，最长 %.1f 秒", store_name, self.request_timeout_seconds)
             try:
-                packet = self._wait_for_target_packet(listener, store_name)
+                packet = self._wait_for_target_packet(listener, store_name, tab=tab)
                 payload = self._packet_json(packet, store_name)
                 fields, summary = self._extract_today(
                     payload, store_name, today=today,
                     require_single_day=self._matches_target_url(str(packet.url), expected_date=today),
                 )
                 if not summary["missing_metrics"]:
+                    self._ad_page.close_budget_popup(tab, store_name, wait_seconds=2.0)
                     LOGGER.info("[美客多][广告完成] 店铺=%s，来源=chart，日期=%s，广告字段=%s", store_name, today, fields)
                     return fields, summary
                 LOGGER.warning(
                     "[美客多][广告数据不完整] 店铺=%s，日期=%s，缺失指标=%s；准备切换今天重新监听",
                     store_name, today, summary["missing_metrics"],
                 )
+            except MercadoAdPopupError:
+                raise
             except (TimeoutError, RuntimeError) as exc:
                 LOGGER.warning("[美客多][广告主接口不可用] 店铺=%s，原因=%s；准备日期选择流程", store_name, exc)
 
@@ -180,16 +184,19 @@ class MercadoAdCapture:
             before_date_click=lambda: self._start_chart_listener(listener),
         )
         try:
-            packet = self._wait_for_target_packet(listener, store_name, expected_date=today)
+            packet = self._wait_for_target_packet(listener, store_name, expected_date=today, tab=tab)
             payload = self._packet_json(packet, store_name)
             fields, summary = self._extract_today(payload, store_name, today=today, require_single_day=True)
             if not summary["missing_metrics"]:
+                self._ad_page.close_budget_popup(tab, store_name, wait_seconds=2.0)
                 LOGGER.info("[美客多][广告今日重监听成功] 店铺=%s，日期=%s，广告字段=%s", store_name, today, fields)
                 return fields, summary
             LOGGER.warning(
                 "[美客多][广告今日仍缺失] 店铺=%s，指标=%s；读取今日页面五项指标",
                 store_name, summary["missing_metrics"],
             )
+        except MercadoAdPopupError:
+            raise
         except (TimeoutError, RuntimeError) as exc:
             LOGGER.warning("[美客多][广告今日响应不可用] 店铺=%s，原因=%s；读取今日页面五项指标", store_name, exc)
         self._stop_listener(listener, store_name)
@@ -202,6 +209,7 @@ class MercadoAdCapture:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """主 chart 接口没有返回时，通过页面周期选择触发 campaigns/search 请求。"""
         today = today or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
+        self._ad_page.close_budget_popup(tab, store_name)
         period_button = self._wait_element(tab, PERIOD_BUTTON_XPATH, self.fallback_request_timeout_seconds)
         if period_button is None:
             raise TimeoutError("美客多广告备用流程未找到周期选择按钮")
@@ -216,19 +224,23 @@ class MercadoAdCapture:
         target_pattern = r"/pa/api/admin-pads/ajax/campaigns/search\?"
         self._start_listener(listener, target_pattern)
         try:
+            self._ad_page.close_budget_popup(tab, store_name)
             self._click_element(period_button, tab, "打开广告周期菜单")
             custom = self._wait_element(tab, CUSTOM_PERIOD_XPATH, 10.0)
             if custom is None:
                 raise TimeoutError("美客多广告备用流程未找到自定义时间按钮")
+            self._ad_page.close_budget_popup(tab, store_name)
             self._click_element(custom, tab, "选择自定义时间")
             today_element = self._wait_element(tab, TODAY_CALENDAR_XPATH, 20.0)
             if today_element is None:
                 raise TimeoutError("美客多广告备用流程未找到今天日期按钮")
+            self._ad_page.close_budget_popup(tab, store_name)
             self._double_click_element(today_element, tab, "选择今天日期")
-            packet = self._wait_for_fallback_packet(listener, store_name, expected_date=today)
+            packet = self._wait_for_fallback_packet(listener, store_name, expected_date=today, tab=tab)
             payload = self._packet_json(packet, store_name)
             fields, summary = self._extract_fallback(payload, store_name)
             summary.update({"date": today, "date_from": today, "date_to": today, "currency": "BRL"})
+            self._ad_page.close_budget_popup(tab, store_name, wait_seconds=2.0)
             LOGGER.info("[美客多][广告备用完成] 店铺=%s，活动字段=%s", store_name, fields)
             return fields, summary
         finally:
@@ -292,13 +304,15 @@ class MercadoAdCapture:
         )
 
     def _wait_for_fallback_packet(
-        self, listener: Any, store_name: str, *, expected_date: str | None = None,
+        self, listener: Any, store_name: str, *, expected_date: str | None = None, tab: Any = None,
     ) -> Any:
         expected_date = expected_date or datetime.now(BRAZIL_TIMEZONE).date().isoformat()
         deadline = time.monotonic() + self.fallback_request_timeout_seconds
         invalid_count = 0
         matched_count = 0
         while time.monotonic() < deadline:
+            if tab is not None:
+                self._ad_page.close_budget_popup(tab, store_name)
             packet = listener.wait(timeout=min(2.0, max(0.2, deadline - time.monotonic())), raise_err=False)
             if not packet:
                 continue
@@ -363,11 +377,15 @@ class MercadoAdCapture:
         summary = {"source": "campaigns/search", "active_campaign_count": len(active), "metrics": totals}
         return fields, summary
 
-    def _wait_for_target_packet(self, listener: Any, store_name: str, *, expected_date: str | None = None) -> Any:
+    def _wait_for_target_packet(
+        self, listener: Any, store_name: str, *, expected_date: str | None = None, tab: Any = None,
+    ) -> Any:
         deadline = time.monotonic() + self.request_timeout_seconds
         matched_count = 0
         invalid_count = 0
         while time.monotonic() < deadline:
+            if tab is not None:
+                self._ad_page.close_budget_popup(tab, store_name)
             remaining = max(0.2, deadline - time.monotonic())
             packet = listener.wait(timeout=min(2.0, remaining), raise_err=False)
             if not packet:

@@ -12,12 +12,13 @@ import unicodedata
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import PROJECT_ROOT, StoreTask, is_period_enabled, normalise_platform
 from .deepseek_client import DeepSeekClient
 from .feishu_client import FeishuClient, FeishuWriteUncertainError
 from .reporting import business_date, capture_batch, display_metric, extract_today, today_record
+from .run_lock import exclusive_daily_run
 from .storage_schema import TODAY_FIELD_ORDER_BY_PLATFORM, today_field_names
 from .write_outbox import WriteOutbox
 from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
@@ -82,6 +83,7 @@ class DailyStoreCheck:
         self.store_concurrency = max(1, int(config.get("data", {}).get("store_concurrency", 3) or 3))
         self._stop_opening_stores = threading.Event()
 
+    @exclusive_daily_run
     def run_once(self) -> None:
         """执行一轮任务；店铺采集和单店 DeepSeek 分别使用独立并发队列。"""
         # ALL_info 保存本轮所有平台、所有店铺的采集结果和失败状态。
@@ -218,7 +220,7 @@ class DailyStoreCheck:
                         "店铺 %s 未确认关闭，停止提交尚未启动的店铺；当前已运行店铺继续完成并关闭",
                         task.store_name,
                     )
-                elif store_info.get("状态") == "成功":
+                elif self._capture_succeeded(store_info):
                     self._submit_store_analysis(task, store_info, deepseek_executor, single_store_enabled)
 
             submit_available_tasks()
@@ -257,7 +259,7 @@ class DailyStoreCheck:
             if store_info.get("中止后续店铺"):
                 close_failed = True
                 self._stop_opening_stores.set()
-            elif store_info.get("状态") == "成功":
+            elif self._capture_succeeded(store_info):
                 self._submit_store_analysis(task, store_info, deepseek_executor, single_store_enabled)
 
         # ALL_info 仍按飞书控制表顺序排列，避免并发完成顺序影响最终经理汇总。
@@ -274,14 +276,45 @@ class DailyStoreCheck:
     def _submit_store_analysis(
         self, task: StoreTask, store_info: dict[str, Any], executor: ThreadPoolExecutor, enabled: bool,
     ) -> None:
-        """仅为最终成功结果提交单店分析，失败的首轮或补跑均不提交。"""
+        """采集成功即可分析；同一快照补写时不得重复提交单店分析。"""
         if task.platform not in {"tiktok", "shopee", "mercado"}:
             return
         if enabled:
-            executor.submit(self._send_store_deepseek_analysis, task.recipient, store_info)
+            message_progress = store_info.setdefault("消息进度", {})
+            if message_progress.get("单店分析已提交"):
+                LOGGER.info("[并发][DeepSeek已提交跳过] 店铺=%s，批次=%s", task.store_name, store_info.get("采集批次", ""))
+                return
+            message_progress["单店分析已提交"] = True
+            self._save_store_progress(task, store_info)
+            try:
+                executor.submit(self._send_store_deepseek_analysis, task.recipient, self._analysis_store_info(store_info))
+            except Exception:
+                # 显式 False 才能覆盖 outbox 已合并保存的 True，允许下一次重新提交。
+                message_progress["单店分析已提交"] = False
+                self._save_store_progress(task, store_info)
+                LOGGER.exception("[并发][DeepSeek提交失败] 店铺=%s，不影响采集结果", task.store_name)
+                return
             LOGGER.info("[并发][DeepSeek提交] 店铺=%s，平台=%s；采集线程已释放，可启动下一店铺", task.store_name, task.platform)
         else:
             LOGGER.info("[并发][DeepSeek单店跳过] 店铺=%s，平台=%s，配置开关已关闭", task.store_name, task.platform)
+
+    @staticmethod
+    def _capture_succeeded(store_info: dict[str, Any]) -> bool:
+        """兼容旧结果，同时让存储失败不再伪装成采集失败。"""
+        return store_info.get("采集状态", store_info.get("状态")) == "成功"
+
+    @staticmethod
+    def _analysis_store_info(store_info: dict[str, Any]) -> dict[str, Any]:
+        """AI 的主状态描述采集情况，另行保留任务与写入结果。"""
+        result = {key: value for key, value in store_info.items() if not key.startswith("_")}
+        if DailyStoreCheck._capture_succeeded(store_info):
+            result["任务状态"] = store_info.get("任务状态", store_info.get("状态", "成功"))
+            result["状态"] = "成功"
+            result["采集状态"] = "成功"
+            if result.get("写入错误"):
+                # 写入错误有自己的字段，避免模型将通用“错误”误读成数据缺失。
+                result.pop("错误", None)
+        return result
 
     def _run_store_timed(
         self, task: StoreTask, *, final_attempt: bool = False, completed_writes: dict[str, bool] | None = None,
@@ -377,6 +410,7 @@ class DailyStoreCheck:
         """采集失败重开店；已关闭浏览器的写入失败只补写同一批次。"""
         store_info: dict[str, Any] = {
             "店铺名": task.store_name, "平台": task.platform, "状态": "未执行", "采集时间": "", "数据": {},
+            "采集状态": "未执行", "写入状态": "未执行", "消息进度": {},
         }
         write_progress = dict(completed_writes or {})
         rows: list[dict[str, Any]] = []
@@ -386,6 +420,7 @@ class DailyStoreCheck:
             if cached_capture is not None:
                 rows = cached_capture["_采集结果"]
                 write_progress.update(cached_capture.get("_已完成写入", {}))
+                store_info["消息进度"] = dict(cached_capture.get("消息进度") or cached_capture.get("_消息进度") or {})
                 LOGGER.info("[补写][恢复快照] 店铺=%s，批次=%s，不重新打开紫鸟浏览器", task.store_name, cached_capture.get("采集批次", ""))
             else:
                 identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name, task.platform)
@@ -410,50 +445,97 @@ class DailyStoreCheck:
                 "采集时间": collected_at, "数据": values, "指标元数据": metadata,
                 "业务日期": business_date(collected_at),
                 "采集批次": capture_batch(task.platform, task.store_name, collected_at),
-                "_采集结果": rows, "_阶段": "写入",
+                "_采集结果": rows, "_阶段": "写入", "采集状态": "成功",
+                "_已完成写入": write_progress,
             })
             # 到这里浏览器已成功关闭；任何补写都不得再次打开店铺。
+            self._save_store_progress(task, store_info)
             try:
-                self._outbox().save(task, rows, store_info, write_progress)
-            except OSError:
-                LOGGER.exception("[补写][本机状态保存失败] 店铺=%s，继续尝试飞书写入", task.store_name)
-            self._write_feishu(task, rows, completed_writes=write_progress)
-            self._outbox().save(task, rows, store_info, write_progress)
-            platform_config = self.config.get("platforms", {}).get(task.platform, {})
-            formatter = {
-                "tiktok": self._format_tiktok_notification,
-                "shopee": self._format_shopee_notification,
-                "mercado": self._format_mercado_notification,
-            }.get(task.platform)
-            if formatter:
-                title, body = formatter(task.store_name, rows, platform_config)
-                self._safe_notify_markdown(task.recipient, title, body)
-                if task.platform == "shopee":
-                    self._send_shopee_analytics_notifications(task.recipient, task.store_name, rows, platform_config)
+                self._write_feishu(task, rows, completed_writes=write_progress)
+            except Exception as exc:
+                # 写表失败只影响存储状态。原始消息和 AI 继续使用已经成功采集的快照。
+                LOGGER.exception("[补写][采集成功写入未完成] 店铺=%s，批次=%s", task.store_name, store_info["采集批次"])
+                store_info.update({"状态": "失败", "写入状态": "待补写", "写入错误": str(exc), "错误": str(exc)})
             else:
-                self._safe_notify(task.recipient, f"{task.store_name} 数据", self._format_rows(rows))
-            store_info["状态"] = "成功"
+                store_info.update({"状态": "成功", "写入状态": "成功"})
+            self._save_store_progress(task, store_info)
+            try:
+                self._send_raw_store_notifications(task, rows, store_info)
+            except Exception as exc:
+                LOGGER.exception("[飞书][原始消息失败] 店铺=%s，不影响已采集数据和写表状态", task.store_name)
+                store_info.update({"消息状态": "失败", "消息错误": str(exc)})
+            self._save_store_progress(task, store_info)
         except ZiniaoStoreCloseError as exc:
             LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
             store_info.update({"状态": "失败", "错误": str(exc), "中止后续店铺": True, "_阶段": "关闭"})
         except Exception as exc:
             LOGGER.exception("店铺 %s 处理失败，阶段=%s", task.store_name, store_info.get("_阶段", "准备"))
             store_info.update({"状态": "失败", "错误": str(exc)})
+        if store_info["状态"] == "失败" and store_info["采集状态"] != "成功":
+            store_info.update({"采集状态": "失败", "采集错误": store_info.get("错误", "采集失败")})
         if store_info["状态"] == "失败":
             store_info["_已完成写入"] = write_progress
             if store_info.get("_阶段") == "写入" and rows:
-                try:
-                    self._outbox().save(task, rows, store_info, write_progress)
-                except OSError:
-                    LOGGER.exception("[补写][失败状态保存异常] 店铺=%s", task.store_name)
+                self._save_store_progress(task, store_info)
             if final_attempt:
                 self._notify_store_failure(task, store_info)
             else:
                 LOGGER.warning("[补跑][首轮失败暂存] 店铺=%s，阶段=%s，等待首轮结束后重试", task.store_name, store_info.get("_阶段", "准备"))
         return store_info
 
+    def _save_store_progress(self, task: StoreTask, store_info: dict[str, Any]) -> None:
+        """保存消息与写入进度；磁盘异常不能抹掉已有采集结果。"""
+        rows = store_info.get("_采集结果")
+        if not rows or not store_info.get("采集批次"):
+            return
+        try:
+            self._outbox().save(task, rows, store_info, store_info.get("_已完成写入", {}))
+        except Exception:
+            LOGGER.exception("[补写][本机状态保存失败] 店铺=%s，批次=%s", task.store_name, store_info.get("采集批次"))
+
+    def _send_raw_store_notifications(
+        self, task: StoreTask, rows: list[dict[str, Any]], store_info: dict[str, Any],
+    ) -> None:
+        """按消息保存成功标记，补写同一快照时只补发未成功的原始消息。"""
+        message_progress = store_info.setdefault("消息进度", {})
+        platform_config = self.config.get("platforms", {}).get(task.platform, {})
+        formatter = {
+            "tiktok": self._format_tiktok_notification,
+            "shopee": self._format_shopee_notification,
+            "mercado": self._format_mercado_notification,
+        }.get(task.platform)
+        if not message_progress.get("原始数据"):
+            if formatter:
+                title, body = formatter(task.store_name, rows, platform_config)
+                sent = self._safe_notify_markdown(task.recipient, title, body)
+            else:
+                sent = self._safe_notify(task.recipient, f"{task.store_name} 数据", self._format_rows(rows))
+            # 原方法及旧的离线桩没有返回值；现在只有显式 False 表示发送失败。
+            if sent is not False:
+                message_progress["原始数据"] = True
+                self._save_store_progress(task, store_info)
+        analytics_sent = True
+        if task.platform == "shopee":
+            analytics_sent = self._send_shopee_analytics_notifications(
+                task.recipient, task.store_name, rows, platform_config,
+                message_progress=message_progress,
+                on_progress=lambda: self._save_store_progress(task, store_info),
+            ) is not False
+        store_info["消息状态"] = "成功" if message_progress.get("原始数据") and analytics_sent else "失败"
+
     def _notify_store_failure(self, task: StoreTask, store_info: dict[str, Any]) -> None:
         """仅在补跑结束或无法安全补跑时发送最终失败状态。"""
+        if self._capture_succeeded(store_info) and store_info.get("写入状态") == "待补写":
+            progress = store_info.get("_已完成写入", {})
+            completed = "、".join(name for name in ("多维表", "电子表") if progress.get(name)) or "无"
+            pending = "、".join(name for name in ("多维表", "电子表") if not progress.get(name))
+            self._safe_notify(
+                task.recipient, f"{task.store_name} 采集成功，飞书写入未完成",
+                f"采集成功，原始数据已保存到本机。\n已完成写入：{completed}\n待补写：{pending}"
+                f"\n业务日期：{store_info.get('业务日期', '')}\n批次：{store_info.get('采集批次', '')}"
+                f"\n写入错误：{store_info.get('写入错误') or store_info.get('错误', '')}",
+            )
+            return
         title = f"{task.store_name} 关闭失败" if store_info.get("中止后续店铺") else f"{task.store_name} 数据任务失败"
         error_message = str(store_info.get("错误") or "店铺执行失败")
         if store_info.get("中止后续店铺"):
@@ -509,7 +591,7 @@ class DailyStoreCheck:
             json.dumps(ALL_info, ensure_ascii=False, default=str),
         )
         try:
-            analysis_text = self.deepseek.analyze_all_info(ALL_info)
+            analysis_text = self.deepseek.analyze_all_info([self._analysis_store_info(info) for info in ALL_info])
         except Exception:
             # AI 汇总属于最终附加步骤，失败不能影响已完成的数据写入、紫鸟退出和计时输出。
             LOGGER.exception("[DeepSeek][ALL_info分析失败] 本轮不发送 AI 汇总")
@@ -555,7 +637,7 @@ class DailyStoreCheck:
             store_name,
         )
         try:
-            analysis_text = self.deepseek.analyze_store(store_info)
+            analysis_text = self.deepseek.analyze_store(self._analysis_store_info(store_info))
         except Exception:
             # 单店 AI 分析属于附加步骤，失败不能覆盖已经成功的采集、写表和原始消息。
             LOGGER.exception(
@@ -595,8 +677,12 @@ class DailyStoreCheck:
         store_name: str,
         rows: list[dict[str, Any]],
         platform_config: dict[str, Any] | None = None,
-    ) -> None:
+        *, message_progress: dict[str, bool] | None = None,
+        on_progress: Callable[[], None] | None = None,
+    ) -> bool:
         """把商业分析每个页面的今天、昨天、近7天合并为横向对比表。"""
+        progress = message_progress if message_progress is not None else {}
+        all_sent = True
         analytics_values = {
             str(row.get("指标") or ""): str(row.get("显示值") or "")
             for row in rows
@@ -629,12 +715,22 @@ class DailyStoreCheck:
             markdown = self._format_shopee_analytics_period_table(page_name, period_payloads, platform_config)
             chunks = self._split_markdown_table(markdown, page_name, max_chunk_size=3500)
             for chunk_index, chunk in enumerate(chunks, start=1):
+                progress_key = f"商业分析:{page_name}:{chunk_index}"
+                if progress.get(progress_key):
+                    continue
                 suffix = f"（{chunk_index}/{len(chunks)}）" if len(chunks) > 1 else ""
-                self._safe_notify_markdown(
+                sent = self._safe_notify_markdown(
                     recipient,
                     f"{store_name} Shopee {page_name}{suffix}",
                     chunk,
                 )
+                if sent is False:
+                    all_sent = False
+                else:
+                    progress[progress_key] = True
+                    if on_progress:
+                        on_progress()
+        return all_sent
 
     @staticmethod
     def _format_shopee_analytics_period_table(
@@ -728,7 +824,7 @@ class DailyStoreCheck:
             chunks.append("\n".join(current_lines))
         return chunks
 
-    def _safe_notify(self, recipient: str, title: str, content: str) -> None:
+    def _safe_notify(self, recipient: str, title: str, content: str) -> bool:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""
         try:
             LOGGER.info(
@@ -738,12 +834,14 @@ class DailyStoreCheck:
                 content,
             )
             self.feishu.send_robot_message(recipient, title, content)
+            return bool(str(recipient or "").strip())
         except Exception:
             LOGGER.exception("飞书消息推送失败 recipient=%s", recipient)
+            return False
 
     def _safe_notify_markdown(
         self, recipient: str, title: str, content: str, *, compact: bool = False,
-    ) -> None:
+    ) -> bool:
         """以 interactive Markdown 卡片发送 DeepSeek 汇总，失败时不影响任务收尾。"""
         try:
             LOGGER.info(
@@ -756,8 +854,10 @@ class DailyStoreCheck:
                 self.feishu.send_robot_markdown_message(recipient, title, content, compact=True)
             else:
                 self.feishu.send_robot_markdown_message(recipient, title, content)
+            return bool(str(recipient or "").strip())
         except Exception:
             LOGGER.exception("飞书 Markdown 消息推送失败 recipient=%s", recipient)
+            return False
 
     def _find_browser_identifier(self, store_name: str, platform: str = "") -> str:
         """按店铺名查找紫鸟标识，先精确匹配，再按“平台+店号”匹配。"""

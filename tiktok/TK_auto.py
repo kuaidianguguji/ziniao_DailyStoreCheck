@@ -123,6 +123,18 @@ AD_TODAY_BUTTON_XPATH = '(//button[contains(@class,"theme-arco-btn") and contain
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的广告指标 XPath。
 AD_DATA_READY_XPATH = '(//div[contains(@class,"overview-item")]/div[contains(@class,"overflow-tooltip-item")])[1]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]'
 
+# 广告导航更新弹窗使用版本化的 ks-modal/ks-button 自定义组件，不能只查找 button 标签。
+AD_ANNOUNCEMENT_MODAL_XPATH = '//*[@data-testid="gmv-revamp-announcement-modal"]'
+AD_ANNOUNCEMENT_DISMISS_XPATH = (
+    AD_ANNOUNCEMENT_MODAL_XPATH
+    + '//*[self::button or starts-with(local-name(),"ks-button")]['
+    '@data-btm="revampannouncementmodal:ksbutton:c1085" '
+    'or @data-uid="revampannouncementmodal:ksbutton:bec64" '
+    'or normalize-space(.)="知道了" or normalize-space(.)="Got it" or normalize-space(.)="Entendi"]'
+)
+AD_ANNOUNCEMENT_CLOSE_TIMEOUT_SECONDS = 5
+AD_ANNOUNCEMENT_CLOSE_ATTEMPTS = 3
+
 
 # 店铺广告时间范围切换步骤。每个时间范围都预留“打开时间”和“选择范围”两次点击。
 AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
@@ -379,6 +391,8 @@ class TiktokAuto:
         )
         # 记录最近一次真实点击的时间；后续每次点击都会据此补足随机的人类操作间隔。
         self._last_button_click_at: float | None = None
+        self._ad_page_active = False
+        self._ad_popup_dismissals = 0
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，依次采集广告数据和数据分析概览。"""
@@ -387,6 +401,8 @@ class TiktokAuto:
 
         # 每间店铺重新计算点击节奏，避免上一间店铺的关闭时间影响当前店铺。
         self._last_button_click_at = None
+        self._ad_page_active = False
+        self._ad_popup_dismissals = 0
 
         LOGGER.info("[TikTok][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
@@ -1484,6 +1500,7 @@ class TiktokAuto:
 
     def _open_business_page(self, tab: Any, url: str, ready_xpath: str, page_name: str) -> bool:
         """在紫鸟当前标签页打开固定业务 URL，并等待该页面的时间控件出现。"""
+        self._ad_page_active = bool(url) and urlsplit(url).path == urlsplit(AD_PAGE_URL).path
         if not url:
             LOGGER.error("[TikTok][页面跳转失败] 页面=%s，URL 为空", page_name)
             return False
@@ -1519,6 +1536,90 @@ class TiktokAuto:
                 ready_xpath,
             )
         return ready
+
+    @staticmethod
+    def _visible_ad_popup_element(tab: Any, xpath: str) -> Any:
+        """弹窗确认使用严格查询；查询异常不能被当成弹窗已经消失。"""
+        element = tab.ele(f"xpath:{xpath}", timeout=0.1)
+        if not element:
+            return None
+        states = getattr(element, "states", None)
+        displayed = getattr(states, "is_displayed", None) if states is not None else None
+        if displayed is None:
+            displayed = getattr(element, "is_displayed", None)
+        if callable(displayed):
+            displayed = displayed()
+        if displayed is not None and not bool(displayed):
+            return None
+        run_js = getattr(element, "run_js", None)
+        if callable(run_js):
+            # ks-modal 可能只隐藏 Shadow DOM 内的容器而保留宿主；检查实际插槽内容的布局。
+            rendered = run_js("""
+                const node = this.querySelector('[slot="body"]') || this;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0
+                    && style.display !== 'none' && style.visibility !== 'hidden';
+            """)
+            if rendered is False:
+                return None
+        return element
+
+    def _dismiss_ad_announcement(self, tab: Any) -> bool:
+        """日期点击失败后检查可选弹窗；没有则立即继续，有则点击知道了并确认关闭。"""
+        query_deadline = time.monotonic() + AD_ANNOUNCEMENT_CLOSE_TIMEOUT_SECONDS
+        while True:
+            try:
+                modal = self._visible_ad_popup_element(tab, AD_ANNOUNCEMENT_MODAL_XPATH)
+            except Exception as exc:
+                LOGGER.info("[TikTok][广告弹窗查询重试] 页面暂时刷新，继续检查，异常=%s", exc)
+                if time.monotonic() >= query_deadline:
+                    LOGGER.warning("[TikTok][广告弹窗查询失败] 无法确认弹窗状态")
+                    return False
+                self._human_wait(tab, 0.25)
+                continue
+            if not modal:
+                return True
+            break
+
+        LOGGER.info("[TikTok][广告弹窗] 发现导航更新提示，准备点击知道了")
+        for attempt in range(1, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS + 1):
+            try:
+                button = self._visible_ad_popup_element(tab, AD_ANNOUNCEMENT_DISMISS_XPATH)
+                if button:
+                    self._prepare_human_click(tab, button, "广告弹窗-知道了")
+                    # 等待和鼠标移动期间，翻译或组件刷新可能替换按钮。
+                    button = self._visible_ad_popup_element(tab, AD_ANNOUNCEMENT_DISMISS_XPATH)
+                    if not button:
+                        raise RuntimeError("点击前知道了按钮已经不可见")
+                    try:
+                        self._human_interaction.click_element(tab, button)
+                    except Exception:
+                        button.click()
+                    self._record_button_click()
+                    LOGGER.info("[TikTok][广告弹窗点击] 第%s/%s次，等待整个弹窗关闭", attempt, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS)
+                else:
+                    LOGGER.info("[TikTok][广告弹窗] 第%s/%s次未找到知道了，先确认弹窗是否已经关闭", attempt, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS)
+            except Exception as exc:
+                LOGGER.warning("[TikTok][广告弹窗点击失败] 第%s/%s次，异常=%s", attempt, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS, exc)
+
+            hidden_checks = 0
+            close_deadline = time.monotonic() + AD_ANNOUNCEMENT_CLOSE_TIMEOUT_SECONDS
+            while time.monotonic() < close_deadline:
+                try:
+                    visible = self._visible_ad_popup_element(tab, AD_ANNOUNCEMENT_MODAL_XPATH)
+                    hidden_checks = 0 if visible else hidden_checks + 1
+                    if hidden_checks >= 2:
+                        self._ad_popup_dismissals = getattr(self, "_ad_popup_dismissals", 0) + 1
+                        LOGGER.info("[TikTok][广告弹窗关闭成功] 第%s/%s次，已连续两次确认弹窗不可见", attempt, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS)
+                        return True
+                except Exception as exc:
+                    hidden_checks = 0
+                    LOGGER.info("[TikTok][广告弹窗等待] 页面查询暂时失败，继续确认关闭，异常=%s", exc)
+                self._human_wait(tab, 0.25)
+            LOGGER.warning("[TikTok][广告弹窗关闭重试] 第%s/%s次，%.1f秒内未确认关闭", attempt, AD_ANNOUNCEMENT_CLOSE_ATTEMPTS, AD_ANNOUNCEMENT_CLOSE_TIMEOUT_SECONDS)
+        LOGGER.error("[TikTok][广告弹窗关闭失败] 不在遮挡状态下继续操作日期控件")
+        return False
 
     def _prepare_human_click(self, tab: Any, element: Any, step_name: str) -> None:
         """在真实点击前补足随机间隔，并执行居中滚动、鼠标移动和短暂停留。"""
@@ -1670,6 +1771,24 @@ class TiktokAuto:
         """按钮最多点击4次，并在统一超时内验证状态；登录步骤可被已登录标志提前终止。"""
         max_attempts = CLICK_RETRY_TIMES + 1
         click_dispatched = False
+
+        def recover_ad_popup_after_failure() -> bool:
+            nonlocal click_dispatched
+            if not getattr(self, "_ad_page_active", False):
+                return True
+            before = getattr(self, "_ad_popup_dismissals", 0)
+            LOGGER.info("[TikTok][日期失败检查弹窗] 步骤=%s，日期点击或验证失败，检查是否存在导航更新弹窗", step_name)
+            try:
+                closed = self._dismiss_ad_announcement(tab)
+            except Exception as exc:
+                LOGGER.warning("[TikTok][日期失败弹窗检查异常] 步骤=%s，异常=%s", step_name, exc)
+                return False
+            if getattr(self, "_ad_popup_dismissals", 0) != before:
+                # 关闭弹窗可能同时收起日期面板，必须重新点击日期，不能把隐藏当作上次成功。
+                click_dispatched = False
+                LOGGER.info("[TikTok][日期失败弹窗恢复] 步骤=%s，弹窗已关闭，按原流程重新点击日期", step_name)
+            return closed
+
         for attempt in range(max_attempts):
             if stop_when_authenticated and self._login_step_already_authenticated(tab, f"{step_name} 第{attempt + 1}次点击前"):
                 return True
@@ -1735,6 +1854,8 @@ class TiktokAuto:
                         attempt + 1,
                         max_attempts,
                     )
+                    if not recover_ad_popup_after_failure():
+                        return False
                     continue
                 self._prepare_human_click(tab, element, step_name)
                 try:
@@ -1762,6 +1883,8 @@ class TiktokAuto:
                             max_attempts,
                             success_name,
                         )
+                        if not recover_ad_popup_after_failure():
+                            return False
                         continue
                 LOGGER.info(
                     "[TikTok][按钮成功] 步骤=%s，第 %s/%s 次点击并验证成功，xpath=%s",
@@ -1780,6 +1903,8 @@ class TiktokAuto:
                     exc,
                     xpath,
                 )
+                if not recover_ad_popup_after_failure():
+                    return False
                 continue
         LOGGER.error("[TikTok][按钮终止] 步骤=%s，全部 %s 次点击均失败，xpath=%s", step_name, max_attempts, xpath)
         return False
