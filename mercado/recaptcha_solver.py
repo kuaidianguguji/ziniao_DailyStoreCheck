@@ -74,6 +74,16 @@ class MercadoRecaptchaSolver:
         self.api_key = str(config.get("api_key") or "").strip()
         self.create_task_url = str(config.get("create_task_url") or "https://api.yescaptcha.com/createTask").strip()
         self.result_url = str(config.get("result_url") or "https://api.yescaptcha.com/getTaskResult").strip()
+        self.request_timeout = max(5.0, float(config.get("request_timeout_seconds", 60) or 60))
+        self.poll_interval = max(0.2, float(config.get("poll_interval_seconds", 2) or 2))
+        self.max_poll = max(1, int(config.get("max_poll", 20) or 20))
+        fallback_urls = config.get("fallback_create_task_urls", [])
+        if isinstance(fallback_urls, str):
+            fallback_urls = [fallback_urls]
+        self.create_task_urls = [self.create_task_url] + [
+            str(url).strip() for url in fallback_urls
+            if str(url).strip() and str(url).strip() != self.create_task_url
+        ]
         self.trigger_xpath = str(config.get("captcha_trigger_button_xpath") or XPATH_CHECKBOX_BTN).strip()
         self.question_id = ""
 
@@ -299,32 +309,46 @@ class MercadoRecaptchaSolver:
             raise RuntimeError("美客多验证码已出现，但未配置 MERCADO_YESCAPTCHA_API_KEY")
         if not self.question_id:
             raise RuntimeError("验证码图片识别前尚未获得有效问题 ID")
-        response = requests.post(
-            self.create_task_url,
-            json={
-                "clientKey": self.api_key,
-                "task": {
-                    "type": "ReCaptchaV2Classification",
-                    "image": image,
-                    "question": self.question_id,
-                },
+        payload = {
+            "clientKey": self.api_key,
+            "task": {
+                "type": "ReCaptchaV2Classification",
+                "image": image,
+                "question": self.question_id,
             },
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
+        }
+        data = None
+        last_error = None
+        for index, url in enumerate(self.create_task_urls, 1):
+            try:
+                LOGGER.info("[美客多][YesCaptcha] 创建任务，第 %s/%s 次，请求=%s，超时=%.1fs", index, len(self.create_task_urls), url, self.request_timeout)
+                response = requests.post(url, json=payload, timeout=self.request_timeout)
+                LOGGER.info("[美客多][YesCaptcha] 创建任务响应，状态=%s，Content-Type=%s，长度=%s", response.status_code, response.headers.get("Content-Type", ""), len(response.content or b""))
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                last_error = exc
+                LOGGER.warning("[美客多][YesCaptcha] 创建任务失败，请求=%s，异常=%r", url, exc)
+        if data is None:
+            raise RuntimeError(f"YesCaptcha 创建任务网络失败：{last_error}") from last_error
         if data.get("errorId") != 0:
             raise RuntimeError(f"YesCaptcha 创建任务失败：errorId={data.get('errorId')}")
+        # ReCaptchaV2Classification 按官网文档通常同步返回 ready + solution。
+        if data.get("status") == "ready" and isinstance(data.get("solution"), dict):
+            LOGGER.info("[美客多][YesCaptcha] 同步识别成功")
+            return data["solution"]
         task_id = data.get("taskId")
         if not task_id:
-            raise RuntimeError("YesCaptcha 未返回 taskId")
-        for _ in range(20):
-            time.sleep(2)
+            raise RuntimeError("YesCaptcha 未返回 solution 或 taskId")
+        for poll_index in range(1, self.max_poll + 1):
+            time.sleep(self.poll_interval)
             result = requests.post(
                 self.result_url,
                 json={"clientKey": self.api_key, "taskId": task_id},
-                timeout=60,
+                timeout=self.request_timeout,
             )
+            LOGGER.info("[美客多][YesCaptcha] 结果查询，第 %s/%s 次，状态=%s，长度=%s", poll_index, self.max_poll, result.status_code, len(result.content or b""))
             result.raise_for_status()
             result_data = result.json()
             if result_data.get("status") == "ready":

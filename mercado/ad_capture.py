@@ -26,6 +26,13 @@ FALLBACK_PATH_RE = re.compile(r"^/pa/api/admin-pads/ajax/campaigns/search$")
 PERIOD_BUTTON_XPATH = '//div[@class="andes-floating-menu"]//button[@aria-label="Período" or @aria-label="周期"]'
 CUSTOM_PERIOD_XPATH = '//div[@data-tippy-root]//ul/li[@data-key="custom"]'
 TODAY_CALENDAR_XPATH = '//div[@class="campaigns-period-picker"]//tbody//td[@data-today="true"]'
+# 新版概览页日期控件：保留上面的旧 XPath，只有旧定位超时后才使用此替补。
+TODAY_CALENDAR_FALLBACK_XPATH = (
+    "//div[@id='DateRange-custom-datepicker']"
+    "//td[@data-andes-datepicker-day='true' and @data-day and "
+    "contains(concat(' ', normalize-space(@class), ' '), ' andes-datepicker__day--today ')]"
+    "//button[contains(concat(' ', normalize-space(@class), ' '), ' andes-datepicker__day ') and not(@disabled)]"
+)
 BRAZIL_TIMEZONE = timezone(timedelta(hours=-3), "BRT")
 CHART_LISTENER_PATTERN = r"/advertiser-hub/api/general-metrics/[^/]+/chart\?"
 
@@ -231,9 +238,16 @@ class MercadoAdCapture:
                 raise TimeoutError("美客多广告备用流程未找到自定义时间按钮")
             self._ad_page.close_budget_popup(tab, store_name)
             self._click_element(custom, tab, "选择自定义时间")
+            # 先使用旧版 data-today 定位；旧节点在新版页面不存在时才启用结构化替补。
             today_element = self._wait_element(tab, TODAY_CALENDAR_XPATH, 20.0)
             if today_element is None:
-                raise TimeoutError("美客多广告备用流程未找到今天日期按钮")
+                LOGGER.warning(
+                    "[美客多][广告备用日期] 旧 XPath 未找到今天节点，启用替补 XPath=%s",
+                    TODAY_CALENDAR_FALLBACK_XPATH,
+                )
+                today_element = self._wait_element(tab, TODAY_CALENDAR_FALLBACK_XPATH, 20.0)
+            if today_element is None:
+                raise TimeoutError("美客多广告备用流程原 XPath 与替补 XPath 均未找到今天日期按钮")
             self._ad_page.close_budget_popup(tab, store_name)
             self._double_click_element(today_element, tab, "选择今天日期")
             packet = self._wait_for_fallback_packet(listener, store_name, expected_date=today, tab=tab)
