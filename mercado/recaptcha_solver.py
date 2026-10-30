@@ -9,6 +9,7 @@ import re
 import time
 from io import BytesIO
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from openai import OpenAI
@@ -84,6 +85,32 @@ class MercadoRecaptchaSolver:
             str(url).strip() for url in fallback_urls
             if str(url).strip() and str(url).strip() != self.create_task_url
         ]
+        self.image_request_timeout = max(
+            5.0, float(config.get("image_request_timeout_seconds", 20) or 20)
+        )
+        self.image_request_retries = max(
+            1, int(config.get("image_request_retries", 3) or 3)
+        )
+        image_fallback_hosts = config.get(
+            "image_fallback_hosts", ["www.recaptcha.net", "recaptcha.net"]
+        )
+        if isinstance(image_fallback_hosts, str):
+            image_fallback_hosts = [image_fallback_hosts]
+        self.image_fallback_hosts = [
+            str(host).strip() for host in image_fallback_hosts if str(host).strip()
+        ]
+        self.image_session = requests.Session()
+        self.image_session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/138.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Referer": "https://www.recaptcha.net/",
+            }
+        )
         self.trigger_xpath = str(config.get("captcha_trigger_button_xpath") or XPATH_CHECKBOX_BTN).strip()
         self.question_id = ""
 
@@ -195,16 +222,56 @@ class MercadoRecaptchaSolver:
             f"第一 XPath 匹配数={primary_count}，第二 XPath 匹配数={fallback_count}{detail}"
         )
 
-    @staticmethod
-    def _image_base64(image_url: str, target_size: int) -> str:
-        """下载并缩放图片，返回纯 Base64 字符串。"""
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        image = Image.open(BytesIO(response.content)).convert("RGB")
-        image = image.resize((target_size, target_size), Image.Resampling.LANCZOS)
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    def _image_base64(self, image_url: str, target_size: int) -> str:
+        """下载并缩放验证码图片；Google 链路失败时切换 recaptcha.net 并重试。"""
+        parsed = urlsplit(image_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise RuntimeError("验证码图片地址无效")
+        hosts = [parsed.netloc]
+        for host in self.image_fallback_hosts:
+            if host not in hosts:
+                hosts.append(host)
+        last_error: Exception | None = None
+        for host in hosts:
+            candidate_url = urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+            for attempt in range(1, self.image_request_retries + 1):
+                try:
+                    LOGGER.info(
+                        "[美客多][验证码图片] 下载尝试，第 %s/%s 次，主机=%s，超时=%.1fs",
+                        attempt,
+                        self.image_request_retries,
+                        host,
+                        self.image_request_timeout,
+                    )
+                    response = self.image_session.get(
+                        candidate_url,
+                        timeout=(5.0, self.image_request_timeout),
+                    )
+                    LOGGER.info(
+                        "[美客多][验证码图片] 下载响应，主机=%s，状态=%s，Content-Type=%s，长度=%s",
+                        host,
+                        response.status_code,
+                        response.headers.get("Content-Type", ""),
+                        len(response.content or b""),
+                    )
+                    response.raise_for_status()
+                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                    image = image.resize((target_size, target_size), Image.Resampling.LANCZOS)
+                    buffer = BytesIO()
+                    image.save(buffer, format="PNG")
+                    return base64.b64encode(buffer.getvalue()).decode("ascii")
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning(
+                        "[美客多][验证码图片] 下载失败，主机=%s，第 %s/%s 次，异常=%r",
+                        host,
+                        attempt,
+                        self.image_request_retries,
+                        exc,
+                    )
+                    if attempt < self.image_request_retries:
+                        time.sleep(min(1.5, 0.5 * attempt))
+        raise RuntimeError(f"验证码图片连续下载失败：{last_error}") from last_error
 
     @staticmethod
     def _read_question_text(content_frame: Any) -> str:

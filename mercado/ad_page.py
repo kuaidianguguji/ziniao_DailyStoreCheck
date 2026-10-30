@@ -269,8 +269,14 @@ class MercadoAdPage:
         second = matches[0]
         current_point = self._click_point(second, preferred=point)
         if current_point != point:
-            # 日期重绘时通常坐标不变；若布局确实改变，停止本轮，避免把双击发到错误位置。
-            raise RuntimeError("美客多广告概览双击时今天日期按钮位置发生变化，请重新选择日期")
+            # 日期控件第一次点击后可能重绘，或页面因加载状态变化而整体移动。
+            # 此时 XPath 仍然唯一指向同一个完整日期节点，使用重新定位后的坐标完成第二次点击。
+            LOGGER.info(
+                "[美客多][广告概览双击] 店铺=%s，日期节点重绘后坐标变化，使用新坐标完成第二次点击：旧=%s，新=%s",
+                store_name,
+                point,
+                current_point,
+            )
         # 节点重定位也会耗时，只补足剩余间隔，避免在 80～180ms 外再叠加完整等待。
         remaining = interval_ms / 1000.0 - (time.monotonic() - first_click_finished)
         if remaining > 0:

@@ -215,6 +215,11 @@ platforms:
         max_poll: 20
         fallback_create_task_urls:
           - "https://cn.yescaptcha.com/createTask"
+        image_request_timeout_seconds: 20
+        image_request_retries: 3
+        image_fallback_hosts:
+          - "www.recaptcha.net"
+          - "recaptcha.net"
     # 美客多实际使用今天、7天和30天三个时间范围。
     periods:
       today: true
