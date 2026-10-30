@@ -117,6 +117,52 @@ class MercadoAdPage:
         self._double_click_date(tab, date_xpath, store_name)
         self._wait_today_range(tab, store_name, today)
 
+    def wait_overview_ready(
+        self,
+        tab: Any,
+        store_name: str,
+        timeout_seconds: float | None = None,
+    ) -> bool:
+        """确认概览页主文档和日期按钮都已可用，再开始日期操作。"""
+        timeout = self.dom_timeout_seconds if timeout_seconds is None else max(0.1, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
+        last_state = ""
+        last_count = 0
+        next_log = 0.0
+        while time.monotonic() < deadline:
+            try:
+                last_state = str(tab.run_js("return document.readyState;") or "").lower()
+            except Exception as exc:
+                last_state = f"error:{type(exc).__name__}"
+            last_count = len(self._elements(tab, PERIOD_XPATH))
+            if last_state == "complete" and last_count == 1:
+                LOGGER.info(
+                    "[美客多][广告概览就绪] 店铺=%s，readyState=%s，日期按钮匹配数=%s",
+                    store_name,
+                    last_state,
+                    last_count,
+                )
+                return True
+            now = time.monotonic()
+            if now >= next_log:
+                LOGGER.info(
+                    "[美客多][广告概览等待] 店铺=%s，readyState=%s，日期按钮匹配数=%s，剩余约%.1f秒",
+                    store_name,
+                    last_state,
+                    last_count,
+                    max(0.0, deadline - now),
+                )
+                next_log = now + 5.0
+            time.sleep(0.25)
+        LOGGER.warning(
+            "[美客多][广告概览未就绪] 店铺=%s，%.1f秒内未确认日期按钮，最后 readyState=%s，匹配数=%s",
+            store_name,
+            timeout,
+            last_state,
+            last_count,
+        )
+        return False
+
     def close_budget_popup(self, tab: Any, store_name: str, *, wait_seconds: float = 0.0) -> bool:
         """仅拒绝广告预算推荐，确认整个弹窗消失；不操作浏览器网络监听。"""
         appearance_deadline = time.monotonic() + max(0.0, wait_seconds)

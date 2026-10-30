@@ -96,6 +96,12 @@ class MercadoAdCapture:
                 self.fallback_double_click_min_interval_ms,
             )
         self._ad_page = MercadoAdPage(config, human_config=human_config)
+        self.overview_ready_timeout_seconds = max(
+            5.0, float(config.get("overview_ready_timeout_seconds", 45) or 45)
+        )
+        self.overview_reload_retries = max(
+            0, int(config.get("overview_reload_retries", 1) or 0)
+        )
         self._active_listener: Any = None
 
     def collect_today(self, tab: Any, store_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -186,10 +192,44 @@ class MercadoAdCapture:
         self, tab: Any, listener: Any, store_name: str, today: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """概览切至巴西今天后重抓 chart；仍不可用时才读取五项页面指标。"""
-        self._ad_page.select_today(
-            tab, store_name, today,
-            before_date_click=lambda: self._start_chart_listener(listener),
-        )
+        selection_error: Exception | None = None
+        max_attempts = self.overview_reload_retries + 1
+        for attempt in range(1, max_attempts + 1):
+            if not self._ad_page.wait_overview_ready(
+                tab, store_name, self.overview_ready_timeout_seconds
+            ):
+                selection_error = TimeoutError("美客多广告概览日期按钮未就绪")
+            else:
+                try:
+                    self._ad_page.select_today(
+                        tab, store_name, today,
+                        before_date_click=lambda: self._start_chart_listener(listener),
+                    )
+                    selection_error = None
+                    break
+                except (TimeoutError, RuntimeError) as exc:
+                    selection_error = exc
+                    LOGGER.warning(
+                        "[美客多][广告概览日期重试] 店铺=%s，第%d/%d次日期操作失败：%s",
+                        store_name,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+            if attempt < max_attempts:
+                LOGGER.warning(
+                    "[美客多][广告概览刷新恢复] 店铺=%s，第%d/%d次准备重新打开广告概览页并等待日期控件",
+                    store_name,
+                    attempt,
+                    max_attempts,
+                )
+                try:
+                    tab.get(self.page_url)
+                except Exception as exc:
+                    LOGGER.warning("[美客多][广告概览刷新失败] 店铺=%s，异常=%s", store_name, exc)
+                time.sleep(1.0)
+        if selection_error is not None:
+            raise selection_error
         try:
             packet = self._wait_for_target_packet(listener, store_name, expected_date=today, tab=tab)
             payload = self._packet_json(packet, store_name)

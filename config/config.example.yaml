@@ -226,6 +226,9 @@ platforms:
     ad_capture:
       # 经营指标抓取完成后，是否监听广告概览接口。
       enabled: true
+      # chart 未命中后，等待概览页日期控件渲染的时间；失败时自动重新打开一次广告页。
+      overview_ready_timeout_seconds: 45
+      overview_reload_retries: 1
       page_url: "https://vendedores.mercadolivre.com.br/publicidade/resumo-anunciante"
       request_timeout_seconds: 60
       fallback_request_timeout_seconds: 60
