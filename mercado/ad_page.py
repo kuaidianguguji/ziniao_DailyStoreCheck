@@ -115,7 +115,45 @@ class MercadoAdPage:
         LOGGER.info("[美客多][广告概览日期] 店铺=%s，准备监听后双击巴西日期=%s", store_name, today)
         before_date_click()
         self._double_click_date(tab, date_xpath, store_name)
-        self._wait_today_range(tab, store_name, today)
+        try:
+            self._wait_today_range(tab, store_name, today)
+        except TimeoutError as first_error:
+            # 某些页面第一次双击只保留原来的 30 天范围；重新定位同一日期后补发独立单击，
+            # 让 range 控件完成“起始日=结束日”的第二阶段选择。
+            LOGGER.warning(
+                "[美客多][广告概览日期补救] 店铺=%s，双击后未确认单日范围，准备重新定位日期节点补点：%s",
+                store_name,
+                first_error,
+            )
+            recovered = False
+            for retry in range(1, 3):
+                try:
+                    self.close_budget_popup(tab, store_name)
+                    element = self._wait_unique(
+                        tab, date_xpath, f"巴西今天日期补救第{retry}次", timeout_seconds=5.0
+                    )
+                    point = self._click_point(element)
+                    self.human.move_to_point(tab, *point)
+                    if self.human.enabled:
+                        time.sleep(random.uniform(0.08, 0.18))
+                    self._dispatch_click(tab, point, 1)
+                    LOGGER.info(
+                        "[美客多][广告概览日期补救] 店铺=%s，第%d/2次补发单击，等待单日范围确认",
+                        store_name,
+                        retry,
+                    )
+                    self._wait_today_range(tab, store_name, today, timeout_seconds=5.0)
+                    recovered = True
+                    break
+                except (TimeoutError, RuntimeError) as exc:
+                    LOGGER.warning(
+                        "[美客多][广告概览日期补救失败] 店铺=%s，第%d/2次，异常=%s",
+                        store_name,
+                        retry,
+                        exc,
+                    )
+            if not recovered:
+                raise first_error
 
     def wait_overview_ready(
         self,
@@ -364,8 +402,15 @@ class MercadoAdPage:
             time.sleep(0.1)
         raise TimeoutError(f"美客多在 {timeout:.1f} 秒内未找到唯一可见的{name}，可见匹配数={last_count}")
 
-    def _wait_today_range(self, tab: Any, store_name: str, today: str) -> None:
-        deadline = time.monotonic() + self.ui_timeout_seconds
+    def _wait_today_range(
+        self,
+        tab: Any,
+        store_name: str,
+        today: str,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        timeout = self.ui_timeout_seconds if timeout_seconds is None else max(0.1, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
         last_range = ""
         while time.monotonic() < deadline:
             last_range = self._range_text(tab)
@@ -373,7 +418,7 @@ class MercadoAdPage:
                 LOGGER.info("[美客多][广告概览日期确认] 店铺=%s，已确认巴西单日=%s，标签=%r", store_name, today, last_range)
                 return
             time.sleep(0.25)
-        raise TimeoutError(f"美客多广告概览在 {self.ui_timeout_seconds:.1f} 秒内未确认 {today} 单日范围，实际标签={last_range!r}")
+        raise TimeoutError(f"美客多广告概览在 {timeout:.1f} 秒内未确认 {today} 单日范围，实际标签={last_range!r}")
 
     @classmethod
     def _range_text(cls, tab: Any) -> str:
